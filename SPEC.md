@@ -80,10 +80,9 @@ teide/
 │   └── bench_*.c               # Microbenchmarks
 └── bindings/
     ├── python/
-    │   ├── teide/__init__.py   # Python ctypes wrapper (low-level C API)
-    │   ├── teide/api.py        # High-level API (Context, Table, Query, Expr)
-    │   └── teide_adapter.py    # rayforce-bench Adapter implementation
-    └── rust/                   # Phase 12: Rust FFI bindings (safe wrapper crate)
+        ├── teide/__init__.py   # Python ctypes wrapper (low-level C API)
+        ├── teide/api.py        # High-level API (Context, Table, Query, Expr)
+        └── teide_adapter.py    # rayforce-bench Adapter implementation
 ```
 
 ---
@@ -1263,7 +1262,6 @@ typedef enum {
 | **11a** | Allocator: slab cache + direct mmap + mem stats | `buddy.h`, `arena.h/.c`, `td.h` | Phase 1 | **DONE** (4 new tests: slab_cache, direct_mmap, direct_mmap_realloc, mem_stats) |
 | **11b** | Python API | `bindings/python/teide/api.py` | Phase 11 | **DONE** (Context, Table, Query, Expr, GroupBy, Series) |
 | **11c** | Python API integration tests (Q1-Q7) | `test/test_api.py` | Phases 11a+11b | **TODO** |
-| **12** | Rust bindings | `bindings/rust/` | Phase 10 | Pending |
 
 ### Algorithm notes for key phases
 

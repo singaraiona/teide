@@ -1,0 +1,92 @@
+#include "col.h"
+#include <string.h>
+#include <stdio.h>
+
+/* --------------------------------------------------------------------------
+ * Column file format:
+ *   Bytes 0-15:  nullmap
+ *   Bytes 16-31: mmod=0, order=0, type, attrs, rc=0, len
+ *   Bytes 32+:   raw element data
+ *
+ * On-disk format IS the in-memory format (zero deserialization on load).
+ * -------------------------------------------------------------------------- */
+
+/* --------------------------------------------------------------------------
+ * td_col_save — write a vector to a column file
+ * -------------------------------------------------------------------------- */
+
+td_err_t td_col_save(td_t* vec, const char* path) {
+    if (!vec || TD_IS_ERR(vec)) return TD_ERR_TYPE;
+    if (!path) return TD_ERR_IO;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return TD_ERR_IO;
+
+    /* Write a clean header (mmod=0, rc=0) */
+    td_t header;
+    memcpy(&header, vec, 32);
+    header.mmod = 0;
+    header.order = 0;
+    atomic_store_explicit(&header.rc, 0, memory_order_relaxed);
+
+    /* Clear slice/ext_nullmap fields for clean serialization */
+    if (!(header.attrs & TD_ATTR_HAS_NULLS)) {
+        memset(header.nullmap, 0, 16);
+    }
+    header.attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
+
+    size_t written = fwrite(&header, 1, 32, f);
+    if (written != 32) { fclose(f); return TD_ERR_IO; }
+
+    /* Write data */
+    uint8_t esz = td_elem_size(vec->type);
+    size_t data_size = (size_t)vec->len * esz;
+
+    void* data;
+    if (vec->attrs & TD_ATTR_SLICE) {
+        data = (char*)td_data(vec->slice_parent) + vec->slice_offset * esz;
+    } else {
+        data = td_data(vec);
+    }
+
+    if (data_size > 0) {
+        written = fwrite(data, 1, data_size, f);
+        if (written != data_size) { fclose(f); return TD_ERR_IO; }
+    }
+
+    fclose(f);
+    return TD_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * td_col_load — load a column file via mmap (zero deserialization)
+ * -------------------------------------------------------------------------- */
+
+td_t* td_col_load(const char* path) {
+    if (!path) return TD_ERR_PTR(TD_ERR_IO);
+
+    size_t mapped_size = 0;
+    void* ptr = td_vm_map_file(path, &mapped_size);
+    if (!ptr) return TD_ERR_PTR(TD_ERR_IO);
+
+    if (mapped_size < 32) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    td_t* vec = (td_t*)ptr;
+
+    /* Set mmod=1 (file-mmap'd) and rc=1 */
+    vec->mmod = 1;
+    atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
+
+    /* Verify: data_size should fit in mapped region */
+    uint8_t esz = td_elem_size(vec->type);
+    size_t expected = 32 + (size_t)vec->len * esz;
+    if (expected > mapped_size) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    return vec;
+}

@@ -1,0 +1,171 @@
+#include "atom.h"
+#include <string.h>
+
+/* --------------------------------------------------------------------------
+ * Simple atom constructors
+ *
+ * Pattern: allocate 0-byte data block (just the 32B header), set type to
+ * negative tag, store value in header union field.
+ * -------------------------------------------------------------------------- */
+
+td_t* td_bool(bool val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_BOOL;
+    v->b8 = val ? 1 : 0;
+    return v;
+}
+
+td_t* td_u8(uint8_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_U8;
+    v->u8 = val;
+    return v;
+}
+
+td_t* td_char(char val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_CHAR;
+    v->c8 = val;
+    return v;
+}
+
+td_t* td_i16(int16_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_I16;
+    v->i16 = val;
+    return v;
+}
+
+td_t* td_i32(int32_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_I32;
+    v->i32 = val;
+    return v;
+}
+
+td_t* td_i64(int64_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_I64;
+    v->i64 = val;
+    return v;
+}
+
+td_t* td_f64(double val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_F64;
+    v->f64 = val;
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * String atom: SSO for <= 7 bytes, long string via CHAR vector for > 7
+ * -------------------------------------------------------------------------- */
+
+td_t* td_str(const char* s, size_t len) {
+    if (len <= 7) {
+        /* SSO path: store inline in header */
+        td_t* v = td_alloc(0);
+        if (TD_IS_ERR(v)) return v;
+        v->type = TD_ATOM_STR;
+        v->slen = (uint8_t)len;
+        if (len > 0) memcpy(v->sdata, s, len);
+        return v;
+    }
+    /* Long string: allocate a CHAR vector to hold the data, store pointer */
+    size_t data_size = len;
+    td_t* chars = td_alloc(data_size);
+    if (!chars || TD_IS_ERR(chars)) return chars;
+    chars->type = TD_CHAR;
+    chars->len = (int64_t)len;
+    memcpy(td_data(chars), s, len);
+
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) {
+        td_free(chars);
+        return v;
+    }
+    v->type = TD_ATOM_STR;
+    v->obj = chars;
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * Symbol atom: intern ID stored as i64
+ * -------------------------------------------------------------------------- */
+
+td_t* td_sym(int64_t id) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_SYM;
+    v->i64 = id;
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * Enum atom: intern index stored as u32
+ * -------------------------------------------------------------------------- */
+
+td_t* td_enum_atom(uint32_t idx) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = TD_ATOM_ENUM;
+    v->u32 = idx;
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * Date/Time/Timestamp atoms: i64 value
+ * -------------------------------------------------------------------------- */
+
+td_t* td_date(int64_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = -TD_DATE;
+    v->i64 = val;
+    return v;
+}
+
+td_t* td_time(int64_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = -TD_TIME;
+    v->i64 = val;
+    return v;
+}
+
+td_t* td_timestamp(int64_t val) {
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) return v;
+    v->type = -TD_TIMESTAMP;
+    v->i64 = val;
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * GUID atom: 16 bytes stored in a U8 vector, pointer in obj field
+ * -------------------------------------------------------------------------- */
+
+td_t* td_guid(const uint8_t* bytes) {
+    /* Allocate U8 vector of length 16 */
+    td_t* vec = td_alloc(16);
+    if (!vec || TD_IS_ERR(vec)) return vec;
+    vec->type = TD_U8;
+    vec->len = 16;
+    memcpy(td_data(vec), bytes, 16);
+
+    td_t* v = td_alloc(0);
+    if (TD_IS_ERR(v)) {
+        td_free(vec);
+        return v;
+    }
+    v->type = -TD_GUID;
+    v->obj = vec;
+    return v;
+}

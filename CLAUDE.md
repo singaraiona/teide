@@ -1,6 +1,22 @@
-# Teide — Developer Guide
+# CLAUDE.md
+
+This file provides guidance to Claude Code when working with the Teide codebase.
+
+## What is Teide?
 
 Pure C17 zero-dependency columnar dataframe library. Lazy fusion API → operation DAG → optimizer → fused morsel-driven execution.
+
+**SPEC.md** is the authoritative design document — it contains detailed specifications for the block header, buddy allocator, threading model, optimizer passes, storage format, and Python API. Refer to it for implementation details.
+
+## Directory Structure
+
+See SPEC.md Section 1 for the full layout. Key entry points:
+
+- `include/teide/td.h` — single public header (entire API)
+- `src/` — implementation (core/, mem/, vec/, df/, ops/, store/, io/)
+- `test/` — munit-based tests (test_main.c + test_*.c)
+- `bench/` — microbenchmarks
+- `bindings/python/` — ctypes wrapper + high-level Python API
 
 ## Build & Test
 
@@ -23,28 +39,17 @@ TEIDE_LIB=build_release/libteide.so python -m pytest bindings/python/
 
 ## Architecture at a Glance
 
-### Core Abstraction: `td_t` (32-byte block header)
-Every object (atom, vector, list, table) is a `td_t`. Data follows immediately at byte 32.
-- `type < 0` → atom, `type > 0` → vector, `type == 0` → LIST, `type == 13` → table
-- `mmod`: 0=arena, 1=file-mmap, 2=direct-mmap (>1GiB)
-- `rc`: COW ref count (`_Atomic(uint32_t)`, relaxed in sequential mode)
-- Error encoding: valid `td_t*` always 32B-aligned → `TD_ERR_PTR(e)` encodes error in low bits, `TD_IS_ERR(p)` to check
+Core abstraction is `td_t` — a 32-byte block header. Every object (atom, vector, list, table) is a `td_t` with data following at byte 32. See SPEC.md Sections 2 and 4 for the full layout.
 
-### Memory: Buddy Allocator + COW
-- Thread-local arenas (`td_tl_arena`), min order 5 (32B), max order 30 (1GiB)
-- Slab cache for orders 5-9 (32B-512B) — LIFO stack, hottest path
-- Direct mmap for >1GiB (`mmod=2`)
-- COW: `td_cow(v)` returns same pointer if `rc==1`, else copies. Mutations main-thread-only.
-- Cross-thread free via MPSC return queue, drained after `td_parallel_end()`
+**Memory**: buddy allocator with thread-local arenas, slab cache for small allocations, COW ref counting. See SPEC.md Sections 5-6.
 
-### Execution Pipeline
+**Execution pipeline**:
 1. Build lazy DAG: `td_graph_new(df)` → `td_scan/td_add/td_filter/...` → `td_execute(g, root)`
 2. Optimizer: type inference → constant fold → predicate pushdown → CSE → fusion → DCE
 3. Fused executor: bytecode over register slots, morsel-by-morsel (1024 elements)
 4. All processing through `td_morsel_t` iterators — never full-vector passes
 
-### Extended Nodes
-Ops with >2 inputs (group-by, multi-column sort, join) use `td_op_ext_t` (64B).
+Ops with >2 inputs (group-by, multi-column sort, join) use extended nodes (`td_op_ext_t`, 64B).
 
 ## Code Conventions
 
@@ -80,7 +85,3 @@ Real CSVs live at `../rayforce-bench/datasets/` relative to project root:
 - Window join: `window_join_10m/`
 
 **Never generate synthetic CSV data when these bench CSVs exist.**
-
-## Project Status
-
-Phases 0-11 complete (159+ C tests, 19/19 benchmark queries passing). Phase 12 (Rust bindings) pending. See SPEC.md for full implementation specification.

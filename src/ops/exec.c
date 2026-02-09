@@ -2,9 +2,53 @@
 #include "hash.h"
 #include "pool.h"
 #include <string.h>
-#include <stdlib.h>
 #include <math.h>
 #include <float.h>
+
+/* --------------------------------------------------------------------------
+ * Arena-based scratch allocation helpers
+ *
+ * All temporary buffers use the buddy allocator instead of malloc/free.
+ * td_alloc() returns a td_t* header; data starts at td_data(hdr).
+ * -------------------------------------------------------------------------- */
+
+/* Allocate zero-initialized scratch buffer, returns data pointer.
+ * *hdr_out receives the td_t* header for later td_free(). */
+static inline void* scratch_calloc(td_t** hdr_out, size_t nbytes) {
+    td_t* h = td_alloc(nbytes);
+    if (!h) { *hdr_out = NULL; return NULL; }
+    void* p = td_data(h);
+    memset(p, 0, nbytes);
+    *hdr_out = h;
+    return p;
+}
+
+/* Allocate uninitialized scratch buffer. */
+static inline void* scratch_alloc(td_t** hdr_out, size_t nbytes) {
+    td_t* h = td_alloc(nbytes);
+    if (!h) { *hdr_out = NULL; return NULL; }
+    *hdr_out = h;
+    return td_data(h);
+}
+
+/* Reallocate: alloc new, copy old, free old. Returns new data pointer. */
+static inline void* scratch_realloc(td_t** hdr_out, size_t old_bytes, size_t new_bytes) {
+    td_t* old_h = *hdr_out;
+    td_t* new_h = td_alloc(new_bytes);
+    if (!new_h) return NULL;
+    void* new_p = td_data(new_h);
+    if (old_h) {
+        memcpy(new_p, td_data(old_h), old_bytes < new_bytes ? old_bytes : new_bytes);
+        td_free(old_h);
+    }
+    *hdr_out = new_h;
+    return new_p;
+}
+
+/* Free a scratch buffer (NULL-safe). */
+static inline void scratch_free(td_t* hdr) {
+    if (hdr) td_free(hdr);
+}
 
 /* --------------------------------------------------------------------------
  * Helper: find the extended node for a given base node ID
@@ -347,8 +391,8 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
     td_pool_t* pool = td_pool_get();
     if (pool && len >= TD_PARALLEL_THRESHOLD) {
         uint32_t nw = td_pool_total_workers(pool);
-        reduce_acc_t* accs = (reduce_acc_t*)calloc(nw, sizeof(reduce_acc_t));
-        if (!accs) goto sequential;
+        reduce_acc_t accs[nw];
+        memset(accs, 0, nw * sizeof(reduce_acc_t));
         for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
 
         par_reduce_ctx_t ctx = { .input = input, .accs = accs };
@@ -378,8 +422,6 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
             }
         }
 
-        free(accs);
-
         switch (op->opcode) {
             case OP_SUM:   return in_type == TD_F64 ? td_f64(merged.sum_f) : td_i64(merged.sum_i);
             case OP_PROD:  return in_type == TD_F64 ? td_f64(merged.prod_f) : td_i64(merged.prod_i);
@@ -393,7 +435,6 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
         }
     }
 
-sequential:;
     reduce_acc_t acc;
     reduce_acc_init(&acc);
     reduce_range(input, 0, len, &acc);
@@ -471,12 +512,13 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     int64_t ncols = td_df_ncols(df);
     uint8_t n_sort = ext->sort.n_cols;
 
-    int64_t* indices = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
+    td_t* indices_hdr;
+    int64_t* indices = (int64_t*)scratch_alloc(&indices_hdr, (size_t)nrows * sizeof(int64_t));
     if (!indices) return TD_ERR_PTR(TD_ERR_OOM);
     for (int64_t i = 0; i < nrows; i++) indices[i] = i;
 
-    td_t** sort_vecs = (td_t**)malloc(n_sort * sizeof(td_t*));
-    if (!sort_vecs) { free(indices); return TD_ERR_PTR(TD_ERR_OOM); }
+    td_t* sort_vecs[n_sort];
+    memset(sort_vecs, 0, n_sort * sizeof(td_t*));
 
     for (uint8_t k = 0; k < n_sort; k++) {
         td_op_t* key_op = ext->sort.columns[k];
@@ -533,7 +575,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
 
     td_t* result = td_df_new(ncols);
     if (!result || TD_IS_ERR(result)) {
-        free(indices); free(sort_vecs); return result;
+        scratch_free(indices_hdr); return result;
     }
 
     for (int64_t c = 0; c < ncols; c++) {
@@ -556,8 +598,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         td_release(new_col);
     }
 
-    free(indices);
-    free(sort_vecs);
+    scratch_free(indices_hdr);
     return result;
 }
 
@@ -653,26 +694,37 @@ typedef struct {
     double*        all_agg_max_f64;
     int64_t*       all_agg_min_i64;
     int64_t*       all_agg_max_i64;
+    /* Arena headers for scratch_free */
+    td_t* _h_ht_rows;
+    td_t* _h_ht_gids;
+    td_t* _h_ht_salts;
+    td_t* _h_groups;
+    td_t* _h_agg_f64;
+    td_t* _h_agg_i64;
+    td_t* _h_min_f64;
+    td_t* _h_max_f64;
+    td_t* _h_min_i64;
+    td_t* _h_max_i64;
 } group_ht_t;
 
 static void group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
     ht->ht_cap = cap;
-    ht->ht_rows = (int64_t*)malloc(cap * sizeof(int64_t));
-    ht->ht_gids = (int32_t*)malloc(cap * sizeof(int32_t));
-    ht->ht_salts = (uint16_t*)malloc(cap * sizeof(uint16_t));
+    ht->ht_rows  = (int64_t*)scratch_alloc(&ht->_h_ht_rows, cap * sizeof(int64_t));
+    ht->ht_gids  = (int32_t*)scratch_alloc(&ht->_h_ht_gids, cap * sizeof(int32_t));
+    ht->ht_salts = (uint16_t*)scratch_alloc(&ht->_h_ht_salts, cap * sizeof(uint16_t));
     memset(ht->ht_rows, -1, cap * sizeof(int64_t));
     ht->grp_cap = 256;
     ht->grp_count = 0;
     ht->n_aggs = n_aggs;
-    ht->groups = (group_entry_t*)calloc(ht->grp_cap, sizeof(group_entry_t));
+    ht->groups = (group_entry_t*)scratch_calloc(&ht->_h_groups, ht->grp_cap * sizeof(group_entry_t));
 
     size_t total = (size_t)ht->grp_cap * n_aggs;
-    ht->all_agg_f64     = (double*)calloc(total, sizeof(double));
-    ht->all_agg_i64     = (int64_t*)calloc(total, sizeof(int64_t));
-    ht->all_agg_min_f64 = (double*)malloc(total * sizeof(double));
-    ht->all_agg_max_f64 = (double*)malloc(total * sizeof(double));
-    ht->all_agg_min_i64 = (int64_t*)malloc(total * sizeof(int64_t));
-    ht->all_agg_max_i64 = (int64_t*)malloc(total * sizeof(int64_t));
+    ht->all_agg_f64     = (double*)scratch_calloc(&ht->_h_agg_f64, total * sizeof(double));
+    ht->all_agg_i64     = (int64_t*)scratch_calloc(&ht->_h_agg_i64, total * sizeof(int64_t));
+    ht->all_agg_min_f64 = (double*)scratch_alloc(&ht->_h_min_f64, total * sizeof(double));
+    ht->all_agg_max_f64 = (double*)scratch_alloc(&ht->_h_max_f64, total * sizeof(double));
+    ht->all_agg_min_i64 = (int64_t*)scratch_alloc(&ht->_h_min_i64, total * sizeof(int64_t));
+    ht->all_agg_max_i64 = (int64_t*)scratch_alloc(&ht->_h_max_i64, total * sizeof(int64_t));
     for (size_t i = 0; i < total; i++) {
         ht->all_agg_min_f64[i] = DBL_MAX;
         ht->all_agg_max_f64[i] = -DBL_MAX;
@@ -682,16 +734,16 @@ static void group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
 }
 
 static void group_ht_free(group_ht_t* ht) {
-    free(ht->groups);
-    free(ht->all_agg_f64);
-    free(ht->all_agg_i64);
-    free(ht->all_agg_min_f64);
-    free(ht->all_agg_max_f64);
-    free(ht->all_agg_min_i64);
-    free(ht->all_agg_max_i64);
-    free(ht->ht_rows);
-    free(ht->ht_gids);
-    free(ht->ht_salts);
+    scratch_free(ht->_h_groups);
+    scratch_free(ht->_h_agg_f64);
+    scratch_free(ht->_h_agg_i64);
+    scratch_free(ht->_h_min_f64);
+    scratch_free(ht->_h_max_f64);
+    scratch_free(ht->_h_min_i64);
+    scratch_free(ht->_h_max_i64);
+    scratch_free(ht->_h_ht_rows);
+    scratch_free(ht->_h_ht_gids);
+    scratch_free(ht->_h_ht_salts);
 }
 
 static void group_ht_grow(group_ht_t* ht) {
@@ -701,17 +753,18 @@ static void group_ht_grow(group_ht_t* ht) {
     size_t old_total = (size_t)old_cap * n_aggs;
     size_t new_total = (size_t)new_cap * n_aggs;
 
-    group_entry_t* new_groups = (group_entry_t*)realloc(ht->groups, new_cap * sizeof(group_entry_t));
+    group_entry_t* new_groups = (group_entry_t*)scratch_realloc(
+        &ht->_h_groups, old_cap * sizeof(group_entry_t), new_cap * sizeof(group_entry_t));
     if (!new_groups) return;
     ht->groups = new_groups;
     memset(&ht->groups[old_cap], 0, (new_cap - old_cap) * sizeof(group_entry_t));
 
-    ht->all_agg_f64     = (double*)realloc(ht->all_agg_f64, new_total * sizeof(double));
-    ht->all_agg_i64     = (int64_t*)realloc(ht->all_agg_i64, new_total * sizeof(int64_t));
-    ht->all_agg_min_f64 = (double*)realloc(ht->all_agg_min_f64, new_total * sizeof(double));
-    ht->all_agg_max_f64 = (double*)realloc(ht->all_agg_max_f64, new_total * sizeof(double));
-    ht->all_agg_min_i64 = (int64_t*)realloc(ht->all_agg_min_i64, new_total * sizeof(int64_t));
-    ht->all_agg_max_i64 = (int64_t*)realloc(ht->all_agg_max_i64, new_total * sizeof(int64_t));
+    ht->all_agg_f64     = (double*)scratch_realloc(&ht->_h_agg_f64, old_total * sizeof(double), new_total * sizeof(double));
+    ht->all_agg_i64     = (int64_t*)scratch_realloc(&ht->_h_agg_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    ht->all_agg_min_f64 = (double*)scratch_realloc(&ht->_h_min_f64, old_total * sizeof(double), new_total * sizeof(double));
+    ht->all_agg_max_f64 = (double*)scratch_realloc(&ht->_h_max_f64, old_total * sizeof(double), new_total * sizeof(double));
+    ht->all_agg_min_i64 = (int64_t*)scratch_realloc(&ht->_h_min_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    ht->all_agg_max_i64 = (int64_t*)scratch_realloc(&ht->_h_max_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
 
     /* Zero-init sum/count arrays for new slots; set sentinel values for min/max */
     memset(ht->all_agg_f64 + old_total, 0, (new_total - old_total) * sizeof(double));
@@ -730,12 +783,12 @@ static void group_ht_grow(group_ht_t* ht) {
 static void group_ht_rehash(group_ht_t* ht, void** key_data, int8_t* key_types,
                              uint8_t n_keys) {
     uint32_t new_cap = ht->ht_cap * 2;
-    free(ht->ht_rows);
-    free(ht->ht_gids);
-    free(ht->ht_salts);
-    ht->ht_rows  = (int64_t*)malloc(new_cap * sizeof(int64_t));
-    ht->ht_gids  = (int32_t*)malloc(new_cap * sizeof(int32_t));
-    ht->ht_salts = (uint16_t*)malloc(new_cap * sizeof(uint16_t));
+    scratch_free(ht->_h_ht_rows);
+    scratch_free(ht->_h_ht_gids);
+    scratch_free(ht->_h_ht_salts);
+    ht->ht_rows  = (int64_t*)scratch_alloc(&ht->_h_ht_rows, new_cap * sizeof(int64_t));
+    ht->ht_gids  = (int32_t*)scratch_alloc(&ht->_h_ht_gids, new_cap * sizeof(int32_t));
+    ht->ht_salts = (uint16_t*)scratch_alloc(&ht->_h_ht_salts, new_cap * sizeof(uint16_t));
     memset(ht->ht_rows, -1, new_cap * sizeof(int64_t));
     ht->ht_cap = new_cap;
 
@@ -886,39 +939,31 @@ typedef struct {
     radix_entry_t* entries;
     uint32_t       count;
     uint32_t       cap;
+    td_t*          _hdr;    /* arena header for scratch_free */
 } radix_buf_t;
 
-static void radix_buf_init(radix_buf_t* buf, uint32_t init_cap) {
-    buf->entries = (radix_entry_t*)malloc(init_cap * sizeof(radix_entry_t));
-    buf->count = 0;
-    buf->cap = init_cap;
-}
-
-static inline void radix_buf_push(radix_buf_t* buf, int64_t row, uint64_t hash) {
-    if (buf->count >= buf->cap) {
-        buf->cap *= 2;
-        buf->entries = (radix_entry_t*)realloc(buf->entries,
-                                                buf->cap * sizeof(radix_entry_t));
-    }
-    buf->entries[buf->count].row  = row;
-    buf->entries[buf->count].hash = hash;
-    buf->count++;
-}
-
-static void radix_buf_free(radix_buf_t* buf) {
-    free(buf->entries);
-    buf->entries = NULL;
-    buf->count = buf->cap = 0;
-}
-
-/* Phase 1 context: partition rows by hash */
+/* Phase 1 context: partition rows by hash into per-worker-per-partition buffers.
+ * Each worker has a pre-allocated slab; per-partition buffers are slices of it. */
 typedef struct {
     void**       key_data;
     int8_t*      key_types;
     uint8_t      n_keys;
     uint32_t     n_workers;
-    radix_buf_t* bufs;    /* [n_workers * RADIX_P] indexed as [worker * RADIX_P + part] */
+    radix_buf_t* bufs;    /* [n_workers * RADIX_P] */
 } radix_phase1_ctx_t;
+
+static inline void radix_buf_push(radix_buf_t* buf, int64_t row, uint64_t hash) {
+    if (__builtin_expect(buf->count >= buf->cap, 0)) {
+        uint32_t old_cap = buf->cap;
+        buf->cap *= 2;
+        buf->entries = (radix_entry_t*)scratch_realloc(
+            &buf->_hdr, (size_t)old_cap * sizeof(radix_entry_t),
+            (size_t)buf->cap * sizeof(radix_entry_t));
+    }
+    buf->entries[buf->count].row  = row;
+    buf->entries[buf->count].hash = hash;
+    buf->count++;
+}
 
 static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
@@ -1014,6 +1059,46 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  * Parallel direct-array accumulation for low-cardinality single integer key
  * ============================================================================ */
 
+/* Parallel min/max scan for direct-array key range detection */
+typedef struct {
+    const void* key_data;
+    int8_t      key_type;
+    int64_t*    per_worker_min;  /* [n_workers] */
+    int64_t*    per_worker_max;  /* [n_workers] */
+    uint32_t    n_workers;
+} minmax_ctx_t;
+
+static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    minmax_ctx_t* c = (minmax_ctx_t*)ctx;
+    uint32_t wid = worker_id % c->n_workers;
+    int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+    int8_t t = c->key_type;
+    if (t == TD_I64 || t == TD_SYM) {
+        const int64_t* kd = (const int64_t*)c->key_data;
+        for (int64_t r = start; r < end; r++) {
+            if (kd[r] < kmin) kmin = kd[r];
+            if (kd[r] > kmax) kmax = kd[r];
+        }
+    } else if (t == TD_ENUM) {
+        const uint32_t* kd = (const uint32_t*)c->key_data;
+        for (int64_t r = start; r < end; r++) {
+            int64_t v = (int64_t)kd[r];
+            if (v < kmin) kmin = v;
+            if (v > kmax) kmax = v;
+        }
+    } else { /* TD_I32 */
+        const int32_t* kd = (const int32_t*)c->key_data;
+        for (int64_t r = start; r < end; r++) {
+            int64_t v = (int64_t)kd[r];
+            if (v < kmin) kmin = v;
+            if (v > kmax) kmax = v;
+        }
+    }
+    /* Merge with existing per-worker values (a worker may process multiple morsels) */
+    if (kmin < c->per_worker_min[wid]) c->per_worker_min[wid] = kmin;
+    if (kmax > c->per_worker_max[wid]) c->per_worker_max[wid] = kmax;
+}
+
 typedef struct {
     double*  f64;
     int64_t* i64;
@@ -1022,6 +1107,14 @@ typedef struct {
     int64_t* min_i64;
     int64_t* max_i64;
     int64_t* count;
+    /* Arena headers */
+    td_t* _h_f64;
+    td_t* _h_i64;
+    td_t* _h_min_f64;
+    td_t* _h_max_f64;
+    td_t* _h_min_i64;
+    td_t* _h_max_i64;
+    td_t* _h_count;
 } da_accum_t;
 
 /* Bitmask for which accumulator arrays are actually needed */
@@ -1086,7 +1179,46 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     da_ctx_t* c = (da_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id % c->n_accums];
     uint8_t n_aggs = c->n_aggs;
+    uint8_t n_keys = c->n_keys;
 
+    /* Fast path: single key — avoid composite GID loop overhead */
+    if (n_keys == 1) {
+        const void* kptr = c->key_ptrs[0];
+        int8_t kt = c->key_types[0];
+        int64_t kmin = c->key_mins[0];
+        for (int64_t r = start; r < end; r++) {
+            int64_t kv;
+            if (kt == TD_I64 || kt == TD_SYM)
+                kv = ((const int64_t*)kptr)[r];
+            else if (kt == TD_ENUM)
+                kv = (int64_t)((const uint32_t*)kptr)[r];
+            else
+                kv = (int64_t)((const int32_t*)kptr)[r];
+            int32_t gid = (int32_t)(kv - kmin);
+            acc->count[gid]++;
+            size_t base = (size_t)gid * n_aggs;
+            for (uint8_t a = 0; a < n_aggs; a++) {
+                if (!c->agg_ptrs[a]) continue;
+                size_t idx = base + a;
+                double fv; int64_t iv;
+                da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+                uint16_t op = c->agg_ops[a];
+                if (op == OP_SUM || op == OP_AVG) {
+                    acc->f64[idx] += fv;
+                    acc->i64[idx] += iv;
+                } else if (op == OP_MIN) {
+                    if (fv < acc->min_f64[idx]) acc->min_f64[idx] = fv;
+                    if (iv < acc->min_i64[idx]) acc->min_i64[idx] = iv;
+                } else if (op == OP_MAX) {
+                    if (fv > acc->max_f64[idx]) acc->max_f64[idx] = fv;
+                    if (iv > acc->max_i64[idx]) acc->max_i64[idx] = iv;
+                }
+            }
+        }
+        return;
+    }
+
+    /* Multi-key composite GID path */
     for (int64_t r = start; r < end; r++) {
         int32_t gid = da_composite_gid(c, r);
         acc->count[gid]++;
@@ -1096,7 +1228,6 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             size_t idx = base + a;
             double fv; int64_t iv;
             da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
-
             uint16_t op = c->agg_ops[a];
             if (op == OP_SUM || op == OP_AVG) {
                 acc->f64[idx] += fv;
@@ -1108,7 +1239,6 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 if (fv > acc->max_f64[idx]) acc->max_f64[idx] = fv;
                 if (iv > acc->max_i64[idx]) acc->max_i64[idx] = iv;
             }
-            /* OP_COUNT only needs count[] which is already incremented above */
         }
     }
 }
@@ -1123,9 +1253,9 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
-    /* Resolve key columns */
-    td_t** key_vecs = (td_t**)calloc(n_keys, sizeof(td_t*));
-    if (!key_vecs) return TD_ERR_PTR(TD_ERR_OOM);
+    /* Resolve key columns (VLA — n_keys ≤ 8) */
+    td_t* key_vecs[n_keys];
+    memset(key_vecs, 0, n_keys * sizeof(td_t*));
 
     for (uint8_t k = 0; k < n_keys; k++) {
         td_op_t* key_op = ext->keys[k];
@@ -1135,9 +1265,9 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         }
     }
 
-    /* Resolve agg input columns */
-    td_t** agg_vecs = (td_t**)calloc(n_aggs, sizeof(td_t*));
-    if (!agg_vecs) { free(key_vecs); return TD_ERR_PTR(TD_ERR_OOM); }
+    /* Resolve agg input columns (VLA — n_aggs ≤ 8) */
+    td_t* agg_vecs[n_aggs];
+    memset(agg_vecs, 0, n_aggs * sizeof(td_t*));
 
     for (uint8_t a = 0; a < n_aggs; a++) {
         td_op_t* agg_op = ext->agg_ins[a];
@@ -1147,13 +1277,9 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         }
     }
 
-    /* Pre-compute key metadata to avoid td_data() / ->type in hot loop */
-    void** key_data   = (void**)malloc(n_keys * sizeof(void*));
-    int8_t* key_types = (int8_t*)malloc(n_keys * sizeof(int8_t));
-    if (!key_data || !key_types) {
-        free(key_vecs); free(agg_vecs); free(key_data); free(key_types);
-        return TD_ERR_PTR(TD_ERR_OOM);
-    }
+    /* Pre-compute key metadata (VLA — n_keys ≤ 8) */
+    void* key_data[n_keys];
+    int8_t key_types[n_keys];
     for (uint8_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = td_data(key_vecs[k]);
@@ -1184,29 +1310,32 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
 
         if (da_eligible) {
             da_fits = true;
+            td_pool_t* mm_pool = td_pool_get();
+            uint32_t mm_n = (mm_pool && nrows >= TD_PARALLEL_THRESHOLD)
+                            ? td_pool_total_workers(mm_pool) : 1;
+            int64_t mm_mins[mm_n], mm_maxs[mm_n];
             for (uint8_t k = 0; k < n_keys && da_fits; k++) {
-                int64_t kmin = INT64_MAX, kmax = INT64_MIN;
-                int8_t t = key_types[k];
-                if (t == TD_I64 || t == TD_SYM) {
-                    const int64_t* kd = (const int64_t*)key_data[k];
-                    for (int64_t r = 0; r < nrows; r++) {
-                        if (kd[r] < kmin) kmin = kd[r];
-                        if (kd[r] > kmax) kmax = kd[r];
-                    }
-                } else if (t == TD_ENUM) {
-                    const uint32_t* kd = (const uint32_t*)key_data[k];
-                    for (int64_t r = 0; r < nrows; r++) {
-                        int64_t v = (int64_t)kd[r];
-                        if (v < kmin) kmin = v;
-                        if (v > kmax) kmax = v;
-                    }
-                } else { /* TD_I32 */
-                    const int32_t* kd = (const int32_t*)key_data[k];
-                    for (int64_t r = 0; r < nrows; r++) {
-                        int64_t v = (int64_t)kd[r];
-                        if (v < kmin) kmin = v;
-                        if (v > kmax) kmax = v;
-                    }
+                int64_t kmin, kmax;
+                for (uint32_t w = 0; w < mm_n; w++) {
+                    mm_mins[w] = INT64_MAX;
+                    mm_maxs[w] = INT64_MIN;
+                }
+                minmax_ctx_t mm_ctx = {
+                    .key_data       = key_data[k],
+                    .key_type       = key_types[k],
+                    .per_worker_min = mm_mins,
+                    .per_worker_max = mm_maxs,
+                    .n_workers      = mm_n,
+                };
+                if (mm_n > 1) {
+                    td_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, nrows);
+                } else {
+                    minmax_scan_fn(&mm_ctx, 0, 0, nrows);
+                }
+                kmin = INT64_MAX; kmax = INT64_MIN;
+                for (uint32_t w = 0; w < mm_n; w++) {
+                    if (mm_mins[w] < kmin) kmin = mm_mins[w];
+                    if (mm_maxs[w] > kmax) kmax = mm_maxs[w];
                 }
                 da_key_min[k]   = kmin;
                 da_key_range[k] = kmax - kmin + 1;
@@ -1257,12 +1386,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             uint32_t n_slots = (uint32_t)total_slots;
             size_t total = (size_t)n_slots * n_aggs;
 
-            void** agg_ptrs    = (void**)malloc(n_aggs * sizeof(void*));
-            int8_t* agg_types  = (int8_t*)malloc(n_aggs * sizeof(int8_t));
-            if (!agg_ptrs || !agg_types) {
-                free(agg_ptrs); free(agg_types);
-                goto ht_path;
-            }
+            void* agg_ptrs[n_aggs];
+            int8_t agg_types[n_aggs];
             for (uint8_t a = 0; a < n_aggs; a++) {
                 if (agg_vecs[a]) {
                     agg_ptrs[a]  = td_data(agg_vecs[a]);
@@ -1286,19 +1411,21 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             while (da_n_workers > 1 && (uint64_t)da_n_workers * per_worker_bytes > DA_MEM_BUDGET)
                 da_n_workers /= 2;
 
-            da_accum_t* accums = (da_accum_t*)calloc(da_n_workers, sizeof(da_accum_t));
-            if (!accums) { free(agg_ptrs); free(agg_types); goto ht_path; }
+            td_t* accums_hdr;
+            da_accum_t* accums = (da_accum_t*)scratch_calloc(&accums_hdr,
+                da_n_workers * sizeof(da_accum_t));
+            if (!accums) goto ht_path;
 
             bool alloc_ok = true;
             for (uint32_t w = 0; w < da_n_workers; w++) {
                 if (need_flags & DA_NEED_SUM) {
-                    accums[w].f64 = (double*)calloc(total, sizeof(double));
-                    accums[w].i64 = (int64_t*)calloc(total, sizeof(int64_t));
+                    accums[w].f64 = (double*)scratch_calloc(&accums[w]._h_f64, total * sizeof(double));
+                    accums[w].i64 = (int64_t*)scratch_calloc(&accums[w]._h_i64, total * sizeof(int64_t));
                     if (!accums[w].f64 || !accums[w].i64) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_MIN) {
-                    accums[w].min_f64 = (double*)malloc(total * sizeof(double));
-                    accums[w].min_i64 = (int64_t*)malloc(total * sizeof(int64_t));
+                    accums[w].min_f64 = (double*)scratch_alloc(&accums[w]._h_min_f64, total * sizeof(double));
+                    accums[w].min_i64 = (int64_t*)scratch_alloc(&accums[w]._h_min_i64, total * sizeof(int64_t));
                     if (!accums[w].min_f64 || !accums[w].min_i64) { alloc_ok = false; break; }
                     for (size_t i = 0; i < total; i++) {
                         accums[w].min_f64[i] = DBL_MAX;
@@ -1306,25 +1433,25 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                     }
                 }
                 if (need_flags & DA_NEED_MAX) {
-                    accums[w].max_f64 = (double*)malloc(total * sizeof(double));
-                    accums[w].max_i64 = (int64_t*)malloc(total * sizeof(int64_t));
+                    accums[w].max_f64 = (double*)scratch_alloc(&accums[w]._h_max_f64, total * sizeof(double));
+                    accums[w].max_i64 = (int64_t*)scratch_alloc(&accums[w]._h_max_i64, total * sizeof(int64_t));
                     if (!accums[w].max_f64 || !accums[w].max_i64) { alloc_ok = false; break; }
                     for (size_t i = 0; i < total; i++) {
                         accums[w].max_f64[i] = -DBL_MAX;
                         accums[w].max_i64[i] = INT64_MIN;
                     }
                 }
-                accums[w].count = (int64_t*)calloc(n_slots, sizeof(int64_t));
+                accums[w].count = (int64_t*)scratch_calloc(&accums[w]._h_count, n_slots * sizeof(int64_t));
                 if (!accums[w].count) { alloc_ok = false; break; }
             }
             if (!alloc_ok) {
                 for (uint32_t w = 0; w < da_n_workers; w++) {
-                    free(accums[w].f64); free(accums[w].i64);
-                    free(accums[w].min_f64); free(accums[w].max_f64);
-                    free(accums[w].min_i64); free(accums[w].max_i64);
-                    free(accums[w].count);
+                    scratch_free(accums[w]._h_f64); scratch_free(accums[w]._h_i64);
+                    scratch_free(accums[w]._h_min_f64); scratch_free(accums[w]._h_max_f64);
+                    scratch_free(accums[w]._h_min_i64); scratch_free(accums[w]._h_max_i64);
+                    scratch_free(accums[w]._h_count);
                 }
-                free(accums); free(agg_ptrs); free(agg_types);
+                scratch_free(accums_hdr);
                 goto ht_path;
             }
 
@@ -1380,10 +1507,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 }
             }
             for (uint32_t w = 1; w < da_n_workers; w++) {
-                free(accums[w].f64); free(accums[w].i64);
-                free(accums[w].min_f64); free(accums[w].max_f64);
-                free(accums[w].min_i64); free(accums[w].max_i64);
-                free(accums[w].count);
+                scratch_free(accums[w]._h_f64); scratch_free(accums[w]._h_i64);
+                scratch_free(accums[w]._h_min_f64); scratch_free(accums[w]._h_max_f64);
+                scratch_free(accums[w]._h_min_i64); scratch_free(accums[w]._h_max_i64);
+                scratch_free(accums[w]._h_count);
             }
 
             double*  da_f64     = merged->f64;     /* may be NULL if !DA_NEED_SUM */
@@ -1401,10 +1528,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             int64_t total_cols = n_keys + n_aggs;
             td_t* result = td_df_new(total_cols);
             if (!result || TD_IS_ERR(result)) {
-                free(da_f64); free(da_i64); free(da_min_f64); free(da_max_f64);
-                free(da_min_i64); free(da_max_i64); free(da_count);
-                free(accums); free(agg_ptrs); free(agg_types);
-                free(key_vecs); free(agg_vecs); free(key_data); free(key_types);
+                scratch_free(accums[0]._h_f64); scratch_free(accums[0]._h_i64);
+                scratch_free(accums[0]._h_min_f64); scratch_free(accums[0]._h_max_f64);
+                scratch_free(accums[0]._h_min_i64); scratch_free(accums[0]._h_max_i64);
+                scratch_free(accums[0]._h_count); scratch_free(accums_hdr);
                 return result ? result : TD_ERR_PTR(TD_ERR_OOM);
             }
 
@@ -1485,10 +1612,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 td_release(new_col);
             }
 
-            free(da_f64); free(da_i64); free(da_min_f64); free(da_max_f64);
-            free(da_min_i64); free(da_max_i64); free(da_count);
-            free(accums); free(agg_ptrs); free(agg_types);
-            free(key_vecs); free(agg_vecs); free(key_data); free(key_types);
+            scratch_free(accums[0]._h_f64); scratch_free(accums[0]._h_i64);
+            scratch_free(accums[0]._h_min_f64); scratch_free(accums[0]._h_max_f64);
+            scratch_free(accums[0]._h_min_i64); scratch_free(accums[0]._h_max_i64);
+            scratch_free(accums[0]._h_count); scratch_free(accums_hdr);
             return result;
         }
     }
@@ -1510,20 +1637,27 @@ ht_path:;
     group_ht_t* final_ht = NULL;
 
     /* Radix partition state — declared here for cleanup */
+    td_t* radix_bufs_hdr = NULL;
     radix_buf_t* radix_bufs = NULL;
+    td_t* part_hts_hdr = NULL;
     group_ht_t*  part_hts   = NULL;
 
     if (pool && nrows >= TD_PARALLEL_THRESHOLD && n_total > 1) {
         /* Allocate per-worker, per-partition buffers */
         size_t n_bufs = (size_t)n_total * RADIX_P;
-        radix_bufs = (radix_buf_t*)calloc(n_bufs, sizeof(radix_buf_t));
+        radix_bufs = (radix_buf_t*)scratch_calloc(&radix_bufs_hdr,
+            n_bufs * sizeof(radix_buf_t));
         if (!radix_bufs) goto sequential_fallback;
 
-        /* Pre-size each buffer: expect nrows / (P * n_workers) rows per buffer */
+        /* Pre-size each buffer with 2x expected to avoid realloc */
         uint32_t buf_init = (uint32_t)((uint64_t)nrows / (RADIX_P * n_total));
         if (buf_init < 64) buf_init = 64;
+        buf_init *= 2;  /* 2x headroom */
         for (size_t i = 0; i < n_bufs; i++) {
-            radix_buf_init(&radix_bufs[i], buf_init);
+            radix_bufs[i].entries = (radix_entry_t*)scratch_alloc(
+                &radix_bufs[i]._hdr, buf_init * sizeof(radix_entry_t));
+            radix_bufs[i].count = 0;
+            radix_bufs[i].cap = buf_init;
         }
 
         /* Phase 1: Parallel partitioning */
@@ -1537,11 +1671,11 @@ ht_path:;
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
 
         /* Phase 2: Parallel per-partition aggregation */
-        part_hts = (group_ht_t*)calloc(RADIX_P, sizeof(group_ht_t));
+        part_hts = (group_ht_t*)scratch_calloc(&part_hts_hdr,
+            RADIX_P * sizeof(group_ht_t));
         if (!part_hts) {
-            /* Cleanup phase 1 buffers and fall through to sequential */
-            for (size_t i = 0; i < n_bufs; i++) radix_buf_free(&radix_bufs[i]);
-            free(radix_bufs);
+            for (size_t i = 0; i < n_bufs; i++) scratch_free(radix_bufs[i]._hdr);
+            scratch_free(radix_bufs_hdr);
             radix_bufs = NULL;
             goto sequential_fallback;
         }
@@ -1697,19 +1831,15 @@ cleanup:
     /* Free radix partition state */
     if (radix_bufs) {
         size_t n_bufs = (size_t)n_total * RADIX_P;
-        for (size_t i = 0; i < n_bufs; i++) radix_buf_free(&radix_bufs[i]);
-        free(radix_bufs);
+        for (size_t i = 0; i < n_bufs; i++) scratch_free(radix_bufs[i]._hdr);
+        scratch_free(radix_bufs_hdr);
     }
     if (part_hts) {
         for (uint32_t p = 0; p < RADIX_P; p++) {
             if (part_hts[p].groups) group_ht_free(&part_hts[p]);
         }
-        free(part_hts);
+        scratch_free(part_hts_hdr);
     }
-    free(key_vecs);
-    free(agg_vecs);
-    free(key_data);
-    free(key_types);
 
     return result;
 }
@@ -1730,8 +1860,10 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
-    td_t** l_key_vecs = (td_t**)calloc(n_keys, sizeof(td_t*));
-    td_t** r_key_vecs = (td_t**)calloc(n_keys, sizeof(td_t*));
+    td_t* l_key_vecs[n_keys];
+    td_t* r_key_vecs[n_keys];
+    memset(l_key_vecs, 0, n_keys * sizeof(td_t*));
+    memset(r_key_vecs, 0, n_keys * sizeof(td_t*));
 
     for (uint8_t k = 0; k < n_keys; k++) {
         td_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
@@ -1748,10 +1880,12 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     uint32_t ht_cap = 256;
     while (ht_cap < (uint32_t)right_rows * 2) ht_cap *= 2;
 
-    int64_t* ht_next = (int64_t*)malloc((size_t)right_rows * sizeof(int64_t));
-    int64_t* ht_heads = (int64_t*)malloc(ht_cap * sizeof(int64_t));
+    td_t* ht_next_hdr;
+    td_t* ht_heads_hdr;
+    int64_t* ht_next = (int64_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(int64_t));
+    int64_t* ht_heads = (int64_t*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(int64_t));
     if (!ht_next || !ht_heads) {
-        free(l_key_vecs); free(r_key_vecs); free(ht_next); free(ht_heads);
+        scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
     memset(ht_heads, -1, ht_cap * sizeof(int64_t));
@@ -1766,11 +1900,13 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     /* Probe: collect (left_idx, right_idx) pairs */
     int64_t pair_cap = left_rows;
     int64_t pair_count = 0;
-    int64_t* l_idx = (int64_t*)malloc((size_t)pair_cap * sizeof(int64_t));
-    int64_t* r_idx = (int64_t*)malloc((size_t)pair_cap * sizeof(int64_t));
+    td_t* l_idx_hdr;
+    td_t* r_idx_hdr;
+    int64_t* l_idx = (int64_t*)scratch_alloc(&l_idx_hdr, (size_t)pair_cap * sizeof(int64_t));
+    int64_t* r_idx = (int64_t*)scratch_alloc(&r_idx_hdr, (size_t)pair_cap * sizeof(int64_t));
     if (!l_idx || !r_idx) {
-        free(l_key_vecs); free(r_key_vecs); free(ht_next); free(ht_heads);
-        free(l_idx); free(r_idx);
+        scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
+        scratch_free(l_idx_hdr); scratch_free(r_idx_hdr);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
@@ -1799,9 +1935,12 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
 
             if (eq) {
                 if (pair_count >= pair_cap) {
+                    int64_t old_cap = pair_cap;
                     pair_cap *= 2;
-                    l_idx = (int64_t*)realloc(l_idx, (size_t)pair_cap * sizeof(int64_t));
-                    r_idx = (int64_t*)realloc(r_idx, (size_t)pair_cap * sizeof(int64_t));
+                    l_idx = (int64_t*)scratch_realloc(&l_idx_hdr,
+                        (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
+                    r_idx = (int64_t*)scratch_realloc(&r_idx_hdr,
+                        (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
                 }
                 l_idx[pair_count] = l;
                 r_idx[pair_count] = r;
@@ -1812,9 +1951,12 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
 
         if (!matched && join_type == 1) {
             if (pair_count >= pair_cap) {
+                int64_t old_cap = pair_cap;
                 pair_cap *= 2;
-                l_idx = (int64_t*)realloc(l_idx, (size_t)pair_cap * sizeof(int64_t));
-                r_idx = (int64_t*)realloc(r_idx, (size_t)pair_cap * sizeof(int64_t));
+                l_idx = (int64_t*)scratch_realloc(&l_idx_hdr,
+                    (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
+                r_idx = (int64_t*)scratch_realloc(&r_idx_hdr,
+                    (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
             }
             l_idx[pair_count] = l;
             r_idx[pair_count] = -1;
@@ -1881,12 +2023,10 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     }
 
 join_cleanup:
-    free(l_key_vecs);
-    free(r_key_vecs);
-    free(ht_next);
-    free(ht_heads);
-    free(l_idx);
-    free(r_idx);
+    scratch_free(ht_next_hdr);
+    scratch_free(ht_heads_hdr);
+    scratch_free(l_idx_hdr);
+    scratch_free(r_idx_hdr);
 
     return result;
 }

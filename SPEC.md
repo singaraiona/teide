@@ -54,8 +54,8 @@ teide/
 │   │   ├── vec.h/.c            # Vector create/access/append, nullable bitmaps
 │   │   ├── str.h/.c            # String type (SSO + long-string via CHAR vector)
 │   │   └── list.h/.c           # LIST (heterogeneous vector of td_t* pointers)
-│   ├── df/
-│   │   ├── df.h/.c             # Table (named column collection)
+│   ├── table/
+│   │   ├── table.h/.c          # Table (named column collection)
 │   │   └── sym.h/.c            # Global symbol intern table
 │   ├── ops/
 │   │   ├── morsel.h/.c       # Morsel iterator (td_morsel_t), madvise integration

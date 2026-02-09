@@ -24,10 +24,10 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
     /* Create directory */
     mkdir(dir, 0755);
 
-    int64_t ncols = td_df_ncols(df);
+    int64_t ncols = td_table_ncols(df);
 
     /* Save .d schema file */
-    td_t* schema = td_df_schema(df);
+    td_t* schema = td_table_schema(df);
     if (schema) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/.d", dir);
@@ -37,8 +37,8 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
 
     /* Save each column */
     for (int64_t c = 0; c < ncols; c++) {
-        td_t* col = td_df_get_col_idx(df, c);
-        int64_t name_id = td_df_col_name(df, c);
+        td_t* col = td_table_get_col_idx(df, c);
+        int64_t name_id = td_table_col_name(df, c);
         if (!col) continue;
 
         /* Get column name string */
@@ -74,7 +74,7 @@ td_t* td_splay_load(const char* dir) {
     int64_t ncols = schema->len;
     int64_t* name_ids = (int64_t*)td_data(schema);
 
-    td_t* df = td_df_new(ncols);
+    td_t* df = td_table_new(ncols);
     if (!df || TD_IS_ERR(df)) {
         td_release(schema);
         return df;
@@ -93,7 +93,7 @@ td_t* td_splay_load(const char* dir) {
         td_t* col = td_col_load(path);
         if (!col || TD_IS_ERR(col)) continue;
 
-        df = td_df_add_col(df, name_id, col);
+        df = td_table_add_col(df, name_id, col);
         /* col is now owned by df (retained), but we keep the mmap ref */
     }
 

@@ -27,8 +27,8 @@ static MunitResult test_parallel_sum(const void* params, void* data) {
     int64_t expected = n * (n + 1) / 2;
 
     int64_t col_name = td_sym_intern("val", 3);
-    td_t* df = td_df_new(1);
-    df = td_df_add_col(df, col_name, vec);
+    td_t* df = td_table_new(1);
+    df = td_table_add_col(df, col_name, vec);
 
     td_graph_t* g = td_graph_new(df);
     td_op_t* scan = td_scan(g, "val");
@@ -71,9 +71,9 @@ static MunitResult test_parallel_add(const void* params, void* data) {
 
     int64_t name_a = td_sym_intern("a", 1);
     int64_t name_b = td_sym_intern("b", 1);
-    td_t* df = td_df_new(2);
-    df = td_df_add_col(df, name_a, a_vec);
-    df = td_df_add_col(df, name_b, b_vec);
+    td_t* df = td_table_new(2);
+    df = td_table_add_col(df, name_a, a_vec);
+    df = td_table_add_col(df, name_b, b_vec);
 
     td_graph_t* g = td_graph_new(df);
     td_op_t* sa = td_scan(g, "a");
@@ -136,9 +136,9 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
 
     int64_t name_id = td_sym_intern("id", 2);
     int64_t name_v  = td_sym_intern("v", 1);
-    td_t* df = td_df_new(2);
-    df = td_df_add_col(df, name_id, id_vec);
-    df = td_df_add_col(df, name_v, v_vec);
+    td_t* df = td_table_new(2);
+    df = td_table_add_col(df, name_id, id_vec);
+    df = td_table_add_col(df, name_v, v_vec);
 
     td_graph_t* g = td_graph_new(df);
 
@@ -158,12 +158,12 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
 
     /* Result should have 4 groups */
-    int64_t nrows = td_df_nrows(result);
+    int64_t nrows = td_table_nrows(result);
     munit_assert_int(nrows, ==, 4);
 
     /* Extract key and sum columns by index (0=key, 1=agg) */
-    td_t* res_ids = td_df_get_col_idx(result, 0);
-    td_t* res_sums = td_df_get_col_idx(result, 1);
+    td_t* res_ids = td_table_get_col_idx(result, 0);
+    td_t* res_sums = td_table_get_col_idx(result, 1);
     munit_assert_ptr_not_null(res_ids);
     munit_assert_ptr_not_null(res_sums);
 
@@ -207,8 +207,8 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
     /* Range: -50000.0 to 49999.0 */
 
     int64_t col_name = td_sym_intern("x", 1);
-    td_t* df = td_df_new(1);
-    df = td_df_add_col(df, col_name, vec);
+    td_t* df = td_table_new(1);
+    df = td_table_add_col(df, col_name, vec);
 
     /* Test min */
     td_graph_t* g = td_graph_new(df);

@@ -28,7 +28,7 @@ class AdapterResult:
 def const_col(lib, g, df_ptr, name):
     """Extract a column from a DataFrame and wrap as td_const_vec node."""
     name_id = lib.sym_intern(name)
-    col_vec = lib._lib.td_df_get_col(df_ptr, name_id)
+    col_vec = lib._lib.td_table_get_col(df_ptr, name_id)
     if not col_vec:
         raise ValueError(f"Column '{name}' not found in DataFrame")
     return lib.const_vec(g, col_vec)

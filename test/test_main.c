@@ -21,7 +21,7 @@ extern MunitSuite test_str_suite;
 extern MunitSuite test_list_suite;
 extern MunitSuite test_morsel_suite;
 extern MunitSuite test_sym_suite;
-extern MunitSuite test_df_suite;
+extern MunitSuite test_table_suite;
 extern MunitSuite test_graph_suite;
 extern MunitSuite test_pool_suite;
 
@@ -37,7 +37,7 @@ static MunitSuite child_suites[] = {
     { "/list",   NULL, NULL, 0, 0 },
     { "/morsel", NULL, NULL, 0, 0 },
     { "/sym",    NULL, NULL, 0, 0 },
-    { "/df",     NULL, NULL, 0, 0 },
+    { "/table",  NULL, NULL, 0, 0 },
     { "/graph",  NULL, NULL, 0, 0 },
     { "/pool",   NULL, NULL, 0, 0 },
     { NULL, NULL, NULL, 0, 0 },        /* terminator */
@@ -63,7 +63,7 @@ int main(int argc, char* argv[]) {
     child_suites[7] = test_list_suite;
     child_suites[8] = test_morsel_suite;
     child_suites[9] = test_sym_suite;
-    child_suites[10] = test_df_suite;
+    child_suites[10] = test_table_suite;
     child_suites[11] = test_graph_suite;
     child_suites[12] = test_pool_suite;
 

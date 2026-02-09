@@ -117,26 +117,26 @@ class TeideLib:
         lib.td_str_len.restype = ctypes.c_size_t
 
         # ===== DataFrame API =====
-        lib.td_df_new.argtypes = [ctypes.c_int64]
-        lib.td_df_new.restype = c_td_p
+        lib.td_table_new.argtypes = [ctypes.c_int64]
+        lib.td_table_new.restype = c_td_p
 
-        lib.td_df_add_col.argtypes = [c_td_p, ctypes.c_int64, c_td_p]
-        lib.td_df_add_col.restype = c_td_p
+        lib.td_table_add_col.argtypes = [c_td_p, ctypes.c_int64, c_td_p]
+        lib.td_table_add_col.restype = c_td_p
 
-        lib.td_df_get_col.argtypes = [c_td_p, ctypes.c_int64]
-        lib.td_df_get_col.restype = c_td_p
+        lib.td_table_get_col.argtypes = [c_td_p, ctypes.c_int64]
+        lib.td_table_get_col.restype = c_td_p
 
-        lib.td_df_get_col_idx.argtypes = [c_td_p, ctypes.c_int64]
-        lib.td_df_get_col_idx.restype = c_td_p
+        lib.td_table_get_col_idx.argtypes = [c_td_p, ctypes.c_int64]
+        lib.td_table_get_col_idx.restype = c_td_p
 
-        lib.td_df_col_name.argtypes = [c_td_p, ctypes.c_int64]
-        lib.td_df_col_name.restype = ctypes.c_int64
+        lib.td_table_col_name.argtypes = [c_td_p, ctypes.c_int64]
+        lib.td_table_col_name.restype = ctypes.c_int64
 
-        lib.td_df_ncols.argtypes = [c_td_p]
-        lib.td_df_ncols.restype = ctypes.c_int64
+        lib.td_table_ncols.argtypes = [c_td_p]
+        lib.td_table_ncols.restype = ctypes.c_int64
 
-        lib.td_df_nrows.argtypes = [c_td_p]
-        lib.td_df_nrows.restype = ctypes.c_int64
+        lib.td_table_nrows.argtypes = [c_td_p]
+        lib.td_table_nrows.restype = ctypes.c_int64
 
         # ===== Graph API =====
         lib.td_graph_new.argtypes = [c_td_p]
@@ -329,16 +329,16 @@ class TeideLib:
         return self._lib.td_execute(g, root)
 
     def df_ncols(self, df):
-        return self._lib.td_df_ncols(df)
+        return self._lib.td_table_ncols(df)
 
     def df_nrows(self, df):
-        return self._lib.td_df_nrows(df)
+        return self._lib.td_table_nrows(df)
 
     def df_get_col_idx(self, df, idx):
-        return self._lib.td_df_get_col_idx(df, idx)
+        return self._lib.td_table_get_col_idx(df, idx)
 
     def df_col_name(self, df, idx):
-        return self._lib.td_df_col_name(df, idx)
+        return self._lib.td_table_col_name(df, idx)
 
     def sym_str(self, sym_id):
         return self._lib.td_sym_str(sym_id)
@@ -362,10 +362,10 @@ class TeideLib:
         return self._lib.td_vec_from_raw(7, arr, len(data))  # TD_F64 = 7
 
     def df_new(self, ncols):
-        return self._lib.td_df_new(ncols)
+        return self._lib.td_table_new(ncols)
 
     def df_add_col(self, df, name_id, col):
-        return self._lib.td_df_add_col(df, name_id, col)
+        return self._lib.td_table_add_col(df, name_id, col)
 
 
 # Type constants (mirror C defines)

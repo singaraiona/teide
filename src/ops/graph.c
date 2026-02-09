@@ -109,7 +109,7 @@ td_op_t* td_scan(td_graph_t* g, const char* col_name) {
 
     /* Infer output type from the bound table */
     if (g->df) {
-        td_t* col = td_df_get_col(g->df, sym_id);
+        td_t* col = td_table_get_col(g->df, sym_id);
         if (col) {
             ext->base.out_type = col->type;
             ext->base.est_rows = (uint32_t)col->len;

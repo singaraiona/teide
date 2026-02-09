@@ -508,8 +508,8 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t nrows = td_df_nrows(df);
-    int64_t ncols = td_df_ncols(df);
+    int64_t nrows = td_table_nrows(df);
+    int64_t ncols = td_table_ncols(df);
     uint8_t n_sort = ext->sort.n_cols;
 
     td_t* indices_hdr;
@@ -524,7 +524,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         td_op_t* key_op = ext->sort.columns[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            sort_vecs[k] = td_df_get_col(df, key_ext->sym);
+            sort_vecs[k] = td_table_get_col(df, key_ext->sym);
         } else {
             sort_vecs[k] = NULL;
         }
@@ -573,14 +573,14 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         indices[j + 1] = key;
     }
 
-    td_t* result = td_df_new(ncols);
+    td_t* result = td_table_new(ncols);
     if (!result || TD_IS_ERR(result)) {
         scratch_free(indices_hdr); return result;
     }
 
     for (int64_t c = 0; c < ncols; c++) {
-        td_t* col = td_df_get_col_idx(df, c);
-        int64_t name_id = td_df_col_name(df, c);
+        td_t* col = td_table_get_col_idx(df, c);
+        int64_t name_id = td_table_col_name(df, c);
         if (!col) continue;
 
         uint8_t esz = td_elem_size(col->type);
@@ -594,7 +594,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
             memcpy(dst + i * esz, src + indices[i] * esz, esz);
         }
 
-        result = td_df_add_col(result, name_id, new_col);
+        result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
     }
 
@@ -1176,7 +1176,7 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
         }
         td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
         int64_t name_id = agg_ext ? agg_ext->sym : (int64_t)(n_keys + a);
-        *result = td_df_add_col(*result, name_id, new_col);
+        *result = td_table_add_col(*result, name_id, new_col);
         td_release(new_col);
     }
 }
@@ -1313,7 +1313,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t nrows = td_df_nrows(df);
+    int64_t nrows = td_table_nrows(df);
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
@@ -1327,7 +1327,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         td_op_t* key_op = ext->keys[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            key_vecs[k] = td_df_get_col(df, key_ext->sym);
+            key_vecs[k] = td_table_get_col(df, key_ext->sym);
         }
     }
 
@@ -1339,7 +1339,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         td_op_t* agg_op = ext->agg_ins[a];
         td_op_ext_t* agg_ext = find_ext(g, agg_op->id);
         if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
-            agg_vecs[a] = td_df_get_col(df, agg_ext->sym);
+            agg_vecs[a] = td_table_get_col(df, agg_ext->sym);
         }
     }
 
@@ -1584,7 +1584,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 if (da_count[s] > 0) grp_count++;
 
             int64_t total_cols = n_keys + n_aggs;
-            td_t* result = td_df_new(total_cols);
+            td_t* result = td_table_new(total_cols);
             if (!result || TD_IS_ERR(result)) {
                 da_accum_free(&accums[0]); scratch_free(accums_hdr);
                 return result ? result : TD_ERR_PTR(TD_ERR_OOM);
@@ -1612,7 +1612,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 }
                 td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
                 int64_t name_id = key_ext ? key_ext->sym : (int64_t)k;
-                result = td_df_add_col(result, name_id, key_col);
+                result = td_table_add_col(result, name_id, key_col);
                 td_release(key_col);
             }
 
@@ -1784,7 +1784,7 @@ build_result:;
     /* Build result DataFrame */
     uint32_t grp_count = final_ht->grp_count;
     int64_t total_cols = n_keys + n_aggs;
-    td_t* result = td_df_new(total_cols);
+    td_t* result = td_table_new(total_cols);
     if (!result || TD_IS_ERR(result)) goto cleanup;
 
     /* Key columns */
@@ -1805,7 +1805,7 @@ build_result:;
 
         td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
         int64_t name_id = key_ext ? key_ext->sym : k;
-        result = td_df_add_col(result, name_id, new_col);
+        result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
     }
 
@@ -1854,8 +1854,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t left_rows = td_df_nrows(left_df);
-    int64_t right_rows = td_df_nrows(right_df);
+    int64_t left_rows = td_table_nrows(left_df);
+    int64_t right_rows = td_table_nrows(right_df);
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
@@ -1868,9 +1868,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
         td_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
         td_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
         if (lk && lk->base.opcode == OP_SCAN)
-            l_key_vecs[k] = td_df_get_col(left_df, lk->sym);
+            l_key_vecs[k] = td_table_get_col(left_df, lk->sym);
         if (rk && rk->base.opcode == OP_SCAN)
-            r_key_vecs[k] = td_df_get_col(right_df, rk->sym);
+            r_key_vecs[k] = td_table_get_col(right_df, rk->sym);
         if (rk && rk->base.opcode == OP_CONST && rk->literal)
             r_key_vecs[k] = rk->literal;
     }
@@ -1964,14 +1964,14 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     }
 
     /* Build result DataFrame */
-    int64_t left_ncols = td_df_ncols(left_df);
-    int64_t right_ncols = td_df_ncols(right_df);
-    td_t* result = td_df_new(left_ncols + right_ncols);
+    int64_t left_ncols = td_table_ncols(left_df);
+    int64_t right_ncols = td_table_ncols(right_df);
+    td_t* result = td_table_new(left_ncols + right_ncols);
     if (!result || TD_IS_ERR(result)) goto join_cleanup;
 
     for (int64_t c = 0; c < left_ncols; c++) {
-        td_t* col = td_df_get_col_idx(left_df, c);
-        int64_t name_id = td_df_col_name(left_df, c);
+        td_t* col = td_table_get_col_idx(left_df, c);
+        int64_t name_id = td_table_col_name(left_df, c);
         if (!col) continue;
 
         uint8_t esz = td_elem_size(col->type);
@@ -1984,13 +1984,13 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
         for (int64_t i = 0; i < pair_count; i++) {
             memcpy(dst + i * esz, src + l_idx[i] * esz, esz);
         }
-        result = td_df_add_col(result, name_id, new_col);
+        result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
     }
 
     for (int64_t c = 0; c < right_ncols; c++) {
-        td_t* col = td_df_get_col_idx(right_df, c);
-        int64_t name_id = td_df_col_name(right_df, c);
+        td_t* col = td_table_get_col_idx(right_df, c);
+        int64_t name_id = td_table_col_name(right_df, c);
         if (!col) continue;
 
         bool is_key = false;
@@ -2017,7 +2017,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
                 memset(dst + i * esz, 0, esz);
             }
         }
-        result = td_df_add_col(result, name_id, new_col);
+        result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
     }
 
@@ -2044,7 +2044,7 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
             if (!g->df) return TD_ERR_PTR(TD_ERR_SCHEMA);
-            td_t* col = td_df_get_col(g->df, ext->sym);
+            td_t* col = td_table_get_col(g->df, ext->sym);
             if (!col) return TD_ERR_PTR(TD_ERR_SCHEMA);
             td_retain(col);
             return col;
@@ -2135,15 +2135,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             if (!input || TD_IS_ERR(input)) return input;
             int64_t n = ext ? ext->sym : 10;
             if (input->type == TD_TABLE) {
-                int64_t ncols = td_df_ncols(input);
-                int64_t nrows = td_df_nrows(input);
+                int64_t ncols = td_table_ncols(input);
+                int64_t nrows = td_table_nrows(input);
                 if (n > nrows) n = nrows;
-                td_t* result = td_df_new(ncols);
+                td_t* result = td_table_new(ncols);
                 for (int64_t c = 0; c < ncols; c++) {
-                    td_t* col = td_df_get_col_idx(input, c);
-                    int64_t name_id = td_df_col_name(input, c);
+                    td_t* col = td_table_get_col_idx(input, c);
+                    int64_t name_id = td_table_col_name(input, c);
                     td_t* sliced = td_vec_slice(col, 0, n);
-                    result = td_df_add_col(result, name_id, sliced);
+                    result = td_table_add_col(result, name_id, sliced);
                     td_release(sliced);
                 }
                 td_release(input);

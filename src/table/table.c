@@ -1,4 +1,4 @@
-#include "df.h"
+#include "table.h"
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -23,10 +23,10 @@ static td_t** df_col_slots(td_t* df) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_new
+ * td_table_new
  * -------------------------------------------------------------------------- */
 
-td_t* td_df_new(int64_t ncols) {
+td_t* td_table_new(int64_t ncols) {
     /* Allocate: 1 schema pointer + ncols column pointers */
     size_t data_size = (size_t)(1 + ncols) * sizeof(td_t*);
 
@@ -54,10 +54,10 @@ td_t* td_df_new(int64_t ncols) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_add_col
+ * td_table_add_col
  * -------------------------------------------------------------------------- */
 
-td_t* td_df_add_col(td_t* df, int64_t name_id, td_t* col_vec) {
+td_t* td_table_add_col(td_t* df, int64_t name_id, td_t* col_vec) {
     if (!df || TD_IS_ERR(df)) return df;
     if (!col_vec || TD_IS_ERR(col_vec)) return TD_ERR_PTR(TD_ERR_TYPE);
 
@@ -105,10 +105,10 @@ td_t* td_df_add_col(td_t* df, int64_t name_id, td_t* col_vec) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_get_col
+ * td_table_get_col
  * -------------------------------------------------------------------------- */
 
-td_t* td_df_get_col(td_t* df, int64_t name_id) {
+td_t* td_table_get_col(td_t* df, int64_t name_id) {
     if (!df || TD_IS_ERR(df)) return NULL;
 
     td_t* schema = *df_schema_slot(df);
@@ -128,10 +128,10 @@ td_t* td_df_get_col(td_t* df, int64_t name_id) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_get_col_idx
+ * td_table_get_col_idx
  * -------------------------------------------------------------------------- */
 
-td_t* td_df_get_col_idx(td_t* df, int64_t idx) {
+td_t* td_table_get_col_idx(td_t* df, int64_t idx) {
     if (!df || TD_IS_ERR(df)) return NULL;
     if (idx < 0 || idx >= df->len) return NULL;
 
@@ -140,10 +140,10 @@ td_t* td_df_get_col_idx(td_t* df, int64_t idx) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_col_name
+ * td_table_col_name
  * -------------------------------------------------------------------------- */
 
-int64_t td_df_col_name(td_t* df, int64_t idx) {
+int64_t td_table_col_name(td_t* df, int64_t idx) {
     if (!df || TD_IS_ERR(df)) return -1;
     if (idx < 0 || idx >= df->len) return -1;
 
@@ -155,19 +155,19 @@ int64_t td_df_col_name(td_t* df, int64_t idx) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_ncols
+ * td_table_ncols
  * -------------------------------------------------------------------------- */
 
-int64_t td_df_ncols(td_t* df) {
+int64_t td_table_ncols(td_t* df) {
     if (!df || TD_IS_ERR(df)) return 0;
     return df->len;
 }
 
 /* --------------------------------------------------------------------------
- * td_df_nrows
+ * td_table_nrows
  * -------------------------------------------------------------------------- */
 
-int64_t td_df_nrows(td_t* df) {
+int64_t td_table_nrows(td_t* df) {
     if (!df || TD_IS_ERR(df)) return 0;
     if (df->len <= 0) return 0;
 
@@ -179,10 +179,10 @@ int64_t td_df_nrows(td_t* df) {
 }
 
 /* --------------------------------------------------------------------------
- * td_df_schema
+ * td_table_schema
  * -------------------------------------------------------------------------- */
 
-td_t* td_df_schema(td_t* df) {
+td_t* td_table_schema(td_t* df) {
     if (!df || TD_IS_ERR(df)) return NULL;
     return *df_schema_slot(df);
 }

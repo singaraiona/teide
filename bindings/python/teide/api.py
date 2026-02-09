@@ -205,7 +205,7 @@ class Table:
     def __getitem__(self, name):
         """Get a Series by column name."""
         name_id = self._lib.sym_intern(name)
-        vec_ptr = self._lib._lib.td_df_get_col(self._ptr, name_id)
+        vec_ptr = self._lib._lib.td_table_get_col(self._ptr, name_id)
         if not vec_ptr:
             raise KeyError(f"Column '{name}' not found")
         # Read type from td_t header (offset 0, byte 0 is type)
@@ -223,7 +223,7 @@ class Table:
             col_ptr = self._lib.df_get_col_idx(self._ptr, i)
             name_id = self._lib.df_col_name(self._ptr, i)
             sliced = self._lib._lib.td_vec_slice(col_ptr, 0, n)
-            new_df = self._lib._lib.td_df_add_col(new_df, name_id, sliced)
+            new_df = self._lib._lib.td_table_add_col(new_df, name_id, sliced)
             self._lib._lib.td_release(sliced)
         return Table(self._lib, new_df)
 

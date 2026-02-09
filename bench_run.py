@@ -20,7 +20,7 @@ CSV_PATH = os.path.join(os.path.dirname(__file__),
 
 def const_col(lib, g, df_ptr, name):
     name_id = lib.sym_intern(name)
-    col_vec = lib._lib.td_df_get_col(df_ptr, name_id)
+    col_vec = lib._lib.td_table_get_col(df_ptr, name_id)
     if not col_vec:
         raise ValueError(f"Column '{name}' not found")
     return lib.const_vec(g, col_vec)

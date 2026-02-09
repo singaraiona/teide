@@ -13,7 +13,7 @@ Pure C17 zero-dependency columnar dataframe library. Lazy fusion API → operati
 See SPEC.md Section 1 for the full layout. Key entry points:
 
 - `include/teide/td.h` — single public header (entire API)
-- `src/` — implementation (core/, mem/, vec/, df/, ops/, store/, io/)
+- `src/` — implementation (core/, mem/, vec/, table/, ops/, store/, io/)
 - `test/` — munit-based tests (test_main.c + test_*.c)
 - `bench/` — microbenchmarks
 - `bindings/python/` — ctypes wrapper + high-level Python API

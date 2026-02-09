@@ -23,10 +23,10 @@ static td_t* make_test_df(void) {
     int64_t name_v1  = td_sym_intern("v1", 2);
     int64_t name_v3  = td_sym_intern("v3", 2);
 
-    td_t* df = td_df_new(3);
-    df = td_df_add_col(df, name_id1, id1_vec);
-    df = td_df_add_col(df, name_v1, v1_vec);
-    df = td_df_add_col(df, name_v3, v3_vec);
+    td_t* df = td_table_new(3);
+    df = td_table_add_col(df, name_id1, id1_vec);
+    df = td_table_add_col(df, name_v1, v1_vec);
+    df = td_table_add_col(df, name_v3, v3_vec);
 
     td_release(id1_vec);
     td_release(v1_vec);
@@ -148,16 +148,16 @@ static MunitResult test_group_sum(const void* params, void* data) {
     munit_assert_int(result->type, ==, TD_TABLE);
 
     /* Should have 3 groups (id1=1,2,3) */
-    munit_assert_int(td_df_ncols(result), ==, 2);
-    int64_t nrows = td_df_nrows(result);
+    munit_assert_int(td_table_ncols(result), ==, 2);
+    int64_t nrows = td_table_nrows(result);
     munit_assert_int(nrows, ==, 3);
 
     /* Verify sums: id1=1: 10+20+70+100=200, id1=2: 30+40+80=150, id1=3: 50+60+90=200 */
-    td_t* sum_col = td_df_get_col_idx(result, 1);
+    td_t* sum_col = td_table_get_col_idx(result, 1);
     munit_assert_ptr_not_null(sum_col);
 
     int64_t sum1 = 0, sum2 = 0, sum3 = 0;
-    td_t* id_col = td_df_get_col_idx(result, 0);
+    td_t* id_col = td_table_get_col_idx(result, 0);
     for (int64_t i = 0; i < nrows; i++) {
         int64_t id = ((int64_t*)td_data(id_col))[i];
         int64_t s = ((int64_t*)td_data(sum_col))[i];

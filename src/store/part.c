@@ -83,8 +83,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     }
 
     /* Load remaining partitions and concatenate */
-    int64_t ncols = td_df_ncols(first);
-    int64_t total_rows = td_df_nrows(first);
+    int64_t ncols = td_table_ncols(first);
+    int64_t total_rows = td_table_nrows(first);
 
     /* Accumulate rows from all partitions */
     td_t** all_dfs = (td_t**)malloc((size_t)part_count * sizeof(td_t*));
@@ -94,21 +94,21 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
         all_dfs[p] = td_splay_load(path);
         if (all_dfs[p] && !TD_IS_ERR(all_dfs[p])) {
-            total_rows += td_df_nrows(all_dfs[p]);
+            total_rows += td_table_nrows(all_dfs[p]);
         }
     }
 
     /* Build combined DataFrame by concatenating columns */
-    td_t* result = td_df_new(ncols);
+    td_t* result = td_table_new(ncols);
     for (int64_t c = 0; c < ncols; c++) {
-        int64_t name_id = td_df_col_name(first, c);
-        td_t* combined = td_df_get_col_idx(first, c);
+        int64_t name_id = td_table_col_name(first, c);
+        td_t* combined = td_table_get_col_idx(first, c);
         if (!combined) continue;
         td_retain(combined);
 
         for (int64_t p = 1; p < part_count; p++) {
             if (!all_dfs[p] || TD_IS_ERR(all_dfs[p])) continue;
-            td_t* part_col = td_df_get_col_idx(all_dfs[p], c);
+            td_t* part_col = td_table_get_col_idx(all_dfs[p], c);
             if (part_col) {
                 td_t* new_combined = td_vec_concat(combined, part_col);
                 td_release(combined);
@@ -116,7 +116,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
             }
         }
 
-        result = td_df_add_col(result, name_id, combined);
+        result = td_table_add_col(result, name_id, combined);
         td_release(combined);
     }
 

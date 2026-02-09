@@ -443,16 +443,16 @@ int64_t  td_sym_find(const char* str, size_t len);
 td_t*    td_sym_str(int64_t id);
 uint32_t td_sym_count(void);
 
-/* ===== Table (DataFrame) API ===== */
+/* ===== Table API ===== */
 
-td_t*       td_df_new(int64_t ncols);
-td_t*       td_df_add_col(td_t* df, int64_t name_id, td_t* col_vec);
-td_t*       td_df_get_col(td_t* df, int64_t name_id);
-td_t*       td_df_get_col_idx(td_t* df, int64_t idx);
-int64_t     td_df_col_name(td_t* df, int64_t idx);
-int64_t     td_df_ncols(td_t* df);
-int64_t     td_df_nrows(td_t* df);
-td_t*       td_df_schema(td_t* df);
+td_t*       td_table_new(int64_t ncols);
+td_t*       td_table_add_col(td_t* df, int64_t name_id, td_t* col_vec);
+td_t*       td_table_get_col(td_t* df, int64_t name_id);
+td_t*       td_table_get_col_idx(td_t* df, int64_t idx);
+int64_t     td_table_col_name(td_t* df, int64_t idx);
+int64_t     td_table_ncols(td_t* df);
+int64_t     td_table_nrows(td_t* df);
+td_t*       td_table_schema(td_t* df);
 
 /* ===== Morsel Iterator API ===== */
 

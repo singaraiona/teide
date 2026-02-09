@@ -277,7 +277,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
     }
 
     /* Build DataFrame */
-    td_t* df = td_df_new(ncols);
+    td_t* df = td_table_new(ncols);
     if (!df || TD_IS_ERR(df)) {
         for (int c = 0; c < ncols; c++) td_release(col_vecs[c]);
         free(col_vecs); free(col_types); free(col_name_ids); free(buf);
@@ -285,7 +285,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
     }
 
     for (int c = 0; c < ncols; c++) {
-        df = td_df_add_col(df, col_name_ids[c], col_vecs[c]);
+        df = td_table_add_col(df, col_name_ids[c], col_vecs[c]);
         td_release(col_vecs[c]);
     }
 

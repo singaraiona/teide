@@ -31,7 +31,7 @@ cmake -B build_release -DCMAKE_BUILD_TYPE=Release && cmake --build build_release
 cd build && ctest --output-on-failure
 
 # Run a single test suite
-./build/test_teide --suite /vec     # or /buddy, /cow, /df, /graph, etc.
+./build/test_teide --suite /vec     # or /buddy, /cow, /table, /graph, etc.
 
 # Python testing — MUST use release build (debug links ASan, ctypes can't load it)
 TEIDE_LIB=build_release/libteide.so python -m pytest bindings/python/

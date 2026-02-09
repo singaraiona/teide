@@ -109,9 +109,9 @@ class Series:
         self.dtype = dtype
 
     def __len__(self):
-        # Read len from td_t header (offset 16, int64)
+        # Read len from td_t header (offset 24, int64)
         ptr_val = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int64))
-        return ptr_val[2]  # offset 16 bytes = 2 int64s
+        return ptr_val[3]  # offset 24 bytes = 3 int64s
 
     def to_list(self):
         n = len(self)
@@ -208,8 +208,8 @@ class Table:
         vec_ptr = self._lib._lib.td_table_get_col(self._ptr, name_id)
         if not vec_ptr:
             raise KeyError(f"Column '{name}' not found")
-        # Read type from td_t header (offset 0, byte 0 is type)
-        type_byte = ctypes.cast(vec_ptr, ctypes.POINTER(ctypes.c_int8))[0]
+        # Read type from td_t header (byte 18 is type field)
+        type_byte = ctypes.cast(vec_ptr, ctypes.POINTER(ctypes.c_int8))[18]
         return Series(self._lib, vec_ptr, name, type_byte)
 
     def head(self, n=10):
@@ -325,31 +325,30 @@ class Query:
         """Walk _ops list, emit graph nodes, return final node."""
         lib = self._lib
         current = None  # pipeline state
+        filter_pred = None  # pending DataFrame-level filter predicate
 
         for op in self._ops:
             if op[0] == "filter":
                 expr = op[1]
                 pred_node = _emit_expr(lib, g, expr)
                 if current is None:
-                    # Build a scan-based filter: need individual column scans
-                    # Actually filter needs an input and a predicate
-                    # For the first op, the input is implicitly the bound df columns
-                    # We need a dummy input — use scan of first column
-                    current = pred_node  # pred is the mask
-                    # Filter takes (input_col, pred)—but we operate on DataFrame level
-                    # The executor's filter handles it at the column level
-                    current = lib._lib.td_filter(g, pred_node, pred_node)
+                    # DataFrame-level filter: store predicate to apply to
+                    # downstream scan nodes (group-by keys, agg inputs, etc.)
+                    filter_pred = pred_node
                 else:
                     current = lib._lib.td_filter(g, current, pred_node)
 
             elif op[0] == "group":
                 key_col_names, agg_exprs = op[1], op[2]
 
-                # Build key scan nodes
+                # Build key scan nodes, applying pending filter if any
                 n_keys = len(key_col_names)
                 key_nodes = []
                 for name in key_col_names:
-                    key_nodes.append(lib.scan(g, name))
+                    node = lib.scan(g, name)
+                    if filter_pred is not None:
+                        node = lib._lib.td_filter(g, node, filter_pred)
+                    key_nodes.append(node)
 
                 # Decompose agg expressions into (opcode, input_scan_node)
                 agg_ops = []
@@ -359,7 +358,12 @@ class Query:
                         raise ValueError("group_by.agg() requires aggregation expressions")
                     agg_ops.append(agg_expr.kw["op"])
                     inner = agg_expr.kw["arg"]
-                    agg_inputs.append(_emit_expr(lib, g, inner))
+                    input_node = _emit_expr(lib, g, inner)
+                    if filter_pred is not None:
+                        input_node = lib._lib.td_filter(g, input_node, filter_pred)
+                    agg_inputs.append(input_node)
+
+                filter_pred = None  # consumed
 
                 n_aggs = len(agg_ops)
                 keys_arr = (ctypes.c_void_p * n_keys)(*key_nodes)
@@ -379,7 +383,12 @@ class Query:
 
                 key_nodes = []
                 for name in col_names:
-                    key_nodes.append(lib.scan(g, name))
+                    node = lib.scan(g, name)
+                    if filter_pred is not None:
+                        node = lib._lib.td_filter(g, node, filter_pred)
+                    key_nodes.append(node)
+
+                filter_pred = None  # consumed
 
                 keys_arr = (ctypes.c_void_p * n_cols)(*key_nodes)
                 descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])

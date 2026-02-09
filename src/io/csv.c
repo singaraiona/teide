@@ -16,7 +16,7 @@
 
 /* Max columns, max field length */
 #define CSV_MAX_COLS  256
-#define CSV_MAX_FIELD 4096
+#define CSV_MAX_FIELD 8192
 #define CSV_INIT_ROWS 1024
 
 /* Type inference state per column */

@@ -45,10 +45,12 @@ void td_sym_init(void) {
 
     g_sym.bucket_cap = SYM_INIT_CAP;
     g_sym.buckets = (uint64_t*)calloc(g_sym.bucket_cap, sizeof(uint64_t));
+    if (!g_sym.buckets) return;
 
     g_sym.str_cap = SYM_INIT_CAP;
     g_sym.str_count = 0;
     g_sym.strings = (td_t**)calloc(g_sym.str_cap, sizeof(td_t*));
+    if (!g_sym.strings) { free(g_sym.buckets); g_sym.buckets = NULL; return; }
 
     g_sym_inited = true;
 }
@@ -95,6 +97,7 @@ static void ht_insert(uint64_t* buckets, uint32_t cap, uint32_t hash, uint32_t i
 static void ht_grow(void) {
     uint32_t new_cap = g_sym.bucket_cap * 2;
     uint64_t* new_buckets = (uint64_t*)calloc(new_cap, sizeof(uint64_t));
+    if (!new_buckets) return; /* stay at current capacity */
 
     /* Re-insert all existing entries */
     for (uint32_t i = 0; i < g_sym.bucket_cap; i++) {
@@ -115,6 +118,7 @@ static void ht_grow(void) {
  * -------------------------------------------------------------------------- */
 
 int64_t td_sym_intern(const char* str, size_t len) {
+    if (!g_sym_inited) return -1;
     uint32_t hash = fnv1a(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
     uint32_t slot = hash & mask;

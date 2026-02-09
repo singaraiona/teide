@@ -1250,7 +1250,7 @@ typedef enum {
 | **1** | Buddy allocator | `buddy.h/.c`, `arena.h/.c` | Phase 0 | **DONE** |
 | **2** | COW + Atoms | `cow.h/.c`, `atom.h/.c` | Phase 1 | **DONE** |
 | **3** | Vectors + Strings + Lists | `vec.h/.c`, `str.h/.c`, `list.h/.c` | Phase 2 | **DONE** |
-| **4** | Symbols + Table | `sym.h/.c`, `df.h/.c` | Phase 3 | **DONE** |
+| **4** | Symbols + Table | `sym.h/.c`, `table.h/.c` | Phase 3 | **DONE** |
 | **5** | Morsel infrastructure | `morsel.h/.c`, `pipe.h/.c` | Phase 3 | **DONE** |
 | **6** | Op graph + Basic executor | `graph.h/.c`, `plan.h/.c`, `exec.h/.c` | Phases 4+5 | **DONE** |
 | **7** | Fusion pass | `fuse.h/.c` | Phase 6 | **DONE** |

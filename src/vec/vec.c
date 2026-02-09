@@ -125,7 +125,7 @@ void* td_vec_get(td_t* vec, int64_t idx) {
 
 td_t* td_vec_slice(td_t* vec, int64_t offset, int64_t len) {
     if (!vec || TD_IS_ERR(vec)) return vec;
-    if (offset < 0 || len < 0 || offset + len > vec->len)
+    if (offset < 0 || len < 0 || offset > vec->len || len > vec->len - offset)
         return TD_ERR_PTR(TD_ERR_RANGE);
 
     /* If input is already a slice, resolve to ultimate parent */
@@ -164,6 +164,7 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
 
     uint8_t esz = td_elem_size(a->type);
     int64_t total_len = a->len + b->len;
+    if (total_len < a->len) return TD_ERR_PTR(TD_ERR_OOM); /* overflow */
     size_t data_size = (size_t)total_len * esz;
 
     td_t* result = td_alloc(data_size);
@@ -261,12 +262,13 @@ void td_vec_set_null(td_t* vec, int64_t idx, bool is_null) {
         int64_t new_len = (vec->len + 7) / 8;
         if (new_len < needed_bytes) new_len = needed_bytes;
         size_t new_data_size = (size_t)new_len;
+        int64_t old_len = ext->len;
         td_t* new_ext = td_scratch_realloc(ext, new_data_size);
         if (!new_ext || TD_IS_ERR(new_ext)) return;
         /* Zero new bytes */
-        if (new_len > ext->len)
-            memset((char*)td_data(new_ext) + ext->len, 0,
-                   (size_t)(new_len - ext->len));
+        if (new_len > old_len)
+            memset((char*)td_data(new_ext) + old_len, 0,
+                   (size_t)(new_len - old_len));
         new_ext->len = new_len;
         vec->ext_nullmap = new_ext;
         ext = new_ext;

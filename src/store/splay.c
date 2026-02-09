@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <dirent.h>
 
 /* --------------------------------------------------------------------------
@@ -22,7 +23,7 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
     if (!dir) return TD_ERR_IO;
 
     /* Create directory */
-    mkdir(dir, 0755);
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) return TD_ERR_IO;
 
     int64_t ncols = td_table_ncols(df);
 
@@ -47,6 +48,11 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
 
         const char* name = td_str_ptr(name_atom);
         size_t name_len = td_str_len(name_atom);
+
+        /* Reject names with path separators or traversal */
+        if (memchr(name, '/', name_len) || memchr(name, '\0', name_len) ||
+            (name_len == 2 && name[0] == '.' && name[1] == '.'))
+            continue;
 
         char path[1024];
         snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
@@ -88,6 +94,11 @@ td_t* td_splay_load(const char* dir) {
 
         const char* name = td_str_ptr(name_atom);
         size_t name_len = td_str_len(name_atom);
+
+        /* Reject names with path separators or traversal */
+        if (memchr(name, '/', name_len) || memchr(name, '\0', name_len) ||
+            (name_len == 2 && name[0] == '.' && name[1] == '.'))
+            continue;
 
         snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
         td_t* col = td_col_load(path);

@@ -47,7 +47,7 @@ static td_op_ext_t* graph_alloc_ext_node(td_graph_t* g) {
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         td_op_ext_t** new_exts = (td_op_ext_t**)realloc(g->ext_nodes,
                                                           new_cap * sizeof(td_op_ext_t*));
-        if (!new_exts) { free(ext); return NULL; }
+        if (!new_exts) { g->node_count--; free(ext); return NULL; }
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
     }

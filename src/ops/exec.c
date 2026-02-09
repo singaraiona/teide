@@ -339,6 +339,8 @@ static void reduce_range(td_t* input, int64_t start, int64_t end, reduce_acc_t* 
                 v = ((int16_t*)base)[row];
             else if (in_type == TD_BOOL || in_type == TD_U8)
                 v = ((uint8_t*)base)[row];
+            else if (in_type == TD_ENUM)
+                v = (int64_t)((uint32_t*)base)[row];
             else
                 v = ((int64_t*)base)[row];
             acc->sum_i += v;
@@ -759,12 +761,20 @@ static void group_ht_grow(group_ht_t* ht) {
     ht->groups = new_groups;
     memset(&ht->groups[old_cap], 0, (new_cap - old_cap) * sizeof(group_entry_t));
 
-    ht->all_agg_f64     = (double*)scratch_realloc(&ht->_h_agg_f64, old_total * sizeof(double), new_total * sizeof(double));
-    ht->all_agg_i64     = (int64_t*)scratch_realloc(&ht->_h_agg_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
-    ht->all_agg_min_f64 = (double*)scratch_realloc(&ht->_h_min_f64, old_total * sizeof(double), new_total * sizeof(double));
-    ht->all_agg_max_f64 = (double*)scratch_realloc(&ht->_h_max_f64, old_total * sizeof(double), new_total * sizeof(double));
-    ht->all_agg_min_i64 = (int64_t*)scratch_realloc(&ht->_h_min_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
-    ht->all_agg_max_i64 = (int64_t*)scratch_realloc(&ht->_h_max_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    double*   new_f64     = (double*)scratch_realloc(&ht->_h_agg_f64, old_total * sizeof(double), new_total * sizeof(double));
+    int64_t*  new_i64     = (int64_t*)scratch_realloc(&ht->_h_agg_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    double*   new_min_f64 = (double*)scratch_realloc(&ht->_h_min_f64, old_total * sizeof(double), new_total * sizeof(double));
+    double*   new_max_f64 = (double*)scratch_realloc(&ht->_h_max_f64, old_total * sizeof(double), new_total * sizeof(double));
+    int64_t*  new_min_i64 = (int64_t*)scratch_realloc(&ht->_h_min_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    int64_t*  new_max_i64 = (int64_t*)scratch_realloc(&ht->_h_max_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
+    if (!new_f64 || !new_i64 || !new_min_f64 || !new_max_f64 || !new_min_i64 || !new_max_i64)
+        return; /* leave HT at old capacity — probe will still work */
+    ht->all_agg_f64     = new_f64;
+    ht->all_agg_i64     = new_i64;
+    ht->all_agg_min_f64 = new_min_f64;
+    ht->all_agg_max_f64 = new_max_f64;
+    ht->all_agg_min_i64 = new_min_i64;
+    ht->all_agg_max_i64 = new_max_i64;
 
     /* Zero-init sum/count arrays for new slots; set sentinel values for min/max */
     memset(ht->all_agg_f64 + old_total, 0, (new_total - old_total) * sizeof(double));
@@ -955,10 +965,13 @@ typedef struct {
 static inline void radix_buf_push(radix_buf_t* buf, int64_t row, uint64_t hash) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
         uint32_t old_cap = buf->cap;
-        buf->cap *= 2;
-        buf->entries = (radix_entry_t*)scratch_realloc(
+        uint32_t new_cap = old_cap * 2;
+        radix_entry_t* new_entries = (radix_entry_t*)scratch_realloc(
             &buf->_hdr, (size_t)old_cap * sizeof(radix_entry_t),
-            (size_t)buf->cap * sizeof(radix_entry_t));
+            (size_t)new_cap * sizeof(radix_entry_t));
+        if (!new_entries) return; /* OOM — drop this row */
+        buf->entries = new_entries;
+        buf->cap = new_cap;
     }
     buf->entries[buf->count].row  = row;
     buf->entries[buf->count].hash = hash;
@@ -1241,7 +1254,7 @@ static inline void da_read_val(const void* ptr, int8_t type, int64_t r,
 
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     da_ctx_t* c = (da_ctx_t*)ctx;
-    da_accum_t* acc = &c->accums[worker_id % c->n_accums];
+    da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
 
@@ -1468,14 +1481,17 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             uint32_t da_n_workers = (da_pool && nrows >= TD_PARALLEL_THRESHOLD)
                                     ? td_pool_total_workers(da_pool) : 1;
 
-            /* Limit workers so total memory stays within budget */
+            /* Check memory budget — need one accumulator set per worker.
+             * If total memory exceeds budget, fall to sequential (1 worker)
+             * rather than throttling to a subset, which would alias workers
+             * to shared accumulators and cause data races. */
             uint32_t arrays_per_agg = 0;
             if (need_flags & DA_NEED_SUM) arrays_per_agg += 2;
             if (need_flags & DA_NEED_MIN) arrays_per_agg += 2;
             if (need_flags & DA_NEED_MAX) arrays_per_agg += 2;
             uint64_t per_worker_bytes = (uint64_t)n_slots * (arrays_per_agg * n_aggs + 1u) * 8u;
-            while (da_n_workers > 1 && (uint64_t)da_n_workers * per_worker_bytes > DA_MEM_BUDGET)
-                da_n_workers /= 2;
+            if ((uint64_t)da_n_workers * per_worker_bytes > DA_MEM_BUDGET)
+                da_n_workers = 1;
 
             td_t* accums_hdr;
             da_accum_t* accums = (da_accum_t*)scratch_calloc(&accums_hdr,

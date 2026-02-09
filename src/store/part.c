@@ -43,9 +43,13 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
         if (part_count >= part_cap) {
             part_cap = part_cap == 0 ? 16 : part_cap * 2;
-            part_dirs = (char**)realloc(part_dirs, (size_t)part_cap * sizeof(char*));
+            char** tmp = (char**)realloc(part_dirs, (size_t)part_cap * sizeof(char*));
+            if (!tmp) break; /* OOM — stop collecting */
+            part_dirs = tmp;
         }
-        part_dirs[part_count] = strdup(ent->d_name);
+        char* dup = strdup(ent->d_name);
+        if (!dup) break;
+        part_dirs[part_count] = dup;
         part_count++;
     }
     closedir(d);
@@ -88,6 +92,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
     /* Accumulate rows from all partitions */
     td_t** all_dfs = (td_t**)malloc((size_t)part_count * sizeof(td_t*));
+    if (!all_dfs) { free(part_dirs); return TD_ERR_PTR(TD_ERR_OOM); }
     all_dfs[0] = first;
 
     for (int64_t p = 1; p < part_count; p++) {

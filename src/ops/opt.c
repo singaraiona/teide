@@ -1,6 +1,5 @@
 #include "opt.h"
 #include <string.h>
-#include <stdlib.h>
 
 /* --------------------------------------------------------------------------
  * Optimizer passes (v1): Type Inference + Constant Folding + Fusion + DCE
@@ -93,18 +92,17 @@ static void mark_live(td_op_t* node, bool* live) {
 }
 
 static void pass_dce(td_graph_t* g, td_op_t* root) {
-    bool* live = (bool*)calloc(g->node_count, sizeof(bool));
-    if (!live) return;
+    uint32_t nc = g->node_count;
+    bool live[nc];
+    memset(live, 0, nc * sizeof(bool));
 
     mark_live(root, live);
 
-    for (uint32_t i = 0; i < g->node_count; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         if (!live[i]) {
             g->nodes[i].flags |= OP_FLAG_DEAD;
         }
     }
-
-    free(live);
 }
 
 /* --------------------------------------------------------------------------

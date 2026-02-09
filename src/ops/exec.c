@@ -1117,6 +1117,70 @@ typedef struct {
     td_t* _h_count;
 } da_accum_t;
 
+static inline void da_accum_free(da_accum_t* a) {
+    scratch_free(a->_h_f64);    scratch_free(a->_h_i64);
+    scratch_free(a->_h_min_f64); scratch_free(a->_h_max_f64);
+    scratch_free(a->_h_min_i64); scratch_free(a->_h_max_i64);
+    scratch_free(a->_h_count);
+}
+
+/* Unified agg result emitter — used by both DA and HT paths.
+ * Arrays indexed by [gi * n_aggs + a], counts by [gi]. */
+static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
+                              td_t** agg_vecs, uint32_t grp_count, uint8_t n_keys,
+                              uint8_t n_aggs,
+                              double*  sum_f64,  int64_t* sum_i64,
+                              double*  min_f64,  double*  max_f64,
+                              int64_t* min_i64,  int64_t* max_i64,
+                              int64_t* counts) {
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        uint16_t agg_op = ext->agg_ops[a];
+        td_t* agg_col = agg_vecs[a];
+        bool is_f64 = agg_col && agg_col->type == TD_F64;
+        int8_t out_type;
+        switch (agg_op) {
+            case OP_AVG:   out_type = TD_F64; break;
+            case OP_COUNT: out_type = TD_I64; break;
+            case OP_SUM: case OP_PROD:
+                out_type = is_f64 ? TD_F64 : TD_I64; break;
+            default:
+                out_type = agg_col ? agg_col->type : TD_I64; break;
+        }
+        td_t* new_col = td_vec_new(out_type, (int64_t)grp_count);
+        if (!new_col || TD_IS_ERR(new_col)) continue;
+        new_col->len = (int64_t)grp_count;
+        for (uint32_t gi = 0; gi < grp_count; gi++) {
+            size_t idx = (size_t)gi * n_aggs + a;
+            if (out_type == TD_F64) {
+                double v;
+                switch (agg_op) {
+                    case OP_SUM: v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
+                    case OP_AVG: v = is_f64 ? sum_f64[idx] / counts[gi] : (double)sum_i64[idx] / counts[gi]; break;
+                    case OP_MIN: v = is_f64 ? min_f64[idx] : (double)min_i64[idx]; break;
+                    case OP_MAX: v = is_f64 ? max_f64[idx] : (double)max_i64[idx]; break;
+                    default:     v = 0.0; break;
+                }
+                ((double*)td_data(new_col))[gi] = v;
+            } else {
+                int64_t v;
+                switch (agg_op) {
+                    case OP_SUM:   v = sum_i64[idx]; break;
+                    case OP_COUNT: v = counts[gi]; break;
+                    case OP_MIN:   v = min_i64[idx]; break;
+                    case OP_MAX:   v = max_i64[idx]; break;
+                    case OP_FIRST: v = sum_i64[idx]; break;
+                    default:       v = 0; break;
+                }
+                ((int64_t*)td_data(new_col))[gi] = v;
+            }
+        }
+        td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
+        int64_t name_id = agg_ext ? agg_ext->sym : (int64_t)(n_keys + a);
+        *result = td_df_add_col(*result, name_id, new_col);
+        td_release(new_col);
+    }
+}
+
 /* Bitmask for which accumulator arrays are actually needed */
 #define DA_NEED_SUM   0x01  /* f64 + i64 arrays */
 #define DA_NEED_MIN   0x02  /* min_f64 + min_i64 */
@@ -1252,6 +1316,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     int64_t nrows = td_df_nrows(df);
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
+
+    if (n_keys > 8 || n_aggs > 8) return TD_ERR_PTR(TD_ERR_NYI);
 
     /* Resolve key columns (VLA — n_keys ≤ 8) */
     td_t* key_vecs[n_keys];
@@ -1445,12 +1511,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 if (!accums[w].count) { alloc_ok = false; break; }
             }
             if (!alloc_ok) {
-                for (uint32_t w = 0; w < da_n_workers; w++) {
-                    scratch_free(accums[w]._h_f64); scratch_free(accums[w]._h_i64);
-                    scratch_free(accums[w]._h_min_f64); scratch_free(accums[w]._h_max_f64);
-                    scratch_free(accums[w]._h_min_i64); scratch_free(accums[w]._h_max_i64);
-                    scratch_free(accums[w]._h_count);
-                }
+                for (uint32_t w = 0; w < da_n_workers; w++)
+                    da_accum_free(&accums[w]);
                 scratch_free(accums_hdr);
                 goto ht_path;
             }
@@ -1506,12 +1568,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                     }
                 }
             }
-            for (uint32_t w = 1; w < da_n_workers; w++) {
-                scratch_free(accums[w]._h_f64); scratch_free(accums[w]._h_i64);
-                scratch_free(accums[w]._h_min_f64); scratch_free(accums[w]._h_max_f64);
-                scratch_free(accums[w]._h_min_i64); scratch_free(accums[w]._h_max_i64);
-                scratch_free(accums[w]._h_count);
-            }
+            for (uint32_t w = 1; w < da_n_workers; w++)
+                da_accum_free(&accums[w]);
 
             double*  da_f64     = merged->f64;     /* may be NULL if !DA_NEED_SUM */
             int64_t* da_i64     = merged->i64;
@@ -1528,10 +1586,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             int64_t total_cols = n_keys + n_aggs;
             td_t* result = td_df_new(total_cols);
             if (!result || TD_IS_ERR(result)) {
-                scratch_free(accums[0]._h_f64); scratch_free(accums[0]._h_i64);
-                scratch_free(accums[0]._h_min_f64); scratch_free(accums[0]._h_max_f64);
-                scratch_free(accums[0]._h_min_i64); scratch_free(accums[0]._h_max_i64);
-                scratch_free(accums[0]._h_count); scratch_free(accums_hdr);
+                da_accum_free(&accums[0]); scratch_free(accums_hdr);
                 return result ? result : TD_ERR_PTR(TD_ERR_OOM);
             }
 
@@ -1561,61 +1616,45 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 td_release(key_col);
             }
 
-            /* Agg columns */
-            for (uint8_t a = 0; a < n_aggs; a++) {
-                uint16_t agg_op = ext->agg_ops[a];
-                td_t* agg_col = agg_vecs[a];
-                bool is_f64 = agg_col && agg_col->type == TD_F64;
-                int8_t out_type;
-                switch (agg_op) {
-                    case OP_AVG:   out_type = TD_F64; break;
-                    case OP_COUNT: out_type = TD_I64; break;
-                    case OP_SUM: case OP_PROD:
-                        out_type = is_f64 ? TD_F64 : TD_I64; break;
-                    default:
-                        out_type = agg_col ? agg_col->type : TD_I64; break;
+            /* Agg columns — compact sparse DA arrays into dense, then emit */
+            size_t dense_total = (size_t)grp_count * n_aggs;
+            td_t *_h_df64 = NULL, *_h_di64 = NULL, *_h_dminf = NULL;
+            td_t *_h_dmaxf = NULL, *_h_dmini = NULL, *_h_dmaxi = NULL, *_h_dcnt = NULL;
+            double*  dense_f64     = da_f64     ? (double*)scratch_alloc(&_h_df64, dense_total * sizeof(double)) : NULL;
+            int64_t* dense_i64     = da_i64     ? (int64_t*)scratch_alloc(&_h_di64, dense_total * sizeof(int64_t)) : NULL;
+            double*  dense_min_f64 = da_min_f64 ? (double*)scratch_alloc(&_h_dminf, dense_total * sizeof(double)) : NULL;
+            double*  dense_max_f64 = da_max_f64 ? (double*)scratch_alloc(&_h_dmaxf, dense_total * sizeof(double)) : NULL;
+            int64_t* dense_min_i64 = da_min_i64 ? (int64_t*)scratch_alloc(&_h_dmini, dense_total * sizeof(int64_t)) : NULL;
+            int64_t* dense_max_i64 = da_max_i64 ? (int64_t*)scratch_alloc(&_h_dmaxi, dense_total * sizeof(int64_t)) : NULL;
+            int64_t* dense_counts  = (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t));
+
+            uint32_t gi = 0;
+            for (uint32_t s = 0; s < n_slots; s++) {
+                if (da_count[s] == 0) continue;
+                dense_counts[gi] = da_count[s];
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    size_t si = (size_t)s * n_aggs + a;
+                    size_t di = (size_t)gi * n_aggs + a;
+                    if (dense_f64)     dense_f64[di]     = da_f64[si];
+                    if (dense_i64)     dense_i64[di]     = da_i64[si];
+                    if (dense_min_f64) dense_min_f64[di] = da_min_f64[si];
+                    if (dense_max_f64) dense_max_f64[di] = da_max_f64[si];
+                    if (dense_min_i64) dense_min_i64[di] = da_min_i64[si];
+                    if (dense_max_i64) dense_max_i64[di] = da_max_i64[si];
                 }
-                td_t* new_col = td_vec_new(out_type, (int64_t)grp_count);
-                if (!new_col || TD_IS_ERR(new_col)) continue;
-                new_col->len = (int64_t)grp_count;
-                uint32_t gi = 0;
-                for (uint32_t s = 0; s < n_slots; s++) {
-                    if (da_count[s] == 0) continue;
-                    size_t idx = (size_t)s * n_aggs + a;
-                    if (out_type == TD_F64) {
-                        double v;
-                        switch (agg_op) {
-                            case OP_SUM: v = is_f64 ? da_f64[idx] : (double)da_i64[idx]; break;
-                            case OP_AVG: v = is_f64 ? da_f64[idx] / da_count[s] : (double)da_i64[idx] / da_count[s]; break;
-                            case OP_MIN: v = is_f64 ? da_min_f64[idx] : (double)da_min_i64[idx]; break;
-                            case OP_MAX: v = is_f64 ? da_max_f64[idx] : (double)da_max_i64[idx]; break;
-                            default:     v = 0.0; break;
-                        }
-                        ((double*)td_data(new_col))[gi] = v;
-                    } else {
-                        int64_t v;
-                        switch (agg_op) {
-                            case OP_SUM:   v = da_i64[idx]; break;
-                            case OP_COUNT: v = da_count[s]; break;
-                            case OP_MIN:   v = da_min_i64[idx]; break;
-                            case OP_MAX:   v = da_max_i64[idx]; break;
-                            case OP_FIRST: v = da_i64[idx]; break;
-                            default:       v = 0; break;
-                        }
-                        ((int64_t*)td_data(new_col))[gi] = v;
-                    }
-                    gi++;
-                }
-                td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
-                int64_t name_id = agg_ext ? agg_ext->sym : (int64_t)(n_keys + a);
-                result = td_df_add_col(result, name_id, new_col);
-                td_release(new_col);
+                gi++;
             }
 
-            scratch_free(accums[0]._h_f64); scratch_free(accums[0]._h_i64);
-            scratch_free(accums[0]._h_min_f64); scratch_free(accums[0]._h_max_f64);
-            scratch_free(accums[0]._h_min_i64); scratch_free(accums[0]._h_max_i64);
-            scratch_free(accums[0]._h_count); scratch_free(accums_hdr);
+            emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_keys, n_aggs,
+                             dense_f64, dense_i64, dense_min_f64, dense_max_f64,
+                             dense_min_i64, dense_max_i64, dense_counts);
+
+            scratch_free(_h_df64); scratch_free(_h_di64);
+            scratch_free(_h_dminf); scratch_free(_h_dmaxf);
+            scratch_free(_h_dmini); scratch_free(_h_dmaxi);
+            scratch_free(_h_dcnt);
+
+            da_accum_free(&accums[0]); scratch_free(accums_hdr);
             return result;
         }
     }
@@ -1770,58 +1809,18 @@ build_result:;
         td_release(new_col);
     }
 
-    /* Agg columns */
-    for (uint8_t a = 0; a < n_aggs; a++) {
-        uint16_t agg_op = ext->agg_ops[a];
-        td_t* agg_col = agg_vecs[a];
-        bool is_f64 = agg_col && agg_col->type == TD_F64;
-        int8_t out_type;
+    /* Agg columns — extract dense counts then use shared emitter */
+    td_t* _h_htcnt = NULL;
+    int64_t* ht_counts = (int64_t*)scratch_alloc(&_h_htcnt, grp_count * sizeof(int64_t));
+    for (uint32_t gi = 0; gi < grp_count; gi++)
+        ht_counts[gi] = final_ht->groups[gi].count;
 
-        switch (agg_op) {
-            case OP_AVG:   out_type = TD_F64; break;
-            case OP_COUNT: out_type = TD_I64; break;
-            case OP_SUM:
-            case OP_PROD:
-                out_type = is_f64 ? TD_F64 : TD_I64; break;
-            default:
-                out_type = agg_col ? agg_col->type : TD_I64; break;
-        }
-
-        td_t* new_col = td_vec_new(out_type, (int64_t)grp_count);
-        if (!new_col || TD_IS_ERR(new_col)) continue;
-        new_col->len = (int64_t)grp_count;
-
-        for (uint32_t gi = 0; gi < grp_count; gi++) {
-            size_t idx = (size_t)gi * n_aggs + a;
-            if (out_type == TD_F64) {
-                double v;
-                switch (agg_op) {
-                    case OP_SUM:   v = is_f64 ? final_ht->all_agg_f64[idx] : (double)final_ht->all_agg_i64[idx]; break;
-                    case OP_AVG:   v = is_f64 ? final_ht->all_agg_f64[idx] / final_ht->groups[gi].count : (double)final_ht->all_agg_i64[idx] / final_ht->groups[gi].count; break;
-                    case OP_MIN:   v = is_f64 ? final_ht->all_agg_min_f64[idx] : (double)final_ht->all_agg_min_i64[idx]; break;
-                    case OP_MAX:   v = is_f64 ? final_ht->all_agg_max_f64[idx] : (double)final_ht->all_agg_max_i64[idx]; break;
-                    default:       v = 0.0; break;
-                }
-                ((double*)td_data(new_col))[gi] = v;
-            } else {
-                int64_t v;
-                switch (agg_op) {
-                    case OP_SUM:   v = final_ht->all_agg_i64[idx]; break;
-                    case OP_COUNT: v = final_ht->groups[gi].count; break;
-                    case OP_MIN:   v = final_ht->all_agg_min_i64[idx]; break;
-                    case OP_MAX:   v = final_ht->all_agg_max_i64[idx]; break;
-                    case OP_FIRST: v = final_ht->all_agg_i64[idx]; break;
-                    default:       v = 0; break;
-                }
-                ((int64_t*)td_data(new_col))[gi] = v;
-            }
-        }
-
-        td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
-        int64_t name_id = agg_ext ? agg_ext->sym : (int64_t)(n_keys + a);
-        result = td_df_add_col(result, name_id, new_col);
-        td_release(new_col);
-    }
+    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_keys, n_aggs,
+                     final_ht->all_agg_f64, final_ht->all_agg_i64,
+                     final_ht->all_agg_min_f64, final_ht->all_agg_max_f64,
+                     final_ht->all_agg_min_i64, final_ht->all_agg_max_i64,
+                     ht_counts);
+    scratch_free(_h_htcnt);
 
 cleanup:
     /* Free the merged/sequential single_ht (always used as final_ht) */

@@ -36,18 +36,15 @@ static void worker_loop(void* arg) {
         for (;;) {
             uint32_t idx = atomic_fetch_add_explicit(&pool->task_tail, 1,
                                                      memory_order_acq_rel);
-            if (idx >= pool->task_count)
+            if (idx >= atomic_load_explicit(&pool->task_count,
+                                            memory_order_acquire))
                 break;
 
             td_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
             t->fn(t->ctx, wctx.worker_id, t->start, t->end);
 
-            /* Decrement pending; if we're the last, signal done */
-            uint32_t prev = atomic_fetch_sub_explicit(&pool->pending, 1,
-                                                      memory_order_acq_rel);
-            if (prev == 1) {
-                td_sem_signal(&pool->done);
-            }
+            atomic_fetch_sub_explicit(&pool->pending, 1,
+                                      memory_order_acq_rel);
         }
     }
 
@@ -79,15 +76,11 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
 
     pool->task_head = 0;
     atomic_store_explicit(&pool->task_tail, 0, memory_order_relaxed);
-    pool->task_count = 0;
+    atomic_store_explicit(&pool->task_count, 0, memory_order_relaxed);
     atomic_store_explicit(&pool->pending, 0, memory_order_relaxed);
 
-    td_err_t err = td_sem_init(&pool->done, 0);
-    if (err != TD_OK) { free(pool->tasks); return err; }
-
-    err = td_sem_init(&pool->work_ready, 0);
+    td_err_t err = td_sem_init(&pool->work_ready, 0);
     if (err != TD_OK) {
-        td_sem_destroy(&pool->done);
         free(pool->tasks);
         return err;
     }
@@ -96,7 +89,6 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
     if (n_workers > 0) {
         pool->threads = (td_thread_t*)calloc(n_workers, sizeof(td_thread_t));
         if (!pool->threads) {
-            td_sem_destroy(&pool->done);
             td_sem_destroy(&pool->work_ready);
             free(pool->tasks);
             return TD_ERR_OOM;
@@ -114,7 +106,6 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
                     td_thread_join(pool->threads[j]);
                 }
                 free(pool->threads);
-                td_sem_destroy(&pool->done);
                 td_sem_destroy(&pool->work_ready);
                 free(pool->tasks);
                 return TD_ERR_OOM;
@@ -133,7 +124,6 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
                     td_thread_join(pool->threads[j]);
                 }
                 free(pool->threads);
-                td_sem_destroy(&pool->done);
                 td_sem_destroy(&pool->work_ready);
                 free(pool->tasks);
                 return err;
@@ -163,7 +153,6 @@ void td_pool_free(td_pool_t* pool) {
     }
 
     free(pool->threads);
-    td_sem_destroy(&pool->done);
     td_sem_destroy(&pool->work_ready);
     free(pool->tasks);
     memset(pool, 0, sizeof(*pool));
@@ -209,7 +198,7 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
     }
 
     pool->task_head = n_tasks;
-    pool->task_count = n_tasks;
+    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_relaxed);
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
@@ -218,11 +207,7 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
         td_sem_signal(&pool->work_ready);
     }
 
-    /* Main thread participates as worker 0.
-     * The main thread must NOT signal 'done' when it finishes the last task.
-     * It will check 'pending == 0' below and skip the wait.  Signaling here
-     * would leave a stale semaphore count that causes the NEXT dispatch to
-     * return before workers finish, leading to use-after-free. */
+    /* Main thread participates as worker 0 */
     for (;;) {
         uint32_t idx = atomic_fetch_add_explicit(&pool->task_tail, 1,
                                                  memory_order_acq_rel);
@@ -234,9 +219,10 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
         atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
     }
 
-    /* Wait for all tasks to complete */
-    if (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-        td_sem_wait(&pool->done);
+    /* Spin-wait for workers to finish remaining tasks.
+     * No semaphore — avoids surplus-signal bug between consecutive dispatches. */
+    while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
+        /* Workers are active; spin is brief (<1µs per remaining task) */
     }
 }
 
@@ -272,7 +258,7 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
     }
 
     pool->task_head = n_tasks;
-    pool->task_count = n_tasks;
+    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_relaxed);
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
@@ -281,7 +267,7 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
         td_sem_signal(&pool->work_ready);
     }
 
-    /* Main thread participates as worker 0 (same stale-signal fix). */
+    /* Main thread participates as worker 0 */
     for (;;) {
         uint32_t idx = atomic_fetch_add_explicit(&pool->task_tail, 1,
                                                  memory_order_acq_rel);
@@ -293,9 +279,9 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
         atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
     }
 
-    /* Wait for all tasks to complete */
-    if (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-        td_sem_wait(&pool->done);
+    /* Spin-wait for workers to finish remaining tasks */
+    while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
+        /* Workers are active; spin is brief */
     }
 }
 

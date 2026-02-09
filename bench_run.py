@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "bindings", "python")
 
 from teide import TeideLib, OP_SUM, OP_AVG, OP_MIN, OP_MAX, OP_COUNT
 
+N_ITER = 7  # median of 7 runs
+
 CSV_PATH = os.path.join(os.path.dirname(__file__),
                         "..", "rayforce-bench", "datasets",
                         "G1_1e7_1e2_0_0", "G1_1e7_1e2_0_0.csv")
@@ -39,18 +41,23 @@ def run_groupby(lib, df, label, key_names, agg_ops, agg_col_names):
         root = lib._lib.td_group(g, keys_arr, nk, ops_arr, ins_arr, na)
         root = lib.optimize(g, root)
 
-        t0 = time.perf_counter()
-        result = lib.execute(g, root)
-        elapsed = time.perf_counter() - t0
+        times = []
+        nrows = ncols = 0
+        for _ in range(N_ITER):
+            t0 = time.perf_counter()
+            result = lib.execute(g, root)
+            times.append(time.perf_counter() - t0)
 
-        if not result or result < 32:
-            print(f"  {label:12s}  FAILED")
-            return
+            if not result or result < 32:
+                print(f"  {label:12s}  FAILED")
+                return
 
-        nrows = lib.df_nrows(result)
-        ncols = lib.df_ncols(result)
+            nrows = lib.df_nrows(result)
+            ncols = lib.df_ncols(result)
+            lib.release(result)
+
+        elapsed = sorted(times)[len(times) // 2]  # median
         print(f"  {label:12s}  {elapsed*1000:8.1f} ms   {nrows:>10,} rows x {ncols} cols")
-        lib.release(result)
     finally:
         lib.graph_free(g)
 

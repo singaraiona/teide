@@ -9,6 +9,8 @@ CSV_PATH = os.path.join(os.path.dirname(__file__),
                         "..", "rayforce-bench", "datasets",
                         "G1_1e7_1e2_0_0", "G1_1e7_1e2_0_0.csv")
 
+N_ITER = 7  # median of 7 runs
+
 QUERIES = {
     "q1": "SELECT id1, SUM(v1) AS v1 FROM df GROUP BY id1",
     "q2": "SELECT id1, id2, SUM(v1) AS v1 FROM df GROUP BY id1, id2",
@@ -40,12 +42,16 @@ def main():
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
     for label, sql in QUERIES.items():
-        # Warm up: run once to compile
-        con.execute(sql).fetchall()
+        # Warm up
+        for _ in range(3):
+            con.execute(sql).fetchall()
 
-        t0 = time.perf_counter()
-        result = con.execute(sql).fetchall()
-        elapsed = time.perf_counter() - t0
+        times = []
+        for _ in range(N_ITER):
+            t0 = time.perf_counter()
+            result = con.execute(sql).fetchall()
+            times.append(time.perf_counter() - t0)
+        elapsed = sorted(times)[len(times) // 2]  # median
         nrows = len(result)
         ncols = len(result[0]) if result else 0
         print(f"  {label:12s}  {elapsed*1000:8.1f} ms   {nrows:>10,} rows x {ncols} cols")
@@ -58,11 +64,15 @@ def main():
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
     for label, sql in QUERIES.items():
-        con.execute(sql).fetchall()  # warm
+        for _ in range(3):
+            con.execute(sql).fetchall()
 
-        t0 = time.perf_counter()
-        result = con.execute(sql).fetchall()
-        elapsed = time.perf_counter() - t0
+        times = []
+        for _ in range(N_ITER):
+            t0 = time.perf_counter()
+            result = con.execute(sql).fetchall()
+            times.append(time.perf_counter() - t0)
+        elapsed = sorted(times)[len(times) // 2]  # median
         nrows = len(result)
         ncols = len(result[0]) if result else 0
         print(f"  {label:12s}  {elapsed*1000:8.1f} ms   {nrows:>10,} rows x {ncols} cols")

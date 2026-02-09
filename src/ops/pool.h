@@ -34,11 +34,10 @@ struct td_pool {
     uint32_t           task_cap;      /* power of 2 */
     uint32_t           task_head;     /* next to write (main only, no atomic needed) */
     _Atomic(uint32_t)  task_tail;     /* next to claim (workers, atomic_fetch_add) */
-    uint32_t           task_count;    /* total tasks submitted this dispatch */
+    _Atomic(uint32_t)  task_count;    /* total tasks submitted this dispatch */
 
     /* Barrier */
     _Atomic(uint32_t)  pending;       /* decremented by each task completion */
-    td_sem_t           done;          /* signaled when pending hits 0 */
     td_sem_t           work_ready;    /* workers sleep here */
 };
 

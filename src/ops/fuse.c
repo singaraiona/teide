@@ -1,6 +1,6 @@
 #include "fuse.h"
 #include <string.h>
-#include <stdlib.h>
+#include <teide/td.h>
 
 /* --------------------------------------------------------------------------
  * Fusion pass: merge element-wise chains into single fused nodes
@@ -32,14 +32,15 @@ static void count_refs(td_graph_t* g, td_op_t* node, uint32_t* ref_counts) {
 void td_fuse_pass(td_graph_t* g, td_op_t* root) {
     if (!g || !root || g->node_count == 0) return;
 
-    uint32_t* ref_counts = (uint32_t*)calloc(g->node_count, sizeof(uint32_t));
-    if (!ref_counts) return;
+    uint32_t nc = g->node_count;
+    uint32_t ref_counts[nc];
+    memset(ref_counts, 0, nc * sizeof(uint32_t));
 
     count_refs(g, root, ref_counts);
 
     /* Mark fuseable chains: element-wise nodes whose inputs have exactly
        one consumer (this node) and are also element-wise */
-    for (uint32_t i = 0; i < g->node_count; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         td_op_t* n = &g->nodes[i];
         if (!is_elementwise(n->opcode)) continue;
         if (n->flags & OP_FLAG_DEAD) continue;
@@ -56,6 +57,4 @@ void td_fuse_pass(td_graph_t* g, td_op_t* root) {
             n->flags |= OP_FLAG_FUSED;
         }
     }
-
-    free(ref_counts);
 }

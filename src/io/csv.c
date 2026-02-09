@@ -1,8 +1,12 @@
+#if defined(__linux__)
+  #define _POSIX_C_SOURCE 200809L
+#endif
 #include "csv.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 /* --------------------------------------------------------------------------
  * CSV parser: reads CSV files into DataFrames
@@ -36,16 +40,17 @@ static char* read_file(const char* path, size_t* out_size) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
 
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    /* Use fstat for >2GB file safety on 32-bit systems */
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || st.st_size <= 0) {
+        fclose(f); return NULL;
+    }
+    size_t sz = (size_t)st.st_size;
 
-    if (sz <= 0) { fclose(f); return NULL; }
-
-    char* buf = (char*)malloc((size_t)sz + 1);
+    char* buf = (char*)malloc(sz + 1);
     if (!buf) { fclose(f); return NULL; }
 
-    size_t rd = fread(buf, 1, (size_t)sz, f);
+    size_t rd = fread(buf, 1, sz, f);
     fclose(f);
     buf[rd] = '\0';
     *out_size = rd;
@@ -128,8 +133,15 @@ static csv_type_t detect_type(const char* field, size_t len) {
     }
 
     if (*p == '\0' && p > field) {
-        if (!has_dot && !has_e && all_digit) return CSV_TYPE_I64;
-        if (has_dot || has_e) return CSV_TYPE_F64;
+        /* Require at least one digit (bare +/- is not numeric) */
+        bool has_digit = false;
+        for (const char* d = field; *d; d++) {
+            if (isdigit((unsigned char)*d)) { has_digit = true; break; }
+        }
+        if (has_digit) {
+            if (!has_dot && !has_e && all_digit) return CSV_TYPE_I64;
+            if (has_dot || has_e) return CSV_TYPE_F64;
+        }
     }
 
     return CSV_TYPE_STR;
@@ -206,6 +218,11 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
 
     const char* data_start = p;
     while (*p) {
+        /* Skip blank lines */
+        if (*p == '\r' || *p == '\n') {
+            while (*p == '\r' || *p == '\n') p++;
+            continue;
+        }
         for (int c = 0; c < ncols && *p; c++) {
             p = parse_field(p, delimiter, field, sizeof(field), &field_len);
             csv_type_t t = detect_type(field, field_len);
@@ -268,6 +285,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                 default: {
                     /* Intern string as ENUM */
                     int64_t sym_id = td_sym_intern(field, field_len);
+                    if (sym_id < 0) sym_id = 0; /* fallback to empty-string id on OOM */
                     ((uint32_t*)td_data(col_vecs[c]))[row] = (uint32_t)sym_id;
                     break;
                 }

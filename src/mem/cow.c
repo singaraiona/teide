@@ -3,7 +3,7 @@
 #include <stdatomic.h>
 
 /* Defined in arena.c (non-static). 0 = sequential, 1 = parallel. */
-extern uint32_t td_parallel_flag;
+extern _Atomic(uint32_t) td_parallel_flag;
 
 /* --------------------------------------------------------------------------
  * td_retain
@@ -35,7 +35,7 @@ void td_release(td_t* v) {
 
 td_t* td_cow(td_t* v) {
     if (!v || TD_IS_ERR(v)) return v;
-    uint32_t rc = atomic_load_explicit(&v->rc, memory_order_relaxed);
+    uint32_t rc = atomic_load_explicit(&v->rc, memory_order_acquire);
     if (rc == 1) return v;  /* sole owner -- mutate in place */
     td_t* copy = td_alloc_copy(v);
     if (!copy || TD_IS_ERR(copy)) return copy;

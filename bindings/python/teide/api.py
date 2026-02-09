@@ -109,16 +109,27 @@ class Series:
         self.dtype = dtype
 
     def __len__(self):
+        # Validate this is a vector (type > 0), not an atom
+        type_byte = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int8))[18]
+        if type_byte <= 0:
+            return 0
         # Read len from td_t header (offset 24, int64)
         ptr_val = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int64))
         return ptr_val[3]  # offset 24 bytes = 3 int64s
 
+    def _data_ptr(self):
+        """Get actual data pointer, resolving slices to parent data."""
+        attrs = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_uint8))[19]
+        if attrs & 0x10:  # TD_ATTR_SLICE
+            parent = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+            offset = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int64))[1]
+            esz = {TD_F64: 8, TD_I64: 8, TD_I32: 4, TD_BOOL: 1, TD_ENUM: 4}.get(self.dtype, 1)
+            return parent + 32 + offset * esz
+        return self._ptr + 32
+
     def to_list(self):
         n = len(self)
-        data_ptr = ctypes.cast(
-            ctypes.c_void_p(self._ptr + 32),
-            ctypes.c_void_p
-        ).value
+        data_ptr = self._data_ptr()
 
         if self.dtype == TD_F64:
             arr = (ctypes.c_double * n).from_address(data_ptr)
@@ -147,10 +158,14 @@ class Series:
             return []
 
     def to_numpy(self):
-        """Zero-copy numpy view for numeric types."""
+        """Zero-copy numpy view for numeric types.
+
+        Warning: The returned array shares memory with the C library.
+        It is only valid while the parent Context is alive and the
+        source Table has not been freed."""
         import numpy as np
         n = len(self)
-        data_ptr = self._ptr + 32
+        data_ptr = self._data_ptr()
 
         if self.dtype == TD_F64:
             return np.ctypeslib.as_array(
@@ -401,12 +416,10 @@ class Query:
                 current = lib.head(g, current, n)
 
             elif op[0] == "select":
-                # Project specific columns
-                exprs = op[1]
-                nodes = [_emit_expr(lib, g, e) for e in exprs]
-                # For now, just return the last node (TODO: proper projection)
-                if nodes:
-                    current = nodes[-1]
+                raise NotImplementedError(
+                    "select() is not yet supported in lazy queries. "
+                    "Use Table['col_name'] after collect() instead."
+                )
 
         if current is None:
             # No ops — just return the bound df

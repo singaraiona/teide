@@ -109,6 +109,12 @@ class TeideLib:
         lib.td_vec_from_raw.argtypes = [ctypes.c_int8, ctypes.c_void_p, ctypes.c_int64]
         lib.td_vec_from_raw.restype = c_td_p
 
+        lib.td_vec_slice.argtypes = [c_td_p, ctypes.c_int64, ctypes.c_int64]
+        lib.td_vec_slice.restype = c_td_p
+
+        lib.td_vec_get.argtypes = [c_td_p, ctypes.c_int64]
+        lib.td_vec_get.restype = ctypes.c_void_p
+
         # ===== String API =====
         lib.td_str_ptr.argtypes = [c_td_p]
         lib.td_str_ptr.restype = ctypes.c_char_p

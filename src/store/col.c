@@ -39,6 +39,7 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     if (written != 32) { fclose(f); return TD_ERR_IO; }
 
     /* Write data */
+    if (vec->len < 0) { fclose(f); return TD_ERR_CORRUPT; }
     uint8_t esz = td_elem_size(vec->type);
     size_t data_size = (size_t)vec->len * esz;
 
@@ -65,6 +66,8 @@ td_err_t td_col_save(td_t* vec, const char* path) {
 td_t* td_col_load(const char* path) {
     if (!path) return TD_ERR_PTR(TD_ERR_IO);
 
+    /* Read file into temp mmap for validation, then copy to buddy block.
+     * This avoids the mmap lifecycle problem (mmod=1 blocks are never freed). */
     size_t mapped_size = 0;
     void* ptr = td_vm_map_file(path, &mapped_size);
     if (!ptr) return TD_ERR_PTR(TD_ERR_IO);
@@ -74,19 +77,37 @@ td_t* td_col_load(const char* path) {
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
 
-    td_t* vec = (td_t*)ptr;
+    td_t* tmp = (td_t*)ptr;
 
-    /* Set mmod=1 (file-mmap'd) and rc=1 */
-    vec->mmod = 1;
-    atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
-
-    /* Verify: data_size should fit in mapped region */
-    uint8_t esz = td_elem_size(vec->type);
-    size_t expected = 32 + (size_t)vec->len * esz;
-    if (expected > mapped_size) {
+    /* Validate type from untrusted file data */
+    if (tmp->type <= 0 || tmp->type >= TD_TYPE_COUNT) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
+    if (tmp->len < 0) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    uint8_t esz = td_elem_size(tmp->type);
+    size_t data_size = (size_t)tmp->len * esz;
+    if (32 + data_size > mapped_size) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    /* Allocate buddy block and copy file data */
+    td_t* vec = td_alloc(data_size);
+    if (!vec || TD_IS_ERR(vec)) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return vec ? vec : TD_ERR_PTR(TD_ERR_OOM);
+    }
+    memcpy(vec, ptr, 32 + data_size);
+    td_vm_unmap_file(ptr, mapped_size);
+
+    /* Fix up header for buddy-allocated block */
+    vec->mmod = 0;
+    atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;
 }

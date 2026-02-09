@@ -135,14 +135,15 @@ td_t* td_alloc(size_t data_size) {
         v->order = 0;
         atomic_store_explicit(&v->rc, 1, memory_order_relaxed);
 
-        td_t* tracker_block = td_buddy_alloc(&td_tl_arena->buddy, TD_ORDER_MIN);
+        /* Need order 6 (64B) to hold 32B header + 24B td_direct_block_t data */
+        td_t* tracker_block = td_buddy_alloc(&td_tl_arena->buddy, TD_ORDER_MIN + 1);
         if (!tracker_block) {
             td_vm_free(ptr, total);
             return NULL;
         }
         memset(tracker_block, 0, 32);
         tracker_block->mmod = 0;
-        tracker_block->order = TD_ORDER_MIN;
+        tracker_block->order = TD_ORDER_MIN + 1;
         atomic_store_explicit(&tracker_block->rc, 1, memory_order_relaxed);
 
         td_direct_block_t* db = (td_direct_block_t*)td_data(tracker_block);
@@ -311,11 +312,11 @@ void td_mem_stats(td_mem_stats_t* out) {
  * Parallel begin/end stubs
  * -------------------------------------------------------------------------- */
 
-uint32_t td_parallel_flag = 0;
+_Atomic(uint32_t) td_parallel_flag = 0;
 
-void td_parallel_begin(void) { td_parallel_flag = 1; }
+void td_parallel_begin(void) { atomic_store(&td_parallel_flag, 1); }
 void td_parallel_end(void) {
-    td_parallel_flag = 0;
+    atomic_store(&td_parallel_flag, 0);
     for (td_arena_t* a = td_tl_arena; a; a = a->next)
         td_arena_drain_return_queue(a);
 }

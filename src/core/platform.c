@@ -41,7 +41,7 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
     }
 
     size_t len = (size_t)st.st_size;
-    void* p = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     close(fd);
 
     if (p == MAP_FAILED) return NULL;

@@ -24,6 +24,7 @@ static int64_t vec_capacity(td_t* vec) {
 td_t* td_vec_new(int8_t type, int64_t capacity) {
     if (type <= 0 || type >= TD_TYPE_COUNT)
         return TD_ERR_PTR(TD_ERR_TYPE);
+    if (capacity < 0) return TD_ERR_PTR(TD_ERR_RANGE);
 
     uint8_t esz = td_elem_size(type);
     size_t data_size = (size_t)capacity * esz;
@@ -166,6 +167,8 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
     int64_t total_len = a->len + b->len;
     if (total_len < a->len) return TD_ERR_PTR(TD_ERR_OOM); /* overflow */
     size_t data_size = (size_t)total_len * esz;
+    if (esz > 1 && data_size / esz != (size_t)total_len)
+        return TD_ERR_PTR(TD_ERR_OOM); /* multiplication overflow */
 
     td_t* result = td_alloc(data_size);
     if (!result || TD_IS_ERR(result)) return result;
@@ -198,6 +201,7 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
 td_t* td_vec_from_raw(int8_t type, const void* data, int64_t count) {
     if (type <= 0 || type >= TD_TYPE_COUNT)
         return TD_ERR_PTR(TD_ERR_TYPE);
+    if (count < 0) return TD_ERR_PTR(TD_ERR_RANGE);
 
     uint8_t esz = td_elem_size(type);
     size_t data_size = (size_t)count * esz;

@@ -393,8 +393,9 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
     td_pool_t* pool = td_pool_get();
     if (pool && len >= TD_PARALLEL_THRESHOLD) {
         uint32_t nw = td_pool_total_workers(pool);
-        reduce_acc_t accs[nw];
-        memset(accs, 0, nw * sizeof(reduce_acc_t));
+        td_t* accs_hdr;
+        reduce_acc_t* accs = (reduce_acc_t*)scratch_calloc(&accs_hdr, nw * sizeof(reduce_acc_t));
+        if (!accs) return TD_ERR_PTR(TD_ERR_OOM);
         for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
 
         par_reduce_ctx_t ctx = { .input = input, .accs = accs };
@@ -424,17 +425,20 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
             }
         }
 
+        td_t* result;
         switch (op->opcode) {
-            case OP_SUM:   return in_type == TD_F64 ? td_f64(merged.sum_f) : td_i64(merged.sum_i);
-            case OP_PROD:  return in_type == TD_F64 ? td_f64(merged.prod_f) : td_i64(merged.prod_i);
-            case OP_MIN:   return in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.min_f : 0.0) : td_i64(merged.cnt > 0 ? merged.min_i : 0);
-            case OP_MAX:   return in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.max_f : 0.0) : td_i64(merged.cnt > 0 ? merged.max_i : 0);
-            case OP_COUNT: return td_i64(merged.cnt);
-            case OP_AVG:   return in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.sum_f / merged.cnt : 0.0) : td_f64(merged.cnt > 0 ? (double)merged.sum_i / merged.cnt : 0.0);
-            case OP_FIRST: return in_type == TD_F64 ? td_f64(merged.first_f) : td_i64(merged.first_i);
-            case OP_LAST:  return in_type == TD_F64 ? td_f64(merged.last_f) : td_i64(merged.last_i);
-            default:       return TD_ERR_PTR(TD_ERR_NYI);
+            case OP_SUM:   result = in_type == TD_F64 ? td_f64(merged.sum_f) : td_i64(merged.sum_i); break;
+            case OP_PROD:  result = in_type == TD_F64 ? td_f64(merged.prod_f) : td_i64(merged.prod_i); break;
+            case OP_MIN:   result = in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.min_f : 0.0) : td_i64(merged.cnt > 0 ? merged.min_i : 0); break;
+            case OP_MAX:   result = in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.max_f : 0.0) : td_i64(merged.cnt > 0 ? merged.max_i : 0); break;
+            case OP_COUNT: result = td_i64(merged.cnt); break;
+            case OP_AVG:   result = in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.sum_f / merged.cnt : 0.0) : td_f64(merged.cnt > 0 ? (double)merged.sum_i / merged.cnt : 0.0); break;
+            case OP_FIRST: result = in_type == TD_F64 ? td_f64(merged.first_f) : td_i64(merged.first_i); break;
+            case OP_LAST:  result = in_type == TD_F64 ? td_f64(merged.last_f) : td_i64(merged.last_i); break;
+            default:       result = TD_ERR_PTR(TD_ERR_NYI); break;
         }
+        scratch_free(accs_hdr);
+        return result;
     }
 
     reduce_acc_t acc;
@@ -709,11 +713,12 @@ typedef struct {
     td_t* _h_max_i64;
 } group_ht_t;
 
-static void group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
+static bool group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
     ht->ht_cap = cap;
     ht->ht_rows  = (int64_t*)scratch_alloc(&ht->_h_ht_rows, cap * sizeof(int64_t));
     ht->ht_gids  = (int32_t*)scratch_alloc(&ht->_h_ht_gids, cap * sizeof(int32_t));
     ht->ht_salts = (uint16_t*)scratch_alloc(&ht->_h_ht_salts, cap * sizeof(uint16_t));
+    if (!ht->ht_rows || !ht->ht_gids || !ht->ht_salts) return false;
     memset(ht->ht_rows, -1, cap * sizeof(int64_t));
     ht->grp_cap = 256;
     ht->grp_count = 0;
@@ -727,12 +732,16 @@ static void group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
     ht->all_agg_max_f64 = (double*)scratch_alloc(&ht->_h_max_f64, total * sizeof(double));
     ht->all_agg_min_i64 = (int64_t*)scratch_alloc(&ht->_h_min_i64, total * sizeof(int64_t));
     ht->all_agg_max_i64 = (int64_t*)scratch_alloc(&ht->_h_max_i64, total * sizeof(int64_t));
+    if (!ht->groups || !ht->all_agg_f64 || !ht->all_agg_i64 ||
+        !ht->all_agg_min_f64 || !ht->all_agg_max_f64 ||
+        !ht->all_agg_min_i64 || !ht->all_agg_max_i64) return false;
     for (size_t i = 0; i < total; i++) {
         ht->all_agg_min_f64[i] = DBL_MAX;
         ht->all_agg_max_f64[i] = -DBL_MAX;
         ht->all_agg_min_i64[i] = INT64_MAX;
         ht->all_agg_max_i64[i] = INT64_MIN;
     }
+    return true;
 }
 
 static void group_ht_free(group_ht_t* ht) {
@@ -904,11 +913,19 @@ static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             __builtin_prefetch(&ht->ht_rows[slot], 0, 1);
             __builtin_prefetch(&ht->ht_salts[slot], 0, 1);
         }
-        /* Phase 2: probe + accumulate */
+        /* Phase 2: probe + accumulate.
+         * If rehash changes mask mid-batch, re-hash remaining entries. */
         for (int i = 0; i < GROUP_PREFETCH_BATCH; i++) {
+            uint32_t old_mask = mask;
             mask = group_probe_row(ht, key_data, key_types, n_keys,
                                    agg_vecs, n_aggs, row + i,
                                    batch_hashes[i], batch_slots[i], mask);
+            if (mask != old_mask) {
+                /* Rehash occurred — recompute slots for remaining entries */
+                for (int j = i + 1; j < GROUP_PREFETCH_BATCH; j++) {
+                    batch_slots[j] = (uint32_t)(batch_hashes[j] & mask);
+                }
+            }
         }
     }
     /* Handle remaining rows without prefetching */
@@ -1055,7 +1072,8 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (target < 256) target = 256;
             while (part_ht_cap < target) part_ht_cap *= 2;
         }
-        group_ht_init(&c->part_hts[p], part_ht_cap, c->n_aggs);
+        if (!group_ht_init(&c->part_hts[p], part_ht_cap, c->n_aggs))
+            continue; /* OOM — skip partition */
 
         /* Process all workers' entries for this partition */
         for (uint32_t w = 0; w < c->n_workers; w++) {
@@ -1757,7 +1775,8 @@ ht_path:;
             uint32_t merged_cap = 256;
             while (merged_cap < total_grps) merged_cap *= 2;
             /* We don't need a HT (no lookups), just the flat group/agg arrays */
-            group_ht_init(&single_ht, merged_cap, n_aggs);
+            if (!group_ht_init(&single_ht, merged_cap, n_aggs))
+                return TD_ERR_PTR(TD_ERR_OOM);
             uint32_t dest = 0;
             for (uint32_t p = 0; p < RADIX_P; p++) {
                 group_ht_t* ph = &part_hts[p];
@@ -1782,7 +1801,8 @@ ht_path:;
             final_ht = &single_ht;
         } else {
             /* No groups at all — init an empty HT for result building */
-            group_ht_init(&single_ht, 256, n_aggs);
+            if (!group_ht_init(&single_ht, 256, n_aggs))
+                return TD_ERR_PTR(TD_ERR_OOM);
             final_ht = &single_ht;
         }
         goto build_result;
@@ -1790,7 +1810,8 @@ ht_path:;
 
 sequential_fallback:;
     /* Sequential path */
-    group_ht_init(&single_ht, ht_cap, n_aggs);
+    if (!group_ht_init(&single_ht, ht_cap, n_aggs))
+        return TD_ERR_PTR(TD_ERR_OOM);
     group_rows_range(&single_ht, key_data, key_types, n_keys, agg_vecs, n_aggs,
                      ext->agg_ops, 0, nrows);
 
@@ -1893,7 +1914,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
 
     /* Build hash table on right side (sequential) */
     uint32_t ht_cap = 256;
-    while (ht_cap < (uint32_t)right_rows * 2) ht_cap *= 2;
+    uint64_t target = (uint64_t)right_rows * 2;
+    while (ht_cap < target && ht_cap != 0) ht_cap *= 2;
+    if (ht_cap == 0) ht_cap = (uint32_t)(target | (target >> 1)); /* saturate */
 
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
@@ -1952,10 +1975,13 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
                 if (pair_count >= pair_cap) {
                     int64_t old_cap = pair_cap;
                     pair_cap *= 2;
-                    l_idx = (int64_t*)scratch_realloc(&l_idx_hdr,
+                    int64_t* new_l = (int64_t*)scratch_realloc(&l_idx_hdr,
                         (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                    r_idx = (int64_t*)scratch_realloc(&r_idx_hdr,
+                    int64_t* new_r = (int64_t*)scratch_realloc(&r_idx_hdr,
                         (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
+                    if (!new_l || !new_r) goto join_cleanup;
+                    l_idx = new_l;
+                    r_idx = new_r;
                 }
                 l_idx[pair_count] = l;
                 r_idx[pair_count] = r;
@@ -1968,10 +1994,13 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
             if (pair_count >= pair_cap) {
                 int64_t old_cap = pair_cap;
                 pair_cap *= 2;
-                l_idx = (int64_t*)scratch_realloc(&l_idx_hdr,
+                int64_t* new_l = (int64_t*)scratch_realloc(&l_idx_hdr,
                     (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                r_idx = (int64_t*)scratch_realloc(&r_idx_hdr,
+                int64_t* new_r = (int64_t*)scratch_realloc(&r_idx_hdr,
                     (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
+                if (!new_l || !new_r) goto join_cleanup;
+                l_idx = new_l;
+                r_idx = new_r;
             }
             l_idx[pair_count] = l;
             r_idx[pair_count] = -1;

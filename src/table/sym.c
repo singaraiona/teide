@@ -16,7 +16,8 @@ static uint32_t fnv1a(const char* data, size_t len) {
 }
 
 /* --------------------------------------------------------------------------
- * Symbol table structure (static global, sequential mode only)
+ * Symbol table structure (static global, sequential mode only).
+ * NOT thread-safe: all interning must happen before td_parallel_begin().
  * -------------------------------------------------------------------------- */
 
 #define SYM_INIT_CAP     256
@@ -139,6 +140,10 @@ int64_t td_sym_intern(const char* str, size_t len) {
         }
         slot = (slot + 1) & mask;
     }
+
+    /* Refuse insert if table is critically full (ht_grow may have failed) */
+    if (g_sym.str_count >= (uint32_t)(g_sym.bucket_cap * 0.95))
+        return -1;
 
     /* Not found — create new entry */
     uint32_t new_id = g_sym.str_count;

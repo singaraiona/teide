@@ -24,6 +24,11 @@
 td_t* td_part_load(const char* db_root, const char* table_name) {
     if (!db_root || !table_name) return TD_ERR_PTR(TD_ERR_IO);
 
+    /* Validate table_name: no path separators or traversal */
+    if (strchr(table_name, '/') || strchr(table_name, '\\') ||
+        strstr(table_name, "..") || table_name[0] == '.')
+        return TD_ERR_PTR(TD_ERR_IO);
+
     /* Scan db_root for partition directories (YYYY.MM.DD format) */
     DIR* d = opendir(db_root);
     if (!d) return TD_ERR_PTR(TD_ERR_IO);
@@ -38,8 +43,14 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         /* Skip . and .. and non-directories */
         if (ent->d_name[0] == '.') continue;
 
-        /* Check if it looks like a partition (contains a dot) */
-        if (strchr(ent->d_name, '.') == NULL) continue;
+        /* Validate partition dir: digits and dots only (YYYY.MM.DD format) */
+        bool valid = false;
+        for (const char* c = ent->d_name; *c; c++) {
+            if (*c == '.') { valid = true; continue; }
+            if (*c >= '0' && *c <= '9') continue;
+            valid = false; break;
+        }
+        if (!valid) continue;
 
         if (part_count >= part_cap) {
             part_cap = part_cap == 0 ? 16 : part_cap * 2;
@@ -92,7 +103,12 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
     /* Accumulate rows from all partitions */
     td_t** all_dfs = (td_t**)malloc((size_t)part_count * sizeof(td_t*));
-    if (!all_dfs) { free(part_dirs); return TD_ERR_PTR(TD_ERR_OOM); }
+    if (!all_dfs) {
+        td_release(first);
+        for (int64_t i = 0; i < part_count; i++) free(part_dirs[i]);
+        free(part_dirs);
+        return TD_ERR_PTR(TD_ERR_OOM);
+    }
     all_dfs[0] = first;
 
     for (int64_t p = 1; p < part_count; p++) {
@@ -117,6 +133,10 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
             if (part_col) {
                 td_t* new_combined = td_vec_concat(combined, part_col);
                 td_release(combined);
+                if (!new_combined || TD_IS_ERR(new_combined)) {
+                    combined = NULL;
+                    break;
+                }
                 combined = new_combined;
             }
         }

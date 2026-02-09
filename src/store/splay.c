@@ -49,13 +49,15 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
         const char* name = td_str_ptr(name_atom);
         size_t name_len = td_str_len(name_atom);
 
-        /* Reject names with path separators or traversal */
-        if (memchr(name, '/', name_len) || memchr(name, '\0', name_len) ||
-            (name_len == 2 && name[0] == '.' && name[1] == '.'))
+        /* Reject names with path separators, traversal, or starting with '.' */
+        if (name_len == 0 || name[0] == '.' ||
+            memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
+            memchr(name, '\0', name_len))
             continue;
 
         char path[1024];
-        snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
 
         td_err_t err = td_col_save(col, path);
         if (err != TD_OK) return err;
@@ -95,17 +97,21 @@ td_t* td_splay_load(const char* dir) {
         const char* name = td_str_ptr(name_atom);
         size_t name_len = td_str_len(name_atom);
 
-        /* Reject names with path separators or traversal */
-        if (memchr(name, '/', name_len) || memchr(name, '\0', name_len) ||
-            (name_len == 2 && name[0] == '.' && name[1] == '.'))
+        /* Reject names with path separators, traversal, or starting with '.' */
+        if (name_len == 0 || name[0] == '.' ||
+            memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
+            memchr(name, '\0', name_len))
             continue;
 
-        snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
+
         td_t* col = td_col_load(path);
         if (!col || TD_IS_ERR(col)) continue;
 
-        df = td_table_add_col(df, name_id, col);
-        /* col is now owned by df (retained), but we keep the mmap ref */
+        td_t* new_df = td_table_add_col(df, name_id, col);
+        if (!new_df || TD_IS_ERR(new_df)) continue;
+        df = new_df;
     }
 
     td_release(schema);

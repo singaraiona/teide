@@ -6,16 +6,30 @@
  * Graph allocation helpers
  * -------------------------------------------------------------------------- */
 
-#define GRAPH_INIT_CAP 64
+#define GRAPH_INIT_CAP 4096
+
+/* After realloc moves g->nodes, fix up all stored input pointers */
+static void graph_fixup_ptrs(td_graph_t* g, td_op_t* old_nodes) {
+    ptrdiff_t delta = (char*)g->nodes - (char*)old_nodes;
+    if (delta == 0) return;
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        if (g->nodes[i].inputs[0])
+            g->nodes[i].inputs[0] = (td_op_t*)((char*)g->nodes[i].inputs[0] + delta);
+        if (g->nodes[i].inputs[1])
+            g->nodes[i].inputs[1] = (td_op_t*)((char*)g->nodes[i].inputs[1] + delta);
+    }
+}
 
 static td_op_t* graph_alloc_node(td_graph_t* g) {
     if (g->node_count >= g->node_cap) {
+        td_op_t* old_nodes = g->nodes;
         uint32_t new_cap = g->node_cap * 2;
         td_op_t* new_nodes = (td_op_t*)realloc(g->nodes,
                                                  new_cap * sizeof(td_op_t));
         if (!new_nodes) return NULL;
         g->nodes = new_nodes;
         g->node_cap = new_cap;
+        graph_fixup_ptrs(g, old_nodes);
     }
     td_op_t* n = &g->nodes[g->node_count];
     memset(n, 0, sizeof(td_op_t));
@@ -31,12 +45,14 @@ static td_op_ext_t* graph_alloc_ext_node(td_graph_t* g) {
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
+        td_op_t* old_nodes = g->nodes;
         uint32_t new_cap = g->node_cap * 2;
         td_op_t* new_nodes = (td_op_t*)realloc(g->nodes,
                                                  new_cap * sizeof(td_op_t));
         if (!new_nodes) { free(ext); return NULL; }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
+        graph_fixup_ptrs(g, old_nodes);
     }
     ext->base.id = g->node_count;
     g->nodes[g->node_count] = ext->base;
@@ -207,27 +223,37 @@ td_op_t* td_const_df(td_graph_t* g, td_t* df) {
  * -------------------------------------------------------------------------- */
 
 static td_op_t* make_unary(td_graph_t* g, uint16_t opcode, td_op_t* a, int8_t out_type) {
+    /* Save ID before alloc — realloc may invalidate the pointer */
+    uint32_t a_id = a->id;
+    uint32_t est = a->est_rows;
     td_op_t* n = graph_alloc_node(g);
     if (!n) return NULL;
+    a = &g->nodes[a_id];  /* re-resolve after potential realloc */
 
     n->opcode = opcode;
     n->arity = 1;
     n->inputs[0] = a;
     n->out_type = out_type;
-    n->est_rows = a->est_rows;
+    n->est_rows = est;
     return n;
 }
 
 static td_op_t* make_binary(td_graph_t* g, uint16_t opcode, td_op_t* a, td_op_t* b, int8_t out_type) {
+    /* Save IDs before alloc — realloc may invalidate the pointers */
+    uint32_t a_id = a->id;
+    uint32_t b_id = b->id;
+    uint32_t est = a->est_rows > b->est_rows ? a->est_rows : b->est_rows;
     td_op_t* n = graph_alloc_node(g);
     if (!n) return NULL;
+    a = &g->nodes[a_id];  /* re-resolve after potential realloc */
+    b = &g->nodes[b_id];
 
     n->opcode = opcode;
     n->arity = 2;
     n->inputs[0] = a;
     n->inputs[1] = b;
     n->out_type = out_type;
-    n->est_rows = a->est_rows > b->est_rows ? a->est_rows : b->est_rows;
+    n->est_rows = est;
     return n;
 }
 

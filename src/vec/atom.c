@@ -78,13 +78,16 @@ td_t* td_str(const char* s, size_t len) {
         if (len > 0) memcpy(v->sdata, s, len);
         return v;
     }
-    /* Long string: allocate a CHAR vector to hold the data, store pointer */
-    size_t data_size = len;
+    /* Long string: allocate a CHAR vector to hold the data, store pointer.
+     * Allocate len+1 and null-terminate for C string compatibility — callers
+     * (including ctypes c_char_p) may read until '\0'. */
+    size_t data_size = len + 1;
     td_t* chars = td_alloc(data_size);
     if (!chars || TD_IS_ERR(chars)) return chars;
     chars->type = TD_CHAR;
     chars->len = (int64_t)len;
     memcpy(td_data(chars), s, len);
+    ((char*)td_data(chars))[len] = '\0';
 
     td_t* v = td_alloc(0);
     if (TD_IS_ERR(v)) {

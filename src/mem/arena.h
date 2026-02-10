@@ -59,6 +59,10 @@ td_arena_t* td_arena_create(size_t size);
 /* Find the arena that owns a given pointer (by checking containment). */
 td_arena_t* td_arena_find(td_t* ptr);
 
+/* Find the arena that owns a given pointer across ALL threads (global registry).
+ * Used by td_free() for cross-thread free when td_arena_find() returns NULL. */
+td_arena_t* td_arena_find_global(td_t* ptr);
+
 /* Drain the return queue for a single arena, freeing blocks back to buddy. */
 void td_arena_drain_return_queue(td_arena_t* a);
 

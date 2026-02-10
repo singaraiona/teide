@@ -93,12 +93,9 @@ static uint32_t fnv1a(const char* data, size_t len) {
  * Strings are interned locally (no locks). After the parallel parse, the
  * main thread merges local tables into the global sym table.
  *
- * Uses malloc/free for internal buffers because they must survive cross-thread
- * alloc (main init) → use (worker) → grow (worker) → free (main cleanup).
- * td_alloc/td_free cannot do cross-thread free (td_arena_find is TLS-only).
+ * Workers init their local_sym on first use (same-thread alloc via scratch).
+ * Main thread frees after merge (cross-thread free → return queue).
  * -------------------------------------------------------------------------- */
-
-#include <stdlib.h>  /* malloc/realloc/free for local_sym internals only */
 
 #define LSYM_INIT_BUCKETS 128
 #define LSYM_INIT_STRS    64
@@ -113,12 +110,16 @@ static uint32_t fnv1a(const char* data, size_t len) {
 #define UNPACK_LID(packed) ((packed) & 0x00FFFFFFu)
 
 typedef struct {
+    td_t*      buckets_hdr;
     uint64_t*  buckets;      /* (hash<<32) | (id+1), 0 = empty */
     uint32_t   bucket_cap;   /* power of 2 */
+    td_t*      offsets_hdr;
     uint32_t*  offsets;      /* offsets[id] = byte offset into arena */
+    td_t*      lens_hdr;
     uint32_t*  lens;         /* lens[id] = string length */
     uint32_t   count;
     uint32_t   cap;
+    td_t*      arena_hdr;
     char*      arena;        /* growable buffer for string copies */
     size_t     arena_used;
     size_t     arena_cap;
@@ -126,28 +127,35 @@ typedef struct {
 
 static void local_sym_init(local_sym_t* ls) {
     ls->bucket_cap = LSYM_INIT_BUCKETS;
-    ls->buckets = (uint64_t*)calloc(ls->bucket_cap, sizeof(uint64_t));
+    ls->buckets = (uint64_t*)scratch_alloc(&ls->buckets_hdr,
+                                            ls->bucket_cap * sizeof(uint64_t));
+    if (ls->buckets) memset(ls->buckets, 0, ls->bucket_cap * sizeof(uint64_t));
     ls->cap = LSYM_INIT_STRS;
-    ls->offsets = (uint32_t*)malloc(ls->cap * sizeof(uint32_t));
-    ls->lens = (uint32_t*)malloc(ls->cap * sizeof(uint32_t));
+    ls->offsets = (uint32_t*)scratch_alloc(&ls->offsets_hdr,
+                                            ls->cap * sizeof(uint32_t));
+    ls->lens = (uint32_t*)scratch_alloc(&ls->lens_hdr,
+                                         ls->cap * sizeof(uint32_t));
     ls->count = 0;
     ls->arena_cap = LSYM_INIT_ARENA;
-    ls->arena = (char*)malloc(ls->arena_cap);
+    ls->arena = (char*)scratch_alloc(&ls->arena_hdr, ls->arena_cap);
     ls->arena_used = 0;
 }
 
 static void local_sym_free(local_sym_t* ls) {
-    free(ls->buckets);
-    free(ls->offsets);
-    free(ls->lens);
-    free(ls->arena);
+    scratch_free(ls->buckets_hdr);
+    scratch_free(ls->offsets_hdr);
+    scratch_free(ls->lens_hdr);
+    scratch_free(ls->arena_hdr);
     memset(ls, 0, sizeof(*ls));
 }
 
 static void local_sym_rehash(local_sym_t* ls) {
     uint32_t new_cap = ls->bucket_cap * 2;
-    uint64_t* new_buckets = (uint64_t*)calloc(new_cap, sizeof(uint64_t));
+    td_t* new_hdr = NULL;
+    uint64_t* new_buckets = (uint64_t*)scratch_alloc(&new_hdr,
+                                                      new_cap * sizeof(uint64_t));
     if (!new_buckets) return;
+    memset(new_buckets, 0, new_cap * sizeof(uint64_t));
 
     uint32_t new_mask = new_cap - 1;
     for (uint32_t i = 0; i < ls->bucket_cap; i++) {
@@ -158,7 +166,8 @@ static void local_sym_rehash(local_sym_t* ls) {
         while (new_buckets[slot] != 0) slot = (slot + 1) & new_mask;
         new_buckets[slot] = e;
     }
-    free(ls->buckets);
+    scratch_free(ls->buckets_hdr);
+    ls->buckets_hdr = new_hdr;
     ls->buckets = new_buckets;
     ls->bucket_cap = new_cap;
 }
@@ -185,15 +194,18 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
 
     if (new_id >= ls->cap) {
         uint32_t new_cap = ls->cap * 2;
-        ls->offsets = (uint32_t*)realloc(ls->offsets, new_cap * sizeof(uint32_t));
-        ls->lens = (uint32_t*)realloc(ls->lens, new_cap * sizeof(uint32_t));
+        ls->offsets = (uint32_t*)scratch_realloc(&ls->offsets_hdr,
+            ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
+        ls->lens = (uint32_t*)scratch_realloc(&ls->lens_hdr,
+            ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
         ls->cap = new_cap;
     }
 
     if (ls->arena_used + len > ls->arena_cap) {
         size_t new_acap = ls->arena_cap * 2;
         while (new_acap < ls->arena_used + len) new_acap *= 2;
-        ls->arena = (char*)realloc(ls->arena, new_acap);
+        ls->arena = (char*)scratch_realloc(&ls->arena_hdr,
+            ls->arena_cap, new_acap);
         ls->arena_cap = new_acap;
     }
     memcpy(ls->arena + ls->arena_used, str, len);
@@ -555,6 +567,7 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
         for (uint32_t w = 0; w < n_workers; w++) {
             local_sym_t* ls = &local_syms[(size_t)w * (size_t)n_cols + (size_t)c];
             if (ls->count == 0) continue;
+
             mappings[w] = (int64_t*)scratch_alloc(&map_hdrs[w],
                                                     ls->count * sizeof(int64_t));
             if (!mappings[w]) continue;
@@ -605,6 +618,14 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
     local_sym_t* my_syms = ctx->local_syms
                            ? &ctx->local_syms[(size_t)worker_id * (size_t)ctx->n_cols]
                            : NULL;
+
+    /* Lazy init: workers allocate their own local_sym buffers (same-thread) */
+    if (my_syms) {
+        for (int c = 0; c < ctx->n_cols; c++) {
+            if (ctx->col_types[c] == CSV_TYPE_STR && my_syms[c].buckets == NULL)
+                local_sym_init(&my_syms[c]);
+        }
+    }
 
     for (int64_t row = start; row < end_row; row++) {
         const char* p = ctx->buf + ctx->row_offsets[row];
@@ -831,18 +852,14 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
             uint32_t n_workers = td_pool_total_workers(pool);
 
             /* Allocate per-worker local sym tables for string columns.
-             * Uses malloc because workers may grow these (cross-thread realloc). */
+             * Zero-init so workers can lazy-init on first use. */
+            td_t* local_syms_hdr = NULL;
             local_sym_t* local_syms = NULL;
             if (has_str_cols) {
-                local_syms = (local_sym_t*)calloc(
-                    (size_t)n_workers * (size_t)ncols, sizeof(local_sym_t));
+                size_t lsym_sz = (size_t)n_workers * (size_t)ncols * sizeof(local_sym_t);
+                local_syms = (local_sym_t*)scratch_alloc(&local_syms_hdr, lsym_sz);
                 if (local_syms) {
-                    for (uint32_t w = 0; w < n_workers; w++) {
-                        for (int c = 0; c < ncols; c++) {
-                            if (col_types[c] == CSV_TYPE_STR)
-                                local_sym_init(&local_syms[(size_t)w * (size_t)ncols + (size_t)c]);
-                        }
-                    }
+                    memset(local_syms, 0, lsym_sz);
                 } else {
                     use_parallel = false;
                 }
@@ -875,7 +892,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                         }
                     }
                 }
-                free(local_syms);
+                scratch_free(local_syms_hdr);
             }
         }
 

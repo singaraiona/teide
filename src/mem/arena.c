@@ -16,6 +16,29 @@ TD_TLS td_direct_block_t* td_tl_direct_blocks = NULL;
 TD_TLS td_mem_stats_t     td_tl_stats;
 
 /* --------------------------------------------------------------------------
+ * Global arena registry — enables cross-thread free via return queue.
+ *
+ * Every arena created by any thread is registered here. td_arena_find_global()
+ * scans this array to find the owning arena for a block when td_arena_find()
+ * (thread-local) returns NULL. Reads are lock-free; writes use a CAS spinlock.
+ * -------------------------------------------------------------------------- */
+#define TD_ARENA_REGISTRY_CAP 1024
+
+static td_arena_t*       g_arena_registry[TD_ARENA_REGISTRY_CAP];
+static _Atomic(uint32_t) g_arena_registry_len  = 0;
+static _Atomic(uint32_t) g_arena_registry_lock = 0;
+
+static void arena_registry_lock(void) {
+    while (atomic_exchange_explicit(&g_arena_registry_lock, 1,
+                                    memory_order_acquire) != 0)
+        ; /* spin */
+}
+
+static void arena_registry_unlock(void) {
+    atomic_store_explicit(&g_arena_registry_lock, 0, memory_order_release);
+}
+
+/* --------------------------------------------------------------------------
  * Arena creation
  * -------------------------------------------------------------------------- */
 
@@ -47,6 +70,15 @@ td_arena_t* td_arena_create(size_t size) {
     a->next = td_tl_arena;
     td_tl_arena = a;
 
+    /* Register in global array for cross-thread free lookup */
+    arena_registry_lock();
+    uint32_t idx = atomic_load_explicit(&g_arena_registry_len, memory_order_relaxed);
+    if (idx < TD_ARENA_REGISTRY_CAP) {
+        g_arena_registry[idx] = a;
+        atomic_store_explicit(&g_arena_registry_len, idx + 1, memory_order_relaxed);
+    }
+    arena_registry_unlock();
+
     return a;
 }
 
@@ -57,6 +89,22 @@ td_arena_t* td_arena_create(size_t size) {
 td_arena_t* td_arena_find(td_t* ptr) {
     uint8_t* p = (uint8_t*)ptr;
     for (td_arena_t* a = td_tl_arena; a; a = a->next) {
+        if (p >= a->buddy.base && p < a->buddy.base + a->region_size)
+            return a;
+    }
+    return NULL;
+}
+
+/* --------------------------------------------------------------------------
+ * Global arena lookup by pointer containment
+ * -------------------------------------------------------------------------- */
+
+td_arena_t* td_arena_find_global(td_t* ptr) {
+    uint8_t* p = (uint8_t*)ptr;
+    uint32_t len = atomic_load_explicit(&g_arena_registry_len, memory_order_acquire);
+    for (uint32_t i = 0; i < len; i++) {
+        td_arena_t* a = g_arena_registry[i];
+        if (!a) continue;
         if (p >= a->buddy.base && p < a->buddy.base + a->region_size)
             return a;
     }
@@ -98,6 +146,23 @@ void td_arena_destroy_all(void) {
     }
     td_tl_direct_blocks = NULL;
 
+    /* Drain return queues before destroying (reclaim cross-thread frees) */
+    for (td_arena_t* a = td_tl_arena; a; a = a->next)
+        td_arena_drain_return_queue(a);
+
+    /* Unregister from global array so no new cross-thread frees target us */
+    arena_registry_lock();
+    for (td_arena_t* a = td_tl_arena; a; a = a->next) {
+        uint32_t len = atomic_load_explicit(&g_arena_registry_len, memory_order_relaxed);
+        for (uint32_t i = 0; i < len; i++) {
+            if (g_arena_registry[i] == a) {
+                g_arena_registry[i] = NULL;
+                break;
+            }
+        }
+    }
+    arena_registry_unlock();
+
     td_arena_t* a = td_tl_arena;
     while (a) {
         td_arena_t* next = a->next;
@@ -120,6 +185,11 @@ td_t* td_alloc(size_t data_size) {
         td_arena_init();
         if (!td_tl_arena) return NULL;
     }
+
+    /* Lazy drain: reclaim blocks returned by other threads */
+    if (atomic_load_explicit(&td_tl_arena->return_queue,
+                             memory_order_relaxed) != NULL)
+        td_arena_drain_return_queue(td_tl_arena);
 
     uint8_t order = td_order_for_size(data_size);
 
@@ -233,7 +303,21 @@ void td_free(td_t* v) {
     size_t block_size = (size_t)1 << order;
 
     td_arena_t* a = td_arena_find(v);
-    if (!a) return;
+    if (!a) {
+        /* Cross-thread free: find owning arena via global registry
+         * and push to its MPSC return queue (Treiber stack). */
+        a = td_arena_find_global(v);
+        if (!a) return;
+        td_t* old_head;
+        do {
+            old_head = atomic_load_explicit(&a->return_queue,
+                                            memory_order_relaxed);
+            *(td_t**)v = old_head;  /* reuse bytes 0-7 as next pointer */
+        } while (!atomic_compare_exchange_weak_explicit(
+                    &a->return_queue, &old_head, v,
+                    memory_order_release, memory_order_relaxed));
+        return;
+    }
 
     td_buddy_free(&a->buddy, v, order);
     td_tl_stats.free_count++;

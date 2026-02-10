@@ -59,6 +59,7 @@ Ops with >2 inputs (group-by, multi-column sort, join) use extended nodes (`td_o
 - **Morsel-only processing**: all vector loops must chunk through `td_morsel_t` (1024 elements/tile). No full-vector iteration.
 - **Error returns**: `td_t*` functions use `TD_ERR_PTR()` / `TD_IS_ERR()`; other functions return `td_err_t`
 - **No external deps**: everything in pure C17, single public header `include/teide/td.h`
+- **No system allocator**: never use `malloc`/`calloc`/`realloc`/`free` from `<stdlib.h>`. Use `td_alloc()`/`td_free()` for dynamic memory (via `scratch_alloc`/`scratch_free` wrappers as in `exec.c`). Use VLAs for small bounded arrays on the stack. Note: `td_free()` only works on the allocating thread's arena — cross-thread free silently leaks.
 
 ## Known Pitfalls
 

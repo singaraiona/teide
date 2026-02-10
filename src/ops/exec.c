@@ -2342,6 +2342,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     while (ht_cap < target && ht_cap != 0) ht_cap *= 2;
     if (ht_cap == 0) ht_cap = (uint32_t)(target | (target >> 1)); /* saturate */
 
+    td_t* result = NULL;  /* declared before goto targets for Clang -Wsometimes-uninitialized */
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     int64_t* ht_next = (int64_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(int64_t));
@@ -2435,7 +2436,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     /* Build result DataFrame */
     int64_t left_ncols = td_table_ncols(left_df);
     int64_t right_ncols = td_table_ncols(right_df);
-    td_t* result = td_table_new(left_ncols + right_ncols);
+    result = td_table_new(left_ncols + right_ncols);
     if (!result || TD_IS_ERR(result)) goto join_cleanup;
 
     for (int64_t c = 0; c < left_ncols; c++) {

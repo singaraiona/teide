@@ -34,7 +34,11 @@ def _format_val(val, dtype):
     if val is None:
         return "null"
     if dtype == TD_F64:
-        return f"{val:.4f}"
+        # Strip trailing zeros: 49.9400 → 49.94, but keep at least one decimal
+        s = f"{val:.4f}".rstrip("0")
+        if s.endswith("."):
+            s += "0"
+        return s
     if dtype == TD_BOOL:
         return "true" if val else "false"
     return str(val)
@@ -349,8 +353,13 @@ class Table:
         # Alignment: right for numeric, left for strings
         aligns = [">" if _is_numeric(d) else "<" for d in dtypes]
 
-        # Total inner width (content between outer ║ characters)
+        # Ensure table is wide enough for footer text (with 1-space padding each side)
+        footer_label = f"{nrows:,} rows x {ncols} columns"
+        min_inner = len(footer_label) + 2  # 1 space on each side
         total_inner = sum(w + 2 for w in widths) + ncols - 1
+        if total_inner < min_inner:
+            widths[-1] += min_inner - total_inner
+            total_inner = min_inner
 
         # Build lines — double outer edges, single inner dividers
         def hline(left, mid, right, fill="═"):
@@ -365,16 +374,22 @@ class Table:
 
         def ellipsis_row():
             parts = []
-            for w, a in zip(widths, aligns):
-                parts.append(f" {'···':{a}{w}} ")
+            for w in widths:
+                parts.append(f" {'···':^{w}} ")
             return "║" + "│".join(parts) + "║"
 
         lines = []
         lines.append(hline("╔", "╤", "╗"))
 
-        # Header: column names + dtype labels
-        lines.append(data_row(col_names))
-        lines.append(data_row(dtype_labels))
+        # Header: column names + dtype labels (always right-aligned for consistency)
+        def header_row(vals):
+            parts = []
+            for v, w in zip(vals, widths):
+                parts.append(f" {v:>{w}} ")
+            return "║" + "│".join(parts) + "║"
+
+        lines.append(header_row(col_names))
+        lines.append(header_row(dtype_labels))
 
         lines.append(hline("╠", "╪", "╣"))
 
@@ -389,10 +404,9 @@ class Table:
             for row in cells:
                 lines.append(data_row(row))
 
-        # Footer — no column crossings
-        lines.append("╠" + "═" * total_inner + "╣")
-        footer_text = f" {nrows:,} rows x {ncols} columns"
-        lines.append("║" + footer_text.ljust(total_inner) + "║")
+        # Footer — ╧ where columns end, centered text
+        lines.append(hline("╠", "╧", "╣"))
+        lines.append("║" + footer_label.center(total_inner) + "║")
         lines.append("╚" + "═" * total_inner + "╝")
 
         return "\n".join(lines)
@@ -451,7 +465,7 @@ class Query:
         lib = self._lib
         g = lib.graph_new(self._ptr)
         try:
-            result_node = self._execute_ops(g)
+            result_node, _pinned = self._execute_ops(g)
             root = lib.optimize(g, result_node)
             result_ptr = lib.execute(g, root)
             if not result_ptr or result_ptr < 32:
@@ -461,10 +475,15 @@ class Query:
             lib.graph_free(g)
 
     def _execute_ops(self, g):
-        """Walk _ops list, emit graph nodes, return final node."""
+        """Walk _ops list, emit graph nodes, return (final_node, pinned_arrays).
+
+        pinned_arrays keeps ctypes arrays alive — the C graph stores raw
+        pointers into them, so they must not be GC'd before execute().
+        """
         lib = self._lib
         current = None  # pipeline state
         filter_pred = None  # pending DataFrame-level filter predicate
+        pinned = []  # prevent GC of ctypes arrays passed to C
 
         for op in self._ops:
             if op[0] == "filter":
@@ -508,6 +527,7 @@ class Query:
                 keys_arr = (ctypes.c_void_p * n_keys)(*key_nodes)
                 ops_arr = (ctypes.c_uint16 * n_aggs)(*agg_ops)
                 ins_arr = (ctypes.c_void_p * n_aggs)(*agg_inputs)
+                pinned.extend([keys_arr, ops_arr, ins_arr])
                 current = lib._lib.td_group(g, keys_arr, n_keys, ops_arr, ins_arr, n_aggs)
 
             elif op[0] == "sort":
@@ -531,6 +551,7 @@ class Query:
 
                 keys_arr = (ctypes.c_void_p * n_cols)(*key_nodes)
                 descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])
+                pinned.extend([keys_arr, descs_arr])
                 current = lib._lib.td_sort_op(g, df_node, keys_arr, descs_arr, n_cols)
 
             elif op[0] == "head":
@@ -549,7 +570,7 @@ class Query:
             # No ops — just return the bound df
             current = lib.const_df(g, self._ptr)
 
-        return current
+        return current, pinned
 
 
 def _emit_expr(lib, g, expr):

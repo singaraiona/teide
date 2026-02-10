@@ -5,6 +5,8 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(TEIDE_PORTABLE "Build portable binary (no -march=native)" OFF)
+
 # Collect all source files under src/
 file(GLOB_RECURSE TEIDE_SOURCES "src/**/*.c")
 
@@ -25,7 +27,11 @@ if(MSVC)
 else()
     set(TEIDE_WARNINGS -Wall -Wextra -Wpedantic -Werror)
     set(TEIDE_DEBUG_FLAGS -O0 -g -fsanitize=address,undefined)
-    set(TEIDE_RELEASE_FLAGS -O3 -march=native -DNDEBUG)
+    if(TEIDE_PORTABLE)
+        set(TEIDE_RELEASE_FLAGS -O3 -mtune=generic -DNDEBUG)
+    else()
+        set(TEIDE_RELEASE_FLAGS -O3 -march=native -DNDEBUG)
+    endif()
 endif()
 
 # Apply flags to both library targets
@@ -71,3 +77,6 @@ if(TEST_SOURCES)
     endif()
     add_test(NAME test_teide COMMAND test_teide)
 endif()
+
+# Install target for scikit-build wheel packaging
+install(TARGETS teide LIBRARY DESTINATION teide)

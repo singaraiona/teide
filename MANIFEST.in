@@ -1,0 +1,10 @@
+include CMakeLists.txt
+include LICENSE
+include README.md
+recursive-include src *.c *.h
+recursive-include include *.h
+recursive-include bindings/python/teide *.py
+prune build
+prune build_release
+prune build_debug_noasan
+prune build_tsan

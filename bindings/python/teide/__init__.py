@@ -1,14 +1,16 @@
 """
-Teide — Low-level ctypes wrapper for libteide.
+Teide — Fast columnar dataframe library for Python.
 
 Usage:
-    from teide import TeideLib
-    lib = TeideLib()  # loads libteide.so
-    lib.sym_init()
-    # ... use the C API ...
-    lib.sym_destroy()
-    lib.arena_destroy_all()
+    from teide import Context, col, lit
+
+    with Context() as ctx:
+        df = ctx.read_csv("data.csv")
+        result = df.group_by("id1").agg(col("v1").sum()).collect()
+        print(result)
 """
+
+__version__ = "0.1.0"
 
 import ctypes
 import os
@@ -21,24 +23,42 @@ c_op_p = ctypes.c_void_p    # td_op_t*
 
 
 def _find_lib():
-    """Find libteide.so, checking TEIDE_LIB env var first."""
+    """Find libteide shared library.
+
+    Search order:
+    1. Same directory as this __init__.py (wheel-bundled layout)
+    2. TEIDE_LIB environment variable
+    3. Common build directories relative to source tree
+    """
+    _pkg_dir = os.path.dirname(__file__)
+    _lib_names = ["libteide.so", "libteide.dylib"]
+
+    # 1. Wheel-bundled: libteide.so sits next to __init__.py
+    for name in _lib_names:
+        path = os.path.join(_pkg_dir, name)
+        if os.path.exists(path):
+            return os.path.abspath(path)
+
+    # 2. Explicit env var
     env_path = os.environ.get("TEIDE_LIB")
     if env_path and os.path.exists(env_path):
         return env_path
 
-    # Search common locations
+    # 3. Source-tree build directories
     search_dirs = [
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "build_release"),
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "build"),
+        os.path.join(_pkg_dir, "..", "..", "..", "build_release"),
+        os.path.join(_pkg_dir, "..", "..", "..", "build"),
         ".",
     ]
     for d in search_dirs:
-        for name in ["libteide.so", "libteide.dylib"]:
+        for name in _lib_names:
             path = os.path.join(d, name)
             if os.path.exists(path):
                 return os.path.abspath(path)
 
-    raise OSError("Cannot find libteide.so. Set TEIDE_LIB environment variable.")
+    raise OSError(
+        "Cannot find libteide.so. Install via 'pip install teide' or set TEIDE_LIB."
+    )
 
 
 class TeideLib:
@@ -422,3 +442,6 @@ OP_COUNT = 54
 OP_AVG = 55
 OP_FIRST = 56
 OP_LAST = 57
+
+# Re-export high-level API so users can do: from teide import Context, col, lit
+from teide.api import Context, col, lit, Expr, Table, Series, Query  # noqa: E402,F401

@@ -60,6 +60,9 @@ class TeideLib:
         lib.td_arena_destroy_all.argtypes = []
         lib.td_arena_destroy_all.restype = None
 
+        lib.td_pool_destroy.argtypes = []
+        lib.td_pool_destroy.restype = None
+
         lib.td_alloc.argtypes = [ctypes.c_size_t]
         lib.td_alloc.restype = c_td_p
 
@@ -249,6 +252,9 @@ class TeideLib:
 
     def arena_destroy_all(self):
         self._lib.td_arena_destroy_all()
+
+    def pool_destroy(self):
+        self._lib.td_pool_destroy()
 
     def retain(self, ptr):
         self._lib.td_retain(ptr)

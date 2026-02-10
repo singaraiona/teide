@@ -23,6 +23,26 @@ from teide import OP_SUM, OP_AVG, OP_MIN, OP_MAX, OP_COUNT, OP_FIRST, OP_LAST
 # Opcode constants not in __init__
 OP_PROD = 51
 
+_DTYPE_NAMES = {
+    TD_BOOL: "bool", TD_I32: "i32", TD_I64: "i64",
+    TD_F64: "f64", TD_STR: "str", TD_ENUM: "sym",
+}
+
+
+def _format_val(val, dtype):
+    """Format a single value for display."""
+    if val is None:
+        return "null"
+    if dtype == TD_F64:
+        return f"{val:.4f}"
+    if dtype == TD_BOOL:
+        return "true" if val else "false"
+    return str(val)
+
+
+def _is_numeric(dtype):
+    return dtype in (TD_I64, TD_I32, TD_F64)
+
 
 class Expr:
     """Column expression tree node.
@@ -126,6 +146,26 @@ class Series:
             esz = {TD_F64: 8, TD_I64: 8, TD_I32: 4, TD_BOOL: 1, TD_ENUM: 4}.get(self.dtype, 1)
             return parent + 32 + offset * esz
         return self._ptr + 32
+
+    def _get_val(self, i):
+        """Get a single element by index. Avoids full materialization."""
+        data_ptr = self._data_ptr()
+        if self.dtype == TD_F64:
+            return (ctypes.c_double * 1).from_address(data_ptr + i * 8)[0]
+        elif self.dtype == TD_I64:
+            return (ctypes.c_int64 * 1).from_address(data_ptr + i * 8)[0]
+        elif self.dtype == TD_I32:
+            return (ctypes.c_int32 * 1).from_address(data_ptr + i * 4)[0]
+        elif self.dtype == TD_BOOL:
+            return bool((ctypes.c_uint8 * 1).from_address(data_ptr + i)[0])
+        elif self.dtype == TD_ENUM:
+            sym_id = (ctypes.c_uint32 * 1).from_address(data_ptr + i * 4)[0]
+            sym_ptr = self._lib.sym_str(sym_id)
+            if sym_ptr:
+                s = self._lib.str_ptr(sym_ptr)
+                return s.decode('utf-8') if s else ""
+            return ""
+        return None
 
     def to_list(self):
         n = len(self)
@@ -272,6 +312,90 @@ class Table:
         rows, cols = self.shape
         col_names = self.columns
         return f"Table({rows} rows x {cols} cols: {col_names})"
+
+    def __str__(self):
+        return self._pretty(top_n=5, bottom_n=5)
+
+    def _pretty(self, top_n=5, bottom_n=5):
+        """Render table with box-drawing frames, top/bottom rows, and types."""
+        nrows, ncols = self.shape
+        col_names = self.columns
+
+        # Gather Series objects and dtypes
+        series = [self[name] for name in col_names]
+        dtypes = [s.dtype for s in series]
+        dtype_labels = [_DTYPE_NAMES.get(d, "?") for d in dtypes]
+
+        # Determine which row indices to display
+        truncated = nrows > top_n + bottom_n
+        if truncated:
+            row_indices = list(range(top_n)) + list(range(nrows - bottom_n, nrows))
+        else:
+            row_indices = list(range(nrows))
+
+        # Format cell values
+        cells = []  # list of rows, each row is list of formatted strings
+        for r in row_indices:
+            cells.append([_format_val(s._get_val(r), d) for s, d in zip(series, dtypes)])
+
+        # Compute column widths (header, dtype label, all visible cells)
+        widths = []
+        for c in range(ncols):
+            w = max(len(col_names[c]), len(dtype_labels[c]), 3)
+            for row in cells:
+                w = max(w, len(row[c]))
+            widths.append(w)
+
+        # Alignment: right for numeric, left for strings
+        aligns = [">" if _is_numeric(d) else "<" for d in dtypes]
+
+        # Total inner width (content between outer ║ characters)
+        total_inner = sum(w + 2 for w in widths) + ncols - 1
+
+        # Build lines — double outer edges, single inner dividers
+        def hline(left, mid, right, fill="═"):
+            segs = [fill * (w + 2) for w in widths]
+            return left + mid.join(segs) + right
+
+        def data_row(vals, edge="║"):
+            parts = []
+            for v, w, a in zip(vals, widths, aligns):
+                parts.append(f" {v:{a}{w}} ")
+            return edge + "│".join(parts) + edge
+
+        def ellipsis_row():
+            parts = []
+            for w, a in zip(widths, aligns):
+                parts.append(f" {'···':{a}{w}} ")
+            return "║" + "│".join(parts) + "║"
+
+        lines = []
+        lines.append(hline("╔", "╤", "╗"))
+
+        # Header: column names + dtype labels
+        lines.append(data_row(col_names))
+        lines.append(data_row(dtype_labels))
+
+        lines.append(hline("╠", "╪", "╣"))
+
+        # Data rows
+        if truncated:
+            for row in cells[:top_n]:
+                lines.append(data_row(row))
+            lines.append(ellipsis_row())
+            for row in cells[top_n:]:
+                lines.append(data_row(row))
+        else:
+            for row in cells:
+                lines.append(data_row(row))
+
+        # Footer — no column crossings
+        lines.append("╠" + "═" * total_inner + "╣")
+        footer_text = f" {nrows:,} rows x {ncols} columns"
+        lines.append("║" + footer_text.ljust(total_inner) + "║")
+        lines.append("╚" + "═" * total_inner + "╝")
+
+        return "\n".join(lines)
 
 
 class GroupBy:
@@ -526,8 +650,9 @@ class Context:
         self.close()
 
     def close(self):
-        self._lib.arena_destroy_all()
-        self._lib.sym_destroy()
+        self._lib.pool_destroy()   # stop worker threads first
+        self._lib.sym_destroy()    # release interned strings (still in arena)
+        self._lib.arena_destroy_all()  # unmap arena memory last
 
     def read_csv(self, path):
         """Read a CSV file into a Table."""

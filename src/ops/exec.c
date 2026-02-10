@@ -634,47 +634,6 @@ static uint64_t hash_row_keys(td_t** key_vecs, uint8_t n_keys, int64_t row) {
     return h;
 }
 
-/* --- Pre-computed key metadata for the group-by hot path --- */
-
-/* Hash with pre-computed key_data/key_types arrays (eliminates td_data() calls) */
-static inline uint64_t hash_row_fast(void** key_data, int8_t* key_types,
-                                     uint8_t n_keys, int64_t row) {
-    uint64_t h = 0;
-    for (uint8_t k = 0; k < n_keys; k++) {
-        uint64_t kh;
-        int8_t t = key_types[k];
-        if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-            kh = td_hash_i64(((int64_t*)key_data[k])[row]);
-        else if (t == TD_F64)
-            kh = td_hash_f64(((double*)key_data[k])[row]);
-        else if (t == TD_I32)
-            kh = td_hash_i64((int64_t)((int32_t*)key_data[k])[row]);
-        else if (t == TD_ENUM)
-            kh = td_hash_i64((int64_t)((uint32_t*)key_data[k])[row]);
-        else
-            kh = 0;
-        h = (k == 0) ? kh : td_hash_combine(h, kh);
-    }
-    return h;
-}
-
-static inline bool keys_equal_fast(void** key_data, int8_t* key_types,
-                                   uint8_t n_keys, int64_t a, int64_t b) {
-    for (uint8_t k = 0; k < n_keys; k++) {
-        int8_t t = key_types[k];
-        if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP) {
-            if (((int64_t*)key_data[k])[a] != ((int64_t*)key_data[k])[b]) return false;
-        } else if (t == TD_F64) {
-            if (((double*)key_data[k])[a] != ((double*)key_data[k])[b]) return false;
-        } else if (t == TD_I32) {
-            if (((int32_t*)key_data[k])[a] != ((int32_t*)key_data[k])[b]) return false;
-        } else if (t == TD_ENUM) {
-            if (((uint32_t*)key_data[k])[a] != ((uint32_t*)key_data[k])[b]) return false;
-        }
-    }
-    return true;
-}
-
 /* Extract salt from hash (upper 16 bits) for fast mismatch rejection */
 #define HT_SALT(h) ((uint8_t)((h) >> 56))
 

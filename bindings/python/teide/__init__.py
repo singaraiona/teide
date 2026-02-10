@@ -239,6 +239,16 @@ class TeideLib:
         lib.td_csv_read_opts.argtypes = [ctypes.c_char_p, ctypes.c_char, ctypes.c_bool]
         lib.td_csv_read_opts.restype = c_td_p
 
+        # ===== Storage (splay / partitioned) =====
+        lib.td_splay_save.argtypes = [c_td_p, ctypes.c_char_p]
+        lib.td_splay_save.restype = ctypes.c_int32  # td_err_t
+
+        lib.td_splay_load.argtypes = [ctypes.c_char_p]
+        lib.td_splay_load.restype = c_td_p
+
+        lib.td_part_load.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.td_part_load.restype = c_td_p
+
     # ===== Convenience methods =====
 
     def sym_init(self):
@@ -378,6 +388,16 @@ class TeideLib:
 
     def df_add_col(self, df, name_id, col):
         return self._lib.td_table_add_col(df, name_id, col)
+
+    def splay_save(self, df, path):
+        return self._lib.td_splay_save(df, path.encode('utf-8'))
+
+    def splay_load(self, path):
+        return self._lib.td_splay_load(path.encode('utf-8'))
+
+    def part_load(self, db_root, table_name):
+        return self._lib.td_part_load(db_root.encode('utf-8'),
+                                       table_name.encode('utf-8'))
 
 
 # Type constants (mirror C defines)

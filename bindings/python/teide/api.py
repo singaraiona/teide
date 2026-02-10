@@ -312,6 +312,35 @@ class Table:
     def select(self, *exprs):
         return Query(self._lib, self._ptr).select(*exprs)
 
+    def join(self, right, on, how="inner"):
+        """Join with another table on shared key column(s).
+
+        Args:
+            right: Table to join with.
+            on: Column name (str) or list of column names to join on.
+            how: Join type — "inner" (default) or "left".
+        Returns:
+            Materialized Table with the join result.
+        """
+        if isinstance(on, str):
+            on = [on]
+        join_type = {"inner": 0, "left": 1}.get(how, 0)
+        lib = self._lib
+        g = lib.graph_new(self._ptr)
+        try:
+            left_df = lib.const_df(g, self._ptr)
+            right_df = lib.const_df(g, right._ptr)
+            left_keys = [lib.scan(g, k) for k in on]
+            right_keys = [lib.const_vec(g, right[k]._ptr) for k in on]
+            result_node = lib.join(g, left_df, left_keys, right_df, right_keys, join_type)
+            root = lib.optimize(g, result_node)
+            result_ptr = lib.execute(g, root)
+            if not result_ptr or result_ptr < 32:
+                raise RuntimeError(f"Join failed (error code {result_ptr})")
+            return Table(lib, result_ptr)
+        finally:
+            lib.graph_free(g)
+
     def __repr__(self):
         rows, cols = self.shape
         col_names = self.columns
@@ -681,6 +710,26 @@ class Context:
         if not df_ptr or df_ptr < 32:
             raise RuntimeError(f"Failed to read CSV: {path}")
         return Table(self._lib, df_ptr)
+
+    def splay_save(self, table, path):
+        """Save a Table as a splayed directory (one file per column)."""
+        err = self._lib.splay_save(table._ptr, path)
+        if err != 0:
+            raise RuntimeError(f"splay_save failed (error code {err})")
+
+    def splay_load(self, path):
+        """Load a splayed table from a directory."""
+        ptr = self._lib.splay_load(path)
+        if not ptr or ptr < 32:
+            raise RuntimeError(f"Failed to load splayed table: {path}")
+        return Table(self._lib, ptr)
+
+    def part_load(self, db_root, table_name):
+        """Load a date-partitioned table (db_root/YYYY.MM.DD/table_name)."""
+        ptr = self._lib.part_load(db_root, table_name)
+        if not ptr or ptr < 32:
+            raise RuntimeError(f"Failed to load partitioned table: {db_root}/{table_name}")
+        return Table(self._lib, ptr)
 
     def mem_stats(self):
         """Return memory statistics (placeholder)."""

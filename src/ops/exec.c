@@ -676,412 +676,585 @@ static inline bool keys_equal_fast(void** key_data, int8_t* key_types,
 }
 
 /* Extract salt from hash (upper 16 bits) for fast mismatch rejection */
-#define HT_SALT(h) ((uint16_t)((h) >> 48))
+#define HT_SALT(h) ((uint8_t)((h) >> 56))
+
+/* Flags controlling which accumulator arrays are allocated */
+#define GHT_NEED_SUM 0x01
+#define GHT_NEED_MIN 0x02
+#define GHT_NEED_MAX 0x04
+
+/* ── Row-layout HT ──────────────────────────────────────────────────────
+ * Keys + accumulators stored inline in both radix entries and group rows.
+ * After phase1 copies data from original columns, phase2 and phase3 never
+ * touch column data again — all access is sequential/local.
+ * ────────────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    int64_t  first_row;
-    int64_t  count;
-} group_entry_t;
+    uint16_t entry_stride;    /* bytes per radix entry: 8 + n_keys*8 + n_agg_vals*8 */
+    uint16_t row_stride;      /* bytes per group row: 8 + n_keys*8 + accum_bytes */
+    uint8_t  n_keys;
+    uint8_t  n_aggs;
+    uint8_t  n_agg_vals;      /* non-NULL agg columns (excludes COUNT) */
+    uint8_t  need_flags;
+    uint8_t  agg_is_f64;      /* bitmask: bit a set => agg[a] source is f64 */
+    int8_t   agg_val_slot[8]; /* agg_idx -> entry/accum slot (-1 = no value) */
+    /* Unified accumulator offsets: each block is n_agg_vals * 8 bytes.
+     * Each 8B slot is double or int64_t based on agg_is_f64 bitmask. */
+    uint16_t off_sum;         /* 0 => not allocated */
+    uint16_t off_min;
+    uint16_t off_max;
+} ght_layout_t;
 
-/* Per-worker local hash table for parallel group-by */
+static ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
+                                        td_t** agg_vecs, uint8_t need_flags) {
+    ght_layout_t ly;
+    memset(&ly, 0, sizeof(ly));
+    ly.n_keys = n_keys;
+    ly.n_aggs = n_aggs;
+    ly.need_flags = need_flags;
+
+    uint8_t nv = 0;
+    for (uint8_t a = 0; a < n_aggs && a < 8; a++) {
+        if (agg_vecs[a]) {
+            ly.agg_val_slot[a] = (int8_t)nv;
+            if (agg_vecs[a]->type == TD_F64)
+                ly.agg_is_f64 |= (1u << a);
+            nv++;
+        } else {
+            ly.agg_val_slot[a] = -1;
+        }
+    }
+    ly.n_agg_vals = nv;
+    ly.entry_stride = (uint16_t)(8 + (uint16_t)n_keys * 8 + (uint16_t)nv * 8);
+
+    uint16_t off = (uint16_t)(8 + (uint16_t)n_keys * 8);
+    uint16_t block = (uint16_t)nv * 8;
+    if (need_flags & GHT_NEED_SUM) { ly.off_sum = off; off += block; }
+    if (need_flags & GHT_NEED_MIN) { ly.off_min = off; off += block; }
+    if (need_flags & GHT_NEED_MAX) { ly.off_max = off; off += block; }
+    ly.row_stride = off;
+    return ly;
+}
+
+/* Packed HT slots: [salt:8 | gid:24] in 4 bytes.
+ * Max groups per HT = 16M (24 bits) — ample for partitioned probes.
+ * 4B slots halve cache footprint vs 8B, fitting HT in L2. */
+#define HT_EMPTY    UINT32_MAX
+#define HT_PACK(salt, gid)  (((uint32_t)(uint8_t)(salt) << 24) | ((gid) & 0xFFFFFF))
+#define HT_GID(s)   ((s) & 0xFFFFFF)
+#define HT_SALT_V(s) ((uint8_t)((s) >> 24))
+
 typedef struct {
-    int64_t*       ht_rows;    /* hash table: representative row indices */
-    int32_t*       ht_gids;    /* hash table: group IDs */
-    uint16_t*      ht_salts;   /* hash table: salt (upper 16 bits of hash) */
-    uint32_t       ht_cap;
-    group_entry_t* groups;
-    uint32_t       grp_count;
-    uint32_t       grp_cap;
-    uint8_t        n_aggs;     /* cached for indexing flat arrays */
-    /* Flat accumulator arrays indexed by [gid * n_aggs + agg_idx] */
-    double*        all_agg_f64;
-    int64_t*       all_agg_i64;
-    double*        all_agg_min_f64;
-    double*        all_agg_max_f64;
-    int64_t*       all_agg_min_i64;
-    int64_t*       all_agg_max_i64;
-    /* Arena headers for scratch_free */
-    td_t* _h_ht_rows;
-    td_t* _h_ht_gids;
-    td_t* _h_ht_salts;
-    td_t* _h_groups;
-    td_t* _h_agg_f64;
-    td_t* _h_agg_i64;
-    td_t* _h_min_f64;
-    td_t* _h_max_f64;
-    td_t* _h_min_i64;
-    td_t* _h_max_i64;
+    uint32_t*    slots;       /* packed [salt:8|gid:24], HT_EMPTY=empty */
+    uint32_t     ht_cap;
+    char*        rows;        /* flat row store: rows + gid * layout.row_stride */
+    uint32_t     grp_count;
+    uint32_t     grp_cap;
+    ght_layout_t layout;
+    td_t*        _h_slots;
+    td_t*        _h_rows;
 } group_ht_t;
 
-static bool group_ht_init(group_ht_t* ht, uint32_t cap, uint8_t n_aggs) {
+static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
+                                 const ght_layout_t* ly, uint32_t init_grp_cap) {
     ht->ht_cap = cap;
-    ht->ht_rows  = (int64_t*)scratch_alloc(&ht->_h_ht_rows, cap * sizeof(int64_t));
-    ht->ht_gids  = (int32_t*)scratch_alloc(&ht->_h_ht_gids, cap * sizeof(int32_t));
-    ht->ht_salts = (uint16_t*)scratch_alloc(&ht->_h_ht_salts, cap * sizeof(uint16_t));
-    if (!ht->ht_rows || !ht->ht_gids || !ht->ht_salts) return false;
-    memset(ht->ht_rows, -1, cap * sizeof(int64_t));
-    ht->grp_cap = 256;
+    ht->layout = *ly;
+    ht->slots = (uint32_t*)scratch_alloc(&ht->_h_slots, (size_t)cap * sizeof(uint32_t));
+    if (!ht->slots) return false;
+    memset(ht->slots, 0xFF, (size_t)cap * sizeof(uint32_t)); /* HT_EMPTY = all-1s */
+    ht->grp_cap = init_grp_cap;
     ht->grp_count = 0;
-    ht->n_aggs = n_aggs;
-    ht->groups = (group_entry_t*)scratch_calloc(&ht->_h_groups, ht->grp_cap * sizeof(group_entry_t));
-
-    size_t total = (size_t)ht->grp_cap * n_aggs;
-    ht->all_agg_f64     = (double*)scratch_calloc(&ht->_h_agg_f64, total * sizeof(double));
-    ht->all_agg_i64     = (int64_t*)scratch_calloc(&ht->_h_agg_i64, total * sizeof(int64_t));
-    ht->all_agg_min_f64 = (double*)scratch_alloc(&ht->_h_min_f64, total * sizeof(double));
-    ht->all_agg_max_f64 = (double*)scratch_alloc(&ht->_h_max_f64, total * sizeof(double));
-    ht->all_agg_min_i64 = (int64_t*)scratch_alloc(&ht->_h_min_i64, total * sizeof(int64_t));
-    ht->all_agg_max_i64 = (int64_t*)scratch_alloc(&ht->_h_max_i64, total * sizeof(int64_t));
-    if (!ht->groups || !ht->all_agg_f64 || !ht->all_agg_i64 ||
-        !ht->all_agg_min_f64 || !ht->all_agg_max_f64 ||
-        !ht->all_agg_min_i64 || !ht->all_agg_max_i64) return false;
-    for (size_t i = 0; i < total; i++) {
-        ht->all_agg_min_f64[i] = DBL_MAX;
-        ht->all_agg_max_f64[i] = -DBL_MAX;
-        ht->all_agg_min_i64[i] = INT64_MAX;
-        ht->all_agg_max_i64[i] = INT64_MIN;
-    }
+    ht->rows = (char*)scratch_alloc(&ht->_h_rows,
+        (size_t)init_grp_cap * ly->row_stride);
+    if (!ht->rows) return false;
     return true;
 }
 
+static bool group_ht_init(group_ht_t* ht, uint32_t cap, const ght_layout_t* ly) {
+    return group_ht_init_sized(ht, cap, ly, 256);
+}
+
 static void group_ht_free(group_ht_t* ht) {
-    scratch_free(ht->_h_groups);
-    scratch_free(ht->_h_agg_f64);
-    scratch_free(ht->_h_agg_i64);
-    scratch_free(ht->_h_min_f64);
-    scratch_free(ht->_h_max_f64);
-    scratch_free(ht->_h_min_i64);
-    scratch_free(ht->_h_max_i64);
-    scratch_free(ht->_h_ht_rows);
-    scratch_free(ht->_h_ht_gids);
-    scratch_free(ht->_h_ht_salts);
+    scratch_free(ht->_h_slots);
+    scratch_free(ht->_h_rows);
 }
 
 static void group_ht_grow(group_ht_t* ht) {
     uint32_t old_cap = ht->grp_cap;
     uint32_t new_cap = old_cap * 2;
-    uint8_t n_aggs = ht->n_aggs;
-    size_t old_total = (size_t)old_cap * n_aggs;
-    size_t new_total = (size_t)new_cap * n_aggs;
-
-    group_entry_t* new_groups = (group_entry_t*)scratch_realloc(
-        &ht->_h_groups, old_cap * sizeof(group_entry_t), new_cap * sizeof(group_entry_t));
-    if (!new_groups) return;
-    ht->groups = new_groups;
-    memset(&ht->groups[old_cap], 0, (new_cap - old_cap) * sizeof(group_entry_t));
-
-    double*   new_f64     = (double*)scratch_realloc(&ht->_h_agg_f64, old_total * sizeof(double), new_total * sizeof(double));
-    int64_t*  new_i64     = (int64_t*)scratch_realloc(&ht->_h_agg_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
-    double*   new_min_f64 = (double*)scratch_realloc(&ht->_h_min_f64, old_total * sizeof(double), new_total * sizeof(double));
-    double*   new_max_f64 = (double*)scratch_realloc(&ht->_h_max_f64, old_total * sizeof(double), new_total * sizeof(double));
-    int64_t*  new_min_i64 = (int64_t*)scratch_realloc(&ht->_h_min_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
-    int64_t*  new_max_i64 = (int64_t*)scratch_realloc(&ht->_h_max_i64, old_total * sizeof(int64_t), new_total * sizeof(int64_t));
-    if (!new_f64 || !new_i64 || !new_min_f64 || !new_max_f64 || !new_min_i64 || !new_max_i64)
-        return; /* leave HT at old capacity — probe will still work */
-    ht->all_agg_f64     = new_f64;
-    ht->all_agg_i64     = new_i64;
-    ht->all_agg_min_f64 = new_min_f64;
-    ht->all_agg_max_f64 = new_max_f64;
-    ht->all_agg_min_i64 = new_min_i64;
-    ht->all_agg_max_i64 = new_max_i64;
-
-    /* Zero-init sum/count arrays for new slots; set sentinel values for min/max */
-    memset(ht->all_agg_f64 + old_total, 0, (new_total - old_total) * sizeof(double));
-    memset(ht->all_agg_i64 + old_total, 0, (new_total - old_total) * sizeof(int64_t));
-    for (size_t i = old_total; i < new_total; i++) {
-        ht->all_agg_min_f64[i] = DBL_MAX;
-        ht->all_agg_max_f64[i] = -DBL_MAX;
-        ht->all_agg_min_i64[i] = INT64_MAX;
-        ht->all_agg_max_i64[i] = INT64_MIN;
-    }
-
+    uint16_t rs = ht->layout.row_stride;
+    char* new_rows = (char*)scratch_realloc(
+        &ht->_h_rows, (size_t)old_cap * rs, (size_t)new_cap * rs);
+    if (!new_rows) return;
+    ht->rows = new_rows;
     ht->grp_cap = new_cap;
 }
 
-/* Rehash: double the HT bucket capacity and re-insert all existing entries */
-static void group_ht_rehash(group_ht_t* ht, void** key_data, int8_t* key_types,
-                             uint8_t n_keys) {
-    uint32_t new_cap = ht->ht_cap * 2;
-    scratch_free(ht->_h_ht_rows);
-    scratch_free(ht->_h_ht_gids);
-    scratch_free(ht->_h_ht_salts);
-    ht->ht_rows  = (int64_t*)scratch_alloc(&ht->_h_ht_rows, new_cap * sizeof(int64_t));
-    ht->ht_gids  = (int32_t*)scratch_alloc(&ht->_h_ht_gids, new_cap * sizeof(int32_t));
-    ht->ht_salts = (uint16_t*)scratch_alloc(&ht->_h_ht_salts, new_cap * sizeof(uint16_t));
-    memset(ht->ht_rows, -1, new_cap * sizeof(int64_t));
-    ht->ht_cap = new_cap;
+/* Hash inline int64_t keys (for rehash — no original column access) */
+static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_types,
+                                         uint8_t n_keys) {
+    uint64_t h = 0;
+    for (uint8_t k = 0; k < n_keys; k++) {
+        uint64_t kh;
+        if (key_types[k] == TD_F64) {
+            double dv;
+            memcpy(&dv, &keys[k], 8);
+            kh = td_hash_f64(dv);
+        } else {
+            kh = td_hash_i64(keys[k]);
+        }
+        h = (k == 0) ? kh : td_hash_combine(h, kh);
+    }
+    return h;
+}
 
+static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
+    uint32_t new_cap = ht->ht_cap * 2;
+    scratch_free(ht->_h_slots);
+    ht->slots = (uint32_t*)scratch_alloc(&ht->_h_slots, (size_t)new_cap * sizeof(uint32_t));
+    memset(ht->slots, 0xFF, (size_t)new_cap * sizeof(uint32_t));
+    ht->ht_cap = new_cap;
     uint32_t mask = new_cap - 1;
+    uint16_t rs = ht->layout.row_stride;
+    uint8_t nk = ht->layout.n_keys;
     for (uint32_t gi = 0; gi < ht->grp_count; gi++) {
-        int64_t rep_row = ht->groups[gi].first_row;
-        uint64_t h = hash_row_fast(key_data, key_types, n_keys, rep_row);
+        const int64_t* row_keys = (const int64_t*)(ht->rows + (size_t)gi * rs + 8);
+        uint64_t h = hash_keys_inline(row_keys, key_types, nk);
         uint32_t slot = (uint32_t)(h & mask);
-        while (ht->ht_rows[slot] != -1)
+        while (ht->slots[slot] != HT_EMPTY)
             slot = (slot + 1) & mask;
-        ht->ht_rows[slot]  = rep_row;
-        ht->ht_gids[slot]  = (int32_t)gi;
-        ht->ht_salts[slot] = HT_SALT(h);
+        ht->slots[slot] = HT_PACK(HT_SALT(h), gi);
     }
 }
 
-/* Probe + accumulate a single row into the HT. Returns updated mask. */
-static inline uint32_t group_probe_row(group_ht_t* ht, void** key_data,
-                                        int8_t* key_types, uint8_t n_keys,
-                                        td_t** agg_vecs, uint8_t n_aggs,
-                                        int64_t row, uint64_t h, uint32_t slot,
-                                        uint32_t mask) {
-    uint16_t salt = HT_SALT(h);
-    int32_t gid = -1;
+/* Initialize accumulators for a new group from entry's inline agg values.
+ * Each unified block has n_agg_vals slots of 8 bytes, typed by agg_is_f64. */
+static inline void init_accum_from_entry(char* row, const char* entry,
+                                          const ght_layout_t* ly) {
+    uint16_t accum_start = (uint16_t)(8 + (uint16_t)ly->n_keys * 8);
+    if (ly->row_stride > accum_start)
+        memset(row + accum_start, 0, ly->row_stride - accum_start);
+
+    const char* agg_data = entry + 8 + ly->n_keys * 8;
+    uint8_t na = ly->n_aggs;
+    uint8_t nf = ly->need_flags;
+
+    for (uint8_t a = 0; a < na; a++) {
+        int8_t s = ly->agg_val_slot[a];
+        if (s < 0) continue;
+        /* Copy raw 8 bytes from entry into each enabled accumulator block */
+        if (nf & GHT_NEED_SUM) memcpy(row + ly->off_sum + s * 8, agg_data + s * 8, 8);
+        if (nf & GHT_NEED_MIN) memcpy(row + ly->off_min + s * 8, agg_data + s * 8, 8);
+        if (nf & GHT_NEED_MAX) memcpy(row + ly->off_max + s * 8, agg_data + s * 8, 8);
+    }
+}
+
+/* Accumulate into existing group from entry's inline agg values */
+static inline void accum_from_entry(char* row, const char* entry,
+                                     const ght_layout_t* ly) {
+    const char* agg_data = entry + 8 + ly->n_keys * 8;
+    uint8_t na = ly->n_aggs;
+    uint8_t nf = ly->need_flags;
+
+    for (uint8_t a = 0; a < na; a++) {
+        int8_t s = ly->agg_val_slot[a];
+        if (s < 0) continue;
+        char* base = row;
+        const char* val = agg_data + s * 8;
+
+        if (ly->agg_is_f64 & (1u << a)) {
+            double v;
+            memcpy(&v, val, 8);
+            if (nf & GHT_NEED_SUM) { double* p = (double*)(base + ly->off_sum) + s; *p += v; }
+            if (nf & GHT_NEED_MIN) { double* p = (double*)(base + ly->off_min) + s; if (v < *p) *p = v; }
+            if (nf & GHT_NEED_MAX) { double* p = (double*)(base + ly->off_max) + s; if (v > *p) *p = v; }
+        } else {
+            int64_t v;
+            memcpy(&v, val, 8);
+            if (nf & GHT_NEED_SUM) { int64_t* p = (int64_t*)(base + ly->off_sum) + s; *p += v; }
+            if (nf & GHT_NEED_MIN) { int64_t* p = (int64_t*)(base + ly->off_min) + s; if (v < *p) *p = v; }
+            if (nf & GHT_NEED_MAX) { int64_t* p = (int64_t*)(base + ly->off_max) + s; if (v > *p) *p = v; }
+        }
+    }
+}
+
+/* Probe + accumulate a single fat entry into the HT. Returns updated mask. */
+static inline uint32_t group_probe_entry(group_ht_t* ht,
+    const char* entry, const int8_t* key_types, uint32_t mask) {
+    const ght_layout_t* ly = &ht->layout;
+    uint64_t hash = *(const uint64_t*)entry;
+    const char* ekeys = entry + 8;
+    uint8_t salt = HT_SALT(hash);
+    uint32_t slot = (uint32_t)(hash & mask);
+    uint16_t key_bytes = ly->n_keys * 8;
+
     for (;;) {
-        if (ht->ht_rows[slot] == -1) {
+        uint32_t sv = ht->slots[slot];
+        if (sv == HT_EMPTY) {
+            /* New group */
             if (ht->grp_count >= ht->grp_cap)
                 group_ht_grow(ht);
-            gid = (int32_t)ht->grp_count++;
-            ht->groups[gid].first_row = row;
-            ht->groups[gid].count = 0;
-            ht->ht_rows[slot]  = row;
-            ht->ht_gids[slot]  = gid;
-            ht->ht_salts[slot] = salt;
-            break;
+            uint32_t gid = ht->grp_count++;
+            char* row = ht->rows + (size_t)gid * ly->row_stride;
+            *(int64_t*)row = 1;   /* count = 1 */
+            memcpy(row + 8, ekeys, key_bytes);
+            init_accum_from_entry(row, entry, ly);
+            ht->slots[slot] = HT_PACK(salt, gid);
+            if (ht->grp_count * 2 > ht->ht_cap) {
+                group_ht_rehash(ht, key_types);
+                mask = ht->ht_cap - 1;
+            }
+            return mask;
         }
-        if (ht->ht_salts[slot] == salt &&
-            keys_equal_fast(key_data, key_types, n_keys, ht->ht_rows[slot], row)) {
-            gid = ht->ht_gids[slot];
-            break;
+        if (HT_SALT_V(sv) == salt) {
+            uint32_t gid = HT_GID(sv);
+            char* row = ht->rows + (size_t)gid * ly->row_stride;
+            if (memcmp(row + 8, ekeys, key_bytes) == 0) {
+                (*(int64_t*)row)++;   /* count++ */
+                accum_from_entry(row, entry, ly);
+                return mask;
+            }
         }
         slot = (slot + 1) & mask;
     }
-
-    if (gid < 0) return mask;
-    ht->groups[gid].count++;
-
-    size_t base = (size_t)gid * n_aggs;
-    for (uint8_t a = 0; a < n_aggs; a++) {
-        td_t* agg_col = agg_vecs[a];
-        if (!agg_col) continue;
-        size_t idx = base + a;
-
-        if (agg_col->type == TD_F64) {
-            double v = ((double*)td_data(agg_col))[row];
-            ht->all_agg_f64[idx] += v;
-            if (v < ht->all_agg_min_f64[idx]) ht->all_agg_min_f64[idx] = v;
-            if (v > ht->all_agg_max_f64[idx]) ht->all_agg_max_f64[idx] = v;
-        } else {
-            int64_t v;
-            if (agg_col->type == TD_I64 || agg_col->type == TD_SYM)
-                v = ((int64_t*)td_data(agg_col))[row];
-            else if (agg_col->type == TD_I32)
-                v = ((int32_t*)td_data(agg_col))[row];
-            else
-                v = ((uint8_t*)td_data(agg_col))[row];
-            ht->all_agg_i64[idx] += v;
-            if (v < ht->all_agg_min_i64[idx]) ht->all_agg_min_i64[idx] = v;
-            if (v > ht->all_agg_max_i64[idx]) ht->all_agg_max_i64[idx] = v;
-        }
-    }
-
-    /* Rehash when load factor > 0.5 */
-    if (ht->grp_count * 2 > ht->ht_cap) {
-        group_ht_rehash(ht, key_data, key_types, n_keys);
-        mask = ht->ht_cap - 1;
-    }
-    return mask;
 }
 
-/* Process rows [start, end) into a local hash table.
- * Uses software prefetching in batches to hide HT lookup latency. */
+/* Process rows [start, end) from original columns into a local hash table.
+ * Converts each row to a fat entry on the stack, then probes. */
 #define GROUP_PREFETCH_BATCH 16
 
 static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
-                              uint8_t n_keys,
-                              td_t** agg_vecs, uint8_t n_aggs, uint16_t* agg_ops,
-                              int64_t start, int64_t end) {
-    (void)agg_ops;
+                              td_t** agg_vecs, int64_t start, int64_t end) {
+    const ght_layout_t* ly = &ht->layout;
+    uint8_t nk = ly->n_keys;
+    uint8_t na = ly->n_aggs;
     uint32_t mask = ht->ht_cap - 1;
+    /* Stack buffer for one entry (max: 8 + 8*8 + 8*8 = 136 bytes) */
+    char ebuf[8 + 8 * 8 + 8 * 8];
 
-    uint64_t batch_hashes[GROUP_PREFETCH_BATCH];
-    uint32_t batch_slots[GROUP_PREFETCH_BATCH];
+    for (int64_t row = start; row < end; row++) {
+        uint64_t h = 0;
+        int64_t* ek = (int64_t*)(ebuf + 8);
+        for (uint8_t k = 0; k < nk; k++) {
+            int8_t t = key_types[k];
+            int64_t kv;
+            if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
+                kv = ((int64_t*)key_data[k])[row];
+            else if (t == TD_F64)
+                memcpy(&kv, &((double*)key_data[k])[row], 8);
+            else if (t == TD_I32)
+                kv = (int64_t)((int32_t*)key_data[k])[row];
+            else if (t == TD_ENUM)
+                kv = (int64_t)((uint32_t*)key_data[k])[row];
+            else
+                kv = 0;
+            ek[k] = kv;
+            uint64_t kh = (t == TD_F64) ? td_hash_f64(((double*)key_data[k])[row])
+                                        : td_hash_i64(kv);
+            h = (k == 0) ? kh : td_hash_combine(h, kh);
+        }
+        *(uint64_t*)ebuf = h;
 
-    int64_t row = start;
-    for (; row + GROUP_PREFETCH_BATCH <= end; row += GROUP_PREFETCH_BATCH) {
-        /* Phase 1: hash + prefetch HT slots */
-        for (int i = 0; i < GROUP_PREFETCH_BATCH; i++) {
-            uint64_t h = hash_row_fast(key_data, key_types, n_keys, row + i);
-            uint32_t slot = (uint32_t)(h & mask);
-            batch_hashes[i] = h;
-            batch_slots[i] = slot;
-            __builtin_prefetch(&ht->ht_rows[slot], 0, 1);
-            __builtin_prefetch(&ht->ht_salts[slot], 0, 1);
+        int64_t* ev = (int64_t*)(ebuf + 8 + nk * 8);
+        uint8_t vi = 0;
+        for (uint8_t a = 0; a < na; a++) {
+            td_t* ac = agg_vecs[a];
+            if (!ac) continue;
+            if (ac->type == TD_F64)
+                memcpy(&ev[vi], &((double*)td_data(ac))[row], 8);
+            else if (ac->type == TD_I64 || ac->type == TD_SYM)
+                ev[vi] = ((int64_t*)td_data(ac))[row];
+            else if (ac->type == TD_I32)
+                ev[vi] = (int64_t)((int32_t*)td_data(ac))[row];
+            else if (ac->type == TD_ENUM)
+                ev[vi] = (int64_t)((uint32_t*)td_data(ac))[row];
+            else
+                ev[vi] = (int64_t)((uint8_t*)td_data(ac))[row];
+            vi++;
         }
-        /* Phase 2: probe + accumulate.
-         * If rehash changes mask mid-batch, re-hash remaining entries. */
-        for (int i = 0; i < GROUP_PREFETCH_BATCH; i++) {
-            uint32_t old_mask = mask;
-            mask = group_probe_row(ht, key_data, key_types, n_keys,
-                                   agg_vecs, n_aggs, row + i,
-                                   batch_hashes[i], batch_slots[i], mask);
-            if (mask != old_mask) {
-                /* Rehash occurred — recompute slots for remaining entries */
-                for (int j = i + 1; j < GROUP_PREFETCH_BATCH; j++) {
-                    batch_slots[j] = (uint32_t)(batch_hashes[j] & mask);
-                }
-            }
-        }
-    }
-    /* Handle remaining rows without prefetching */
-    for (; row < end; row++) {
-        uint64_t h = hash_row_fast(key_data, key_types, n_keys, row);
-        uint32_t slot = (uint32_t)(h & mask);
-        mask = group_probe_row(ht, key_data, key_types, n_keys,
-                               agg_vecs, n_aggs, row, h, slot, mask);
+
+        mask = group_probe_entry(ht, ebuf, key_types, mask);
     }
 }
 
 /* ============================================================================
  * Radix-partitioned parallel group-by
  *
- * Phase 1 (parallel): Each worker hashes rows in its range and writes
- *         (row_idx, hash) into thread-local per-partition buffers.
- * Phase 2 (parallel): Each partition is aggregated independently by one
- *         worker — no merge needed since partitions are disjoint.
- * Phase 3: Concatenate partition HT results into the final DataFrame.
+ * Phase 1 (parallel): Each worker reads keys+agg values from original columns,
+ *         packs into fat entries (hash, keys, agg_vals), scatters into
+ *         thread-local per-partition buffers.
+ * Phase 2 (parallel): Each partition is aggregated independently using
+ *         inline data — no original column access needed.
+ * Phase 3: Build result columns from inline group rows.
  * ============================================================================ */
 
-/* Number of radix partitions — must be power of 2 */
 #define RADIX_BITS  8
 #define RADIX_P     (1u << RADIX_BITS)   /* 256 partitions */
 #define RADIX_MASK  (RADIX_P - 1)
-
-/* Partition ID from hash: use bits [16..23] (above HT probe bits, below salt) */
 #define RADIX_PART(h) (((uint32_t)((h) >> 16)) & RADIX_MASK)
 
-/* (row_idx, hash) pair written during partitioning phase */
+/* Per-worker, per-partition buffer of fat entries */
 typedef struct {
-    int64_t  row;
-    uint64_t hash;
-} radix_entry_t;
-
-/* Per-worker, per-partition buffer */
-typedef struct {
-    radix_entry_t* entries;
-    uint32_t       count;
-    uint32_t       cap;
-    td_t*          _hdr;    /* arena header for scratch_free */
+    char*    data;           /* flat buffer: data[i * entry_stride] */
+    uint32_t count;
+    uint32_t cap;
+    td_t*    _hdr;
 } radix_buf_t;
 
-/* Phase 1 context: partition rows by hash into per-worker-per-partition buffers.
- * Each worker has a pre-allocated slab; per-partition buffers are slices of it. */
-typedef struct {
-    void**       key_data;
-    int8_t*      key_types;
-    uint8_t      n_keys;
-    uint32_t     n_workers;
-    radix_buf_t* bufs;    /* [n_workers * RADIX_P] */
-} radix_phase1_ctx_t;
-
-static inline void radix_buf_push(radix_buf_t* buf, int64_t row, uint64_t hash) {
+static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
+                                   uint64_t hash, const int64_t* keys, uint8_t n_keys,
+                                   const int64_t* agg_vals, uint8_t n_agg_vals) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
         uint32_t old_cap = buf->cap;
         uint32_t new_cap = old_cap * 2;
-        radix_entry_t* new_entries = (radix_entry_t*)scratch_realloc(
-            &buf->_hdr, (size_t)old_cap * sizeof(radix_entry_t),
-            (size_t)new_cap * sizeof(radix_entry_t));
-        if (!new_entries) return; /* OOM — drop this row */
-        buf->entries = new_entries;
+        char* new_data = (char*)scratch_realloc(
+            &buf->_hdr, (size_t)old_cap * entry_stride,
+            (size_t)new_cap * entry_stride);
+        if (!new_data) return;
+        buf->data = new_data;
         buf->cap = new_cap;
     }
-    buf->entries[buf->count].row  = row;
-    buf->entries[buf->count].hash = hash;
+    char* dst = buf->data + (size_t)buf->count * entry_stride;
+    *(uint64_t*)dst = hash;
+    memcpy(dst + 8, keys, (size_t)n_keys * 8);
+    if (n_agg_vals)
+        memcpy(dst + 8 + (size_t)n_keys * 8, agg_vals, (size_t)n_agg_vals * 8);
     buf->count++;
 }
 
-static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
-    radix_buf_t* my_bufs = &c->bufs[(size_t)worker_id * RADIX_P];
-
-    for (int64_t row = start; row < end; row++) {
-        uint64_t h = hash_row_fast(c->key_data, c->key_types, c->n_keys, row);
-        uint32_t part = RADIX_PART(h);
-        radix_buf_push(&my_bufs[part], row, h);
-    }
-}
-
-/* Process rows from indirect index array with pre-computed hashes into a HT */
-/* Process pre-partitioned rows (with pre-computed hashes) into a HT.
- * Uses the same prefetch batching as group_rows_range. */
-static void group_rows_indirect(group_ht_t* ht, void** key_data, int8_t* key_types,
-                                 uint8_t n_keys,
-                                 td_t** agg_vecs, uint8_t n_aggs,
-                                 radix_entry_t* entries, uint32_t n_entries) {
-    uint32_t mask = ht->ht_cap - 1;
-
-    uint32_t batch_slots[GROUP_PREFETCH_BATCH];
-    uint32_t i = 0;
-    for (; i + GROUP_PREFETCH_BATCH <= n_entries; i += GROUP_PREFETCH_BATCH) {
-        /* Phase 1: compute slots + prefetch */
-        for (int b = 0; b < GROUP_PREFETCH_BATCH; b++) {
-            uint32_t slot = (uint32_t)(entries[i + b].hash & mask);
-            batch_slots[b] = slot;
-            __builtin_prefetch(&ht->ht_rows[slot], 0, 1);
-            __builtin_prefetch(&ht->ht_salts[slot], 0, 1);
-        }
-        /* Phase 2: probe + accumulate */
-        for (int b = 0; b < GROUP_PREFETCH_BATCH; b++) {
-            mask = group_probe_row(ht, key_data, key_types, n_keys,
-                                   agg_vecs, n_aggs, entries[i + b].row,
-                                   entries[i + b].hash, batch_slots[b], mask);
-        }
-    }
-    /* Remainder */
-    for (; i < n_entries; i++) {
-        uint32_t slot = (uint32_t)(entries[i].hash & mask);
-        mask = group_probe_row(ht, key_data, key_types, n_keys,
-                               agg_vecs, n_aggs, entries[i].row,
-                               entries[i].hash, slot, mask);
-    }
-}
-
-/* Phase 2 context: aggregate each partition independently */
 typedef struct {
     void**       key_data;
     int8_t*      key_types;
     td_t**       agg_vecs;
-    uint8_t      n_keys;
-    uint8_t      n_aggs;
     uint32_t     n_workers;
-    radix_buf_t* bufs;         /* [n_workers * RADIX_P] */
-    group_ht_t*  part_hts;     /* [RADIX_P] — one HT per partition */
+    radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
+    ght_layout_t layout;
+} radix_phase1_ctx_t;
+
+static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    radix_phase1_ctx_t* c = (radix_phase1_ctx_t*)ctx;
+    const ght_layout_t* ly = &c->layout;
+    radix_buf_t* my_bufs = &c->bufs[(size_t)worker_id * RADIX_P];
+    uint8_t nk = ly->n_keys;
+    uint8_t na = ly->n_aggs;
+    uint8_t nv = ly->n_agg_vals;
+    uint16_t estride = ly->entry_stride;
+
+    int64_t keys[8];
+    int64_t agg_vals[8];
+
+    for (int64_t row = start; row < end; row++) {
+        uint64_t h = 0;
+        for (uint8_t k = 0; k < nk; k++) {
+            int8_t t = c->key_types[k];
+            int64_t kv;
+            if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
+                kv = ((int64_t*)c->key_data[k])[row];
+            else if (t == TD_F64)
+                memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+            else if (t == TD_I32)
+                kv = (int64_t)((int32_t*)c->key_data[k])[row];
+            else if (t == TD_ENUM)
+                kv = (int64_t)((uint32_t*)c->key_data[k])[row];
+            else
+                kv = 0;
+            keys[k] = kv;
+            uint64_t kh = (t == TD_F64) ? td_hash_f64(((double*)c->key_data[k])[row])
+                                        : td_hash_i64(kv);
+            h = (k == 0) ? kh : td_hash_combine(h, kh);
+        }
+
+        uint8_t vi = 0;
+        for (uint8_t a = 0; a < na; a++) {
+            td_t* ac = c->agg_vecs[a];
+            if (!ac) continue;
+            if (ac->type == TD_F64)
+                memcpy(&agg_vals[vi], &((double*)td_data(ac))[row], 8);
+            else if (ac->type == TD_I64 || ac->type == TD_SYM)
+                agg_vals[vi] = ((int64_t*)td_data(ac))[row];
+            else if (ac->type == TD_I32)
+                agg_vals[vi] = (int64_t)((int32_t*)td_data(ac))[row];
+            else if (ac->type == TD_ENUM)
+                agg_vals[vi] = (int64_t)((uint32_t*)td_data(ac))[row];
+            else
+                agg_vals[vi] = (int64_t)((uint8_t*)td_data(ac))[row];
+            vi++;
+        }
+
+        uint32_t part = RADIX_PART(h);
+        radix_buf_push(&my_bufs[part], estride, h, keys, nk, agg_vals, nv);
+    }
+}
+
+/* Process pre-partitioned fat entries into an HT with prefetch batching.
+ * Two-phase prefetch: (1) prefetch HT slots, (2) prefetch group rows. */
+static void group_rows_indirect(group_ht_t* ht, const int8_t* key_types,
+                                 const char* entries, uint32_t n_entries,
+                                 uint16_t entry_stride) {
+    uint32_t mask = ht->ht_cap - 1;
+    /* Stride-ahead prefetch: prefetch HT slot for entry i+D while processing i.
+     * D=8 covers ~200ns L2/L3 latency at ~25ns per probe iteration. */
+    enum { PF_DIST = 8 };
+    /* Prime the prefetch pipeline */
+    uint32_t pf_end = (n_entries < PF_DIST) ? n_entries : PF_DIST;
+    for (uint32_t j = 0; j < pf_end; j++) {
+        uint64_t h = *(const uint64_t*)(entries + (size_t)j * entry_stride);
+        __builtin_prefetch(&ht->slots[(uint32_t)(h & mask)], 0, 1);
+    }
+    for (uint32_t i = 0; i < n_entries; i++) {
+        /* Prefetch PF_DIST entries ahead */
+        if (i + PF_DIST < n_entries) {
+            uint64_t h = *(const uint64_t*)(entries + (size_t)(i + PF_DIST) * entry_stride);
+            __builtin_prefetch(&ht->slots[(uint32_t)(h & mask)], 0, 1);
+        }
+        const char* e = entries + (size_t)i * entry_stride;
+        mask = group_probe_entry(ht, e, key_types, mask);
+    }
+}
+
+/* Phase 3: build result columns from inline group rows */
+typedef struct {
+    int8_t  out_type;
+    bool    src_f64;
+    uint16_t agg_op;
+    void*   dst;
+} agg_out_t;
+
+typedef struct {
+    group_ht_t*   part_hts;
+    uint32_t*     part_offsets;
+    char**        key_dsts;
+    int8_t*       key_types;
+    uint8_t*      key_esizes;
+    uint8_t       n_keys;
+    agg_out_t*    agg_outs;
+    uint8_t       n_aggs;
+} radix_phase3_ctx_t;
+
+static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    radix_phase3_ctx_t* c = (radix_phase3_ctx_t*)ctx;
+    uint8_t nk = c->n_keys;
+    uint8_t na = c->n_aggs;
+
+    for (int64_t p = start; p < end; p++) {
+        group_ht_t* ph = &c->part_hts[p];
+        uint32_t gc = ph->grp_count;
+        if (gc == 0) continue;
+        uint32_t off = c->part_offsets[p];
+        const ght_layout_t* ly = &ph->layout;
+        uint16_t rs = ly->row_stride;
+
+        /* Single pass over group rows: read each row once, scatter keys + aggs.
+         * Reduces memory traffic from nk+na passes over group data to 1 pass. */
+        for (uint32_t gi = 0; gi < gc; gi++) {
+            const char* row = ph->rows + (size_t)gi * rs;
+            const int64_t* rkeys = (const int64_t*)(row + 8);
+            int64_t cnt = *(const int64_t*)row;
+            uint32_t di = off + gi;
+
+            /* Scatter keys to result columns */
+            for (uint8_t k = 0; k < nk; k++) {
+                int64_t kv = rkeys[k];
+                int8_t kt = c->key_types[k];
+                char* dst = c->key_dsts[k];
+                uint8_t esz = c->key_esizes[k];
+                size_t doff = (size_t)di * esz;
+                if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
+                    *(int64_t*)(dst + doff) = kv;
+                else if (kt == TD_F64)
+                    memcpy(dst + doff, &kv, 8);
+                else if (kt == TD_ENUM)
+                    *(uint32_t*)(dst + doff) = (uint32_t)kv;
+                else if (kt == TD_I32)
+                    *(int32_t*)(dst + doff) = (int32_t)kv;
+            }
+
+            /* Scatter agg results to result columns */
+            for (uint8_t a = 0; a < na; a++) {
+                agg_out_t* ao = &c->agg_outs[a];
+                uint16_t op = ao->agg_op;
+                bool sf = ao->src_f64;
+                int8_t s = ly->agg_val_slot[a];
+                if (ao->out_type == TD_F64) {
+                    double v;
+                    switch (op) {
+                        case OP_SUM:
+                            v = sf ? ((const double*)(row + ly->off_sum))[s]
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                            break;
+                        case OP_AVG:
+                            v = sf ? ((const double*)(row + ly->off_sum))[s] / cnt
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s] / cnt;
+                            break;
+                        case OP_MIN:
+                            v = sf ? ((const double*)(row + ly->off_min))[s]
+                                   : (double)((const int64_t*)(row + ly->off_min))[s];
+                            break;
+                        case OP_MAX:
+                            v = sf ? ((const double*)(row + ly->off_max))[s]
+                                   : (double)((const int64_t*)(row + ly->off_max))[s];
+                            break;
+                        default: v = 0.0; break;
+                    }
+                    ((double*)ao->dst)[di] = v;
+                } else {
+                    int64_t v;
+                    switch (op) {
+                        case OP_SUM:   v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                        case OP_COUNT: v = cnt; break;
+                        case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
+                        case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
+                        case OP_FIRST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                        default:       v = 0; break;
+                    }
+                    ((int64_t*)ao->dst)[di] = v;
+                }
+            }
+        }
+    }
+}
+
+/* Phase 2: aggregate each partition independently using inline data */
+typedef struct {
+    int8_t*      key_types;
+    uint8_t      n_keys;
+    uint32_t     n_workers;
+    radix_buf_t* bufs;
+    group_ht_t*  part_hts;
+    ght_layout_t layout;
 } radix_phase2_ctx_t;
 
 static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     radix_phase2_ctx_t* c = (radix_phase2_ctx_t*)ctx;
+    uint16_t estride = c->layout.entry_stride;
 
     for (int64_t p = start; p < end; p++) {
-        /* Count total entries in this partition across all workers */
         uint32_t total = 0;
-        for (uint32_t w = 0; w < c->n_workers; w++) {
+        for (uint32_t w = 0; w < c->n_workers; w++)
             total += c->bufs[(size_t)w * RADIX_P + p].count;
-        }
         if (total == 0) continue;
 
-        /* Size the per-partition HT */
         uint32_t part_ht_cap = 256;
         {
-            uint64_t target = (uint64_t)total;
+            uint64_t target = (uint64_t)total * 2;
             if (target < 256) target = 256;
             while (part_ht_cap < target) part_ht_cap *= 2;
         }
-        if (!group_ht_init(&c->part_hts[p], part_ht_cap, c->n_aggs))
-            continue; /* OOM — skip partition */
+        /* Pre-size group store to avoid grows. Use next_pow2(total) as upper
+         * bound on groups. Over-allocation is bounded: worst case total >> groups,
+         * but total * row_stride is already committed via HT capacity anyway. */
+        uint32_t init_grp = 256;
+        while (init_grp < total) init_grp *= 2;
+        if (!group_ht_init_sized(&c->part_hts[p], part_ht_cap, &c->layout, init_grp))
+            continue;
 
-        /* Process all workers' entries for this partition */
         for (uint32_t w = 0; w < c->n_workers; w++) {
             radix_buf_t* buf = &c->bufs[(size_t)w * RADIX_P + p];
             if (buf->count == 0) continue;
-            group_rows_indirect(&c->part_hts[p], c->key_data, c->key_types,
-                                c->n_keys, c->agg_vecs, c->n_aggs,
-                                buf->entries, buf->count);
+            group_rows_indirect(&c->part_hts[p], c->key_types,
+                                buf->data, buf->count, estride);
         }
     }
 }
@@ -1189,6 +1362,8 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                     case OP_AVG: v = is_f64 ? sum_f64[idx] / counts[gi] : (double)sum_i64[idx] / counts[gi]; break;
                     case OP_MIN: v = is_f64 ? min_f64[idx] : (double)min_i64[idx]; break;
                     case OP_MAX: v = is_f64 ? max_f64[idx] : (double)max_i64[idx]; break;
+                    case OP_FIRST: case OP_LAST:
+                        v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
                     default:     v = 0.0; break;
                 }
                 ((double*)td_data(new_col))[gi] = v;
@@ -1199,14 +1374,41 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                     case OP_COUNT: v = counts[gi]; break;
                     case OP_MIN:   v = min_i64[idx]; break;
                     case OP_MAX:   v = max_i64[idx]; break;
-                    case OP_FIRST: v = sum_i64[idx]; break;
+                    case OP_FIRST: case OP_LAST: v = sum_i64[idx]; break;
                     default:       v = 0; break;
                 }
                 ((int64_t*)td_data(new_col))[gi] = v;
             }
         }
+        /* Generate unique column name: base_name + agg suffix (e.g. "v1_sum") */
         td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
-        int64_t name_id = agg_ext ? agg_ext->sym : (int64_t)(n_keys + a);
+        int64_t name_id;
+        if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
+            td_t* name_atom = td_sym_str(agg_ext->sym);
+            const char* base = name_atom ? td_str_ptr(name_atom) : NULL;
+            size_t blen = base ? td_str_len(name_atom) : 0;
+            const char* sfx = "";
+            size_t slen = 0;
+            switch (agg_op) {
+                case OP_SUM:   sfx = "_sum";   slen = 4; break;
+                case OP_COUNT: sfx = "_count"; slen = 6; break;
+                case OP_AVG:   sfx = "_mean";  slen = 5; break;
+                case OP_MIN:   sfx = "_min";   slen = 4; break;
+                case OP_MAX:   sfx = "_max";   slen = 4; break;
+                case OP_FIRST: sfx = "_first"; slen = 6; break;
+                case OP_LAST:  sfx = "_last";  slen = 5; break;
+            }
+            char buf[256];
+            if (base && blen + slen < sizeof(buf)) {
+                memcpy(buf, base, blen);
+                memcpy(buf + blen, sfx, slen);
+                name_id = td_sym_intern(buf, blen + slen);
+            } else {
+                name_id = agg_ext->sym;
+            }
+        } else {
+            name_id = (int64_t)(n_keys + a);
+        }
         *result = td_table_add_col(*result, name_id, new_col);
         td_release(new_col);
     }
@@ -1301,6 +1503,10 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 if (op == OP_SUM || op == OP_AVG) {
                     acc->f64[idx] += fv;
                     acc->i64[idx] += iv;
+                } else if (op == OP_FIRST) {
+                    if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
+                } else if (op == OP_LAST) {
+                    acc->f64[idx] = fv; acc->i64[idx] = iv;
                 } else if (op == OP_MIN) {
                     if (fv < acc->min_f64[idx]) acc->min_f64[idx] = fv;
                     if (iv < acc->min_i64[idx]) acc->min_i64[idx] = iv;
@@ -1327,6 +1533,10 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             if (op == OP_SUM || op == OP_AVG) {
                 acc->f64[idx] += fv;
                 acc->i64[idx] += iv;
+            } else if (op == OP_FIRST) {
+                if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
+            } else if (op == OP_LAST) {
+                acc->f64[idx] = fv; acc->i64[idx] = iv;
             } else if (op == OP_MIN) {
                 if (fv < acc->min_f64[idx]) acc->min_f64[idx] = fv;
                 if (iv < acc->min_i64[idx]) acc->min_i64[idx] = iv;
@@ -1447,7 +1657,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             uint8_t need_flags = DA_NEED_COUNT; /* always need count */
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t op = ext->agg_ops[a];
-                if (op == OP_SUM || op == OP_AVG) need_flags |= DA_NEED_SUM;
+                if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
             }
@@ -1467,7 +1677,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             uint8_t need_flags = DA_NEED_COUNT;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t op = ext->agg_ops[a];
-                if (op == OP_SUM || op == OP_AVG) need_flags |= DA_NEED_SUM;
+                if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
             }
@@ -1572,17 +1782,48 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             else
                 da_accum_fn(&da_ctx, 0, 0, nrows);
 
+            /* Check if any agg is FIRST/LAST (needs per-slot merge) */
+            bool has_first_last = false;
+            for (uint8_t a = 0; a < n_aggs; a++) {
+                uint16_t op = ext->agg_ops[a];
+                if (op == OP_FIRST || op == OP_LAST) { has_first_last = true; break; }
+            }
+
             /* Merge per-worker accumulators into accums[0] */
             da_accum_t* merged = &accums[0];
             for (uint32_t w = 1; w < da_n_workers; w++) {
                 da_accum_t* wa = &accums[w];
-                for (uint32_t s = 0; s < n_slots; s++) {
-                    merged->count[s] += wa->count[s];
-                }
                 if (need_flags & DA_NEED_SUM) {
-                    for (size_t i = 0; i < total; i++) {
-                        merged->f64[i] += wa->f64[i];
-                        merged->i64[i] += wa->i64[i];
+                    if (has_first_last) {
+                        /* Per-slot merge: FIRST/LAST need different semantics */
+                        for (uint32_t s = 0; s < n_slots; s++) {
+                            size_t base = (size_t)s * n_aggs;
+                            for (uint8_t a = 0; a < n_aggs; a++) {
+                                size_t idx = base + a;
+                                uint16_t op = ext->agg_ops[a];
+                                if (op == OP_SUM || op == OP_AVG) {
+                                    merged->f64[idx] += wa->f64[idx];
+                                    merged->i64[idx] += wa->i64[idx];
+                                } else if (op == OP_FIRST) {
+                                    /* Keep first worker's value (merged already has it if count > 0) */
+                                    if (merged->count[s] == 0 && wa->count[s] > 0) {
+                                        merged->f64[idx] = wa->f64[idx];
+                                        merged->i64[idx] = wa->i64[idx];
+                                    }
+                                } else if (op == OP_LAST) {
+                                    /* Take last worker's value if it saw the group */
+                                    if (wa->count[s] > 0) {
+                                        merged->f64[idx] = wa->f64[idx];
+                                        merged->i64[idx] = wa->i64[idx];
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (size_t i = 0; i < total; i++) {
+                            merged->f64[i] += wa->f64[i];
+                            merged->i64[i] += wa->i64[i];
+                        }
                     }
                 }
                 if (need_flags & DA_NEED_MIN) {
@@ -1600,6 +1841,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                         if (wa->max_i64[i] > merged->max_i64[i])
                             merged->max_i64[i] = wa->max_i64[i];
                     }
+                }
+                /* Merge counts AFTER agg merge (FIRST/LAST check merged count) */
+                for (uint32_t s = 0; s < n_slots; s++) {
+                    merged->count[s] += wa->count[s];
                 }
             }
             for (uint32_t w = 1; w < da_n_workers; w++)
@@ -1694,6 +1939,20 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     }
 
 ht_path:;
+    /* Compute which accumulator arrays the HT needs based on agg ops.
+     * COUNT only reads group row's count field — no accumulator needed. */
+    uint8_t ght_need = 0;
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        uint16_t op = ext->agg_ops[a];
+        if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST)
+            ght_need |= GHT_NEED_SUM;
+        if (op == OP_MIN) ght_need |= GHT_NEED_MIN;
+        if (op == OP_MAX) ght_need |= GHT_NEED_MAX;
+    }
+
+    /* Compute row-layout: keys + agg values inline */
+    ght_layout_t ght_layout = ght_compute_layout(n_keys, n_aggs, agg_vecs, ght_need);
+
     /* Right-sized hash table: start small, rehash on load > 0.5 */
     uint32_t ht_cap = 256;
     {
@@ -1708,42 +1967,43 @@ ht_path:;
 
     group_ht_t single_ht;
     group_ht_t* final_ht = NULL;
+    td_t* result = NULL;
 
-    /* Radix partition state — declared here for cleanup */
     td_t* radix_bufs_hdr = NULL;
     radix_buf_t* radix_bufs = NULL;
     td_t* part_hts_hdr = NULL;
     group_ht_t*  part_hts   = NULL;
 
     if (pool && nrows >= TD_PARALLEL_THRESHOLD && n_total > 1) {
-        /* Allocate per-worker, per-partition buffers */
         size_t n_bufs = (size_t)n_total * RADIX_P;
         radix_bufs = (radix_buf_t*)scratch_calloc(&radix_bufs_hdr,
             n_bufs * sizeof(radix_buf_t));
         if (!radix_bufs) goto sequential_fallback;
 
-        /* Pre-size each buffer with 2x expected to avoid realloc */
+        /* Pre-size each buffer: 1.5x expected entries per partition per worker */
         uint32_t buf_init = (uint32_t)((uint64_t)nrows / (RADIX_P * n_total));
         if (buf_init < 64) buf_init = 64;
-        buf_init *= 2;  /* 2x headroom */
+        buf_init = buf_init + buf_init / 2;  /* 1.5x headroom */
+        uint16_t estride = ght_layout.entry_stride;
         for (size_t i = 0; i < n_bufs; i++) {
-            radix_bufs[i].entries = (radix_entry_t*)scratch_alloc(
-                &radix_bufs[i]._hdr, buf_init * sizeof(radix_entry_t));
+            radix_bufs[i].data = (char*)scratch_alloc(
+                &radix_bufs[i]._hdr, (size_t)buf_init * estride);
             radix_bufs[i].count = 0;
             radix_bufs[i].cap = buf_init;
         }
 
-        /* Phase 1: Parallel partitioning */
+        /* Phase 1: parallel hash + copy keys/agg values into fat entries */
         radix_phase1_ctx_t p1ctx = {
             .key_data  = key_data,
             .key_types = key_types,
-            .n_keys    = n_keys,
+            .agg_vecs  = agg_vecs,
             .n_workers = n_total,
             .bufs      = radix_bufs,
+            .layout    = ght_layout,
         };
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
 
-        /* Phase 2: Parallel per-partition aggregation */
+        /* Phase 2: parallel per-partition aggregation (no column access) */
         part_hts = (group_ht_t*)scratch_calloc(&part_hts_hdr,
             RADIX_P * sizeof(group_ht_t));
         if (!part_hts) {
@@ -1754,90 +2014,177 @@ ht_path:;
         }
 
         radix_phase2_ctx_t p2ctx = {
-            .key_data  = key_data,
-            .key_types = key_types,
-            .agg_vecs  = agg_vecs,
-            .n_keys    = n_keys,
-            .n_aggs    = n_aggs,
-            .n_workers = n_total,
-            .bufs      = radix_bufs,
-            .part_hts  = part_hts,
+            .key_types   = key_types,
+            .n_keys      = n_keys,
+            .n_workers   = n_total,
+            .bufs        = radix_bufs,
+            .part_hts    = part_hts,
+            .layout      = ght_layout,
         };
         td_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
 
-        /* Merge partition HTs into a single final HT for result building.
-         * Each partition has its own groups — just concatenate them into one. */
-        uint32_t total_grps = 0;
+        /* Prefix offsets */
+        uint32_t part_offsets[RADIX_P + 1];
+        part_offsets[0] = 0;
         for (uint32_t p = 0; p < RADIX_P; p++)
-            total_grps += part_hts[p].grp_count;
+            part_offsets[p + 1] = part_offsets[p] + part_hts[p].grp_count;
+        uint32_t total_grps = part_offsets[RADIX_P];
 
-        if (total_grps > 0) {
-            uint32_t merged_cap = 256;
-            while (merged_cap < total_grps) merged_cap *= 2;
-            /* We don't need a HT (no lookups), just the flat group/agg arrays */
-            if (!group_ht_init(&single_ht, merged_cap, n_aggs))
-                return TD_ERR_PTR(TD_ERR_OOM);
-            uint32_t dest = 0;
-            for (uint32_t p = 0; p < RADIX_P; p++) {
-                group_ht_t* ph = &part_hts[p];
-                for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
-                    if (dest >= single_ht.grp_cap)
-                        group_ht_grow(&single_ht);
-                    single_ht.groups[dest] = ph->groups[gi];
-                    size_t src_base = (size_t)gi * n_aggs;
-                    size_t dst_base = (size_t)dest * n_aggs;
-                    for (uint8_t a = 0; a < n_aggs; a++) {
-                        single_ht.all_agg_f64[dst_base + a]     = ph->all_agg_f64[src_base + a];
-                        single_ht.all_agg_i64[dst_base + a]     = ph->all_agg_i64[src_base + a];
-                        single_ht.all_agg_min_f64[dst_base + a] = ph->all_agg_min_f64[src_base + a];
-                        single_ht.all_agg_max_f64[dst_base + a] = ph->all_agg_max_f64[src_base + a];
-                        single_ht.all_agg_min_i64[dst_base + a] = ph->all_agg_min_i64[src_base + a];
-                        single_ht.all_agg_max_i64[dst_base + a] = ph->all_agg_max_i64[src_base + a];
-                    }
-                    dest++;
-                }
-            }
-            single_ht.grp_count = dest;
-            final_ht = &single_ht;
-        } else {
-            /* No groups at all — init an empty HT for result building */
-            if (!group_ht_init(&single_ht, 256, n_aggs))
-                return TD_ERR_PTR(TD_ERR_OOM);
-            final_ht = &single_ht;
+        /* Build result directly from partition HTs */
+        int64_t total_cols = n_keys + n_aggs;
+        result = td_table_new(total_cols);
+        if (!result || TD_IS_ERR(result)) goto cleanup;
+
+        /* Pre-allocate key columns */
+        td_t* key_cols[n_keys];
+        char* key_dsts[n_keys];
+        int8_t key_out_types[n_keys];
+        uint8_t key_esizes[n_keys];
+        for (uint8_t k = 0; k < n_keys; k++) {
+            td_t* src_col = key_vecs[k];
+            key_cols[k] = NULL;
+            key_dsts[k] = NULL;
+            key_out_types[k] = 0;
+            key_esizes[k] = 0;
+            if (!src_col) continue;
+            uint8_t esz = td_elem_size(src_col->type);
+            td_t* new_col = td_vec_new(src_col->type, (int64_t)total_grps);
+            if (!new_col || TD_IS_ERR(new_col)) continue;
+            new_col->len = (int64_t)total_grps;
+            key_cols[k] = new_col;
+            key_dsts[k] = (char*)td_data(new_col);
+            key_out_types[k] = src_col->type;
+            key_esizes[k] = esz;
         }
-        goto build_result;
+
+        /* Pre-allocate agg result vectors */
+        agg_out_t agg_outs[n_aggs];
+        td_t* agg_cols[n_aggs];
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            uint16_t agg_op = ext->agg_ops[a];
+            td_t* agg_col = agg_vecs[a];
+            bool is_f64 = agg_col && agg_col->type == TD_F64;
+            int8_t out_type;
+            switch (agg_op) {
+                case OP_AVG:   out_type = TD_F64; break;
+                case OP_COUNT: out_type = TD_I64; break;
+                case OP_SUM: case OP_PROD:
+                    out_type = is_f64 ? TD_F64 : TD_I64; break;
+                default:
+                    out_type = agg_col ? agg_col->type : TD_I64; break;
+            }
+            td_t* new_col = td_vec_new(out_type, (int64_t)total_grps);
+            if (!new_col || TD_IS_ERR(new_col)) { agg_cols[a] = NULL; continue; }
+            new_col->len = (int64_t)total_grps;
+            agg_cols[a] = new_col;
+            agg_outs[a] = (agg_out_t){
+                .out_type = out_type, .src_f64 = is_f64,
+                .agg_op = agg_op, .dst = td_data(new_col),
+            };
+        }
+
+        /* Phase 3: parallel key gather + agg result building from inline rows */
+        {
+            radix_phase3_ctx_t p3ctx = {
+                .part_hts     = part_hts,
+                .part_offsets = part_offsets,
+                .key_dsts     = key_dsts,
+                .key_types    = key_out_types,
+                .key_esizes   = key_esizes,
+                .n_keys       = n_keys,
+                .agg_outs     = agg_outs,
+                .n_aggs       = n_aggs,
+            };
+            td_pool_dispatch_n(pool, radix_phase3_fn, &p3ctx, RADIX_P);
+        }
+
+        /* Add key columns to result */
+        for (uint8_t k = 0; k < n_keys; k++) {
+            if (!key_cols[k]) continue;
+            td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
+            int64_t name_id = key_ext ? key_ext->sym : k;
+            result = td_table_add_col(result, name_id, key_cols[k]);
+            td_release(key_cols[k]);
+        }
+
+        /* Add agg columns to result */
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            if (!agg_cols[a]) continue;
+            uint16_t agg_op = ext->agg_ops[a];
+            td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
+            int64_t name_id;
+            if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
+                td_t* name_atom = td_sym_str(agg_ext->sym);
+                const char* base = name_atom ? td_str_ptr(name_atom) : NULL;
+                size_t blen = base ? td_str_len(name_atom) : 0;
+                const char* sfx = "";
+                size_t slen = 0;
+                switch (agg_op) {
+                    case OP_SUM:   sfx = "_sum";   slen = 4; break;
+                    case OP_COUNT: sfx = "_count"; slen = 6; break;
+                    case OP_AVG:   sfx = "_mean";  slen = 5; break;
+                    case OP_MIN:   sfx = "_min";   slen = 4; break;
+                    case OP_MAX:   sfx = "_max";   slen = 4; break;
+                    case OP_FIRST: sfx = "_first"; slen = 6; break;
+                    case OP_LAST:  sfx = "_last";  slen = 5; break;
+                }
+                char buf[256];
+                if (base && blen + slen < sizeof(buf)) {
+                    memcpy(buf, base, blen);
+                    memcpy(buf + blen, sfx, slen);
+                    name_id = td_sym_intern(buf, blen + slen);
+                } else {
+                    name_id = agg_ext->sym;
+                }
+            } else {
+                name_id = (int64_t)(n_keys + a);
+            }
+            result = td_table_add_col(result, name_id, agg_cols[a]);
+            td_release(agg_cols[a]);
+        }
+
+        goto cleanup;
     }
 
 sequential_fallback:;
-    /* Sequential path */
-    if (!group_ht_init(&single_ht, ht_cap, n_aggs))
+    /* Sequential path using row-layout HT */
+    if (!group_ht_init(&single_ht, ht_cap, &ght_layout))
         return TD_ERR_PTR(TD_ERR_OOM);
-    group_rows_range(&single_ht, key_data, key_types, n_keys, agg_vecs, n_aggs,
-                     ext->agg_ops, 0, nrows);
+    group_rows_range(&single_ht, key_data, key_types, agg_vecs, 0, nrows);
 
     final_ht = &single_ht;
 
-build_result:;
-    /* Build result DataFrame */
+    /* Build result from sequential HT (inline row layout) */
+    {
     uint32_t grp_count = final_ht->grp_count;
+    const ght_layout_t* ly = &final_ht->layout;
     int64_t total_cols = n_keys + n_aggs;
-    td_t* result = td_table_new(total_cols);
+    result = td_table_new(total_cols);
     if (!result || TD_IS_ERR(result)) goto cleanup;
 
-    /* Key columns */
+    /* Key columns: read from inline group rows, narrow to original type */
     for (uint8_t k = 0; k < n_keys; k++) {
         td_t* src_col = key_vecs[k];
         if (!src_col) continue;
         uint8_t esz = td_elem_size(src_col->type);
+        int8_t kt = src_col->type;
 
-        td_t* new_col = td_vec_new(src_col->type, (int64_t)grp_count);
+        td_t* new_col = td_vec_new(kt, (int64_t)grp_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = (int64_t)grp_count;
 
         for (uint32_t gi = 0; gi < grp_count; gi++) {
-            memcpy((char*)td_data(new_col) + gi * esz,
-                   (char*)td_data(src_col) + final_ht->groups[gi].first_row * esz,
-                   esz);
+            const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
+            int64_t kv = ((const int64_t*)(row + 8))[k];
+            char* dst = (char*)td_data(new_col) + (size_t)gi * esz;
+            if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
+                *(int64_t*)dst = kv;
+            else if (kt == TD_F64)
+                memcpy(dst, &kv, 8);
+            else if (kt == TD_ENUM)
+                *(uint32_t*)dst = (uint32_t)kv;
+            else if (kt == TD_I32)
+                *(int32_t*)dst = (int32_t)kv;
         }
 
         td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
@@ -1846,25 +2193,102 @@ build_result:;
         td_release(new_col);
     }
 
-    /* Agg columns — extract dense counts then use shared emitter */
-    td_t* _h_htcnt = NULL;
-    int64_t* ht_counts = (int64_t*)scratch_alloc(&_h_htcnt, grp_count * sizeof(int64_t));
-    for (uint32_t gi = 0; gi < grp_count; gi++)
-        ht_counts[gi] = final_ht->groups[gi].count;
+    /* Agg columns from inline accumulators */
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        uint16_t agg_op = ext->agg_ops[a];
+        td_t* agg_col = agg_vecs[a];
+        bool is_f64 = agg_col && agg_col->type == TD_F64;
+        int8_t out_type;
+        switch (agg_op) {
+            case OP_AVG:   out_type = TD_F64; break;
+            case OP_COUNT: out_type = TD_I64; break;
+            case OP_SUM: case OP_PROD:
+                out_type = is_f64 ? TD_F64 : TD_I64; break;
+            default:
+                out_type = agg_col ? agg_col->type : TD_I64; break;
+        }
+        td_t* new_col = td_vec_new(out_type, (int64_t)grp_count);
+        if (!new_col || TD_IS_ERR(new_col)) continue;
+        new_col->len = (int64_t)grp_count;
 
-    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_keys, n_aggs,
-                     final_ht->all_agg_f64, final_ht->all_agg_i64,
-                     final_ht->all_agg_min_f64, final_ht->all_agg_max_f64,
-                     final_ht->all_agg_min_i64, final_ht->all_agg_max_i64,
-                     ht_counts);
-    scratch_free(_h_htcnt);
+        int8_t s = ly->agg_val_slot[a]; /* unified accum slot */
+        for (uint32_t gi = 0; gi < grp_count; gi++) {
+            const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
+            int64_t cnt = *(const int64_t*)row;
+            if (out_type == TD_F64) {
+                double v;
+                switch (agg_op) {
+                    case OP_SUM:
+                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s]
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        break;
+                    case OP_AVG:
+                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s] / cnt
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s] / cnt;
+                        break;
+                    case OP_MIN:
+                        v = is_f64 ? ((const double*)(row + ly->off_min))[s]
+                                   : (double)((const int64_t*)(row + ly->off_min))[s];
+                        break;
+                    case OP_MAX:
+                        v = is_f64 ? ((const double*)(row + ly->off_max))[s]
+                                   : (double)((const int64_t*)(row + ly->off_max))[s];
+                        break;
+                    default: v = 0.0; break;
+                }
+                ((double*)td_data(new_col))[gi] = v;
+            } else {
+                int64_t v;
+                switch (agg_op) {
+                    case OP_SUM:   v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                    case OP_COUNT: v = cnt; break;
+                    case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
+                    case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
+                    case OP_FIRST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                    default:       v = 0; break;
+                }
+                ((int64_t*)td_data(new_col))[gi] = v;
+            }
+        }
+
+        /* Generate unique column name */
+        td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
+        int64_t name_id;
+        if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
+            td_t* name_atom = td_sym_str(agg_ext->sym);
+            const char* base = name_atom ? td_str_ptr(name_atom) : NULL;
+            size_t blen = base ? td_str_len(name_atom) : 0;
+            const char* sfx = "";
+            size_t slen = 0;
+            switch (agg_op) {
+                case OP_SUM:   sfx = "_sum";   slen = 4; break;
+                case OP_COUNT: sfx = "_count"; slen = 6; break;
+                case OP_AVG:   sfx = "_mean";  slen = 5; break;
+                case OP_MIN:   sfx = "_min";   slen = 4; break;
+                case OP_MAX:   sfx = "_max";   slen = 4; break;
+                case OP_FIRST: sfx = "_first"; slen = 6; break;
+                case OP_LAST:  sfx = "_last";  slen = 5; break;
+            }
+            char buf[256];
+            if (base && blen + slen < sizeof(buf)) {
+                memcpy(buf, base, blen);
+                memcpy(buf + blen, sfx, slen);
+                name_id = td_sym_intern(buf, blen + slen);
+            } else {
+                name_id = agg_ext->sym;
+            }
+        } else {
+            name_id = (int64_t)(n_keys + a);
+        }
+        result = td_table_add_col(result, name_id, new_col);
+        td_release(new_col);
+    }
+    }
 
 cleanup:
-    /* Free the merged/sequential single_ht (always used as final_ht) */
     if (final_ht == &single_ht) {
         group_ht_free(&single_ht);
     }
-    /* Free radix partition state */
     if (radix_bufs) {
         size_t n_bufs = (size_t)n_total * RADIX_P;
         for (size_t i = 0; i < n_bufs; i++) scratch_free(radix_bufs[i]._hdr);
@@ -1872,7 +2296,7 @@ cleanup:
     }
     if (part_hts) {
         for (uint32_t p = 0; p < RADIX_P; p++) {
-            if (part_hts[p].groups) group_ht_free(&part_hts[p]);
+            if (part_hts[p].rows) group_ht_free(&part_hts[p]);
         }
         scratch_free(part_hts_hdr);
     }

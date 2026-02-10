@@ -102,11 +102,13 @@ td_t* td_col_load(const char* path) {
         td_vm_unmap_file(ptr, mapped_size);
         return vec ? vec : TD_ERR_PTR(TD_ERR_OOM);
     }
+    uint8_t saved_order = vec->order;  /* preserve buddy order */
     memcpy(vec, ptr, 32 + data_size);
     td_vm_unmap_file(ptr, mapped_size);
 
     /* Fix up header for buddy-allocated block */
     vec->mmod = 0;
+    vec->order = saved_order;
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;

@@ -99,8 +99,6 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
     /* Load remaining partitions and concatenate */
     int64_t ncols = td_table_ncols(first);
-    int64_t total_rows = td_table_nrows(first);
-
     /* Accumulate rows from all partitions */
     td_t** all_dfs = (td_t**)malloc((size_t)part_count * sizeof(td_t*));
     if (!all_dfs) {
@@ -114,8 +112,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     for (int64_t p = 1; p < part_count; p++) {
         snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
         all_dfs[p] = td_splay_load(path);
-        if (all_dfs[p] && !TD_IS_ERR(all_dfs[p])) {
-            total_rows += td_table_nrows(all_dfs[p]);
+        if (!all_dfs[p] || TD_IS_ERR(all_dfs[p])) {
+            all_dfs[p] = NULL;
         }
     }
 

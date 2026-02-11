@@ -69,13 +69,16 @@ td_t* td_f64(double val) {
  * -------------------------------------------------------------------------- */
 
 td_t* td_str(const char* s, size_t len) {
-    if (len <= 7) {
-        /* SSO path: store inline in header */
+    if (len < 7) {
+        /* SSO path: store inline in header (< 7 leaves room for NUL).
+         * Exactly 7 bytes would fill all of sdata[7] with no NUL terminator,
+         * so 7-byte strings fall through to the long-string path. */
         td_t* v = td_alloc(0);
         if (TD_IS_ERR(v)) return v;
         v->type = TD_ATOM_STR;
         v->slen = (uint8_t)len;
         if (len > 0) memcpy(v->sdata, s, len);
+        v->sdata[len] = '\0';
         return v;
     }
     /* Long string: allocate a CHAR vector to hold the data, store pointer.

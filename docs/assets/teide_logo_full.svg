@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   version="1.1"
+   id="svg1"
+   width="1654.163"
+   height="1066.5649"
+   viewBox="0 0 1654.163 1066.5649"
+   sodipodi:docname="teide_logo.svg"
+   inkscape:version="1.4.2 (ebf0e94, 2025-05-08)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#666666"
+     borderopacity="1.0"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="0.32776163"
+     inkscape:cx="1734.4922"
+     inkscape:cy="642.23503"
+     inkscape:window-width="1920"
+     inkscape:window-height="1048"
+     inkscape:window-x="1280"
+     inkscape:window-y="-5"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="g1">
+    <inkscape:page
+       x="0"
+       y="0"
+       width="1654.163"
+       height="1066.5649"
+       id="page2"
+       margin="0"
+       bleed="0" />
+  </sodipodi:namedview>
+  <g
+     inkscape:groupmode="layer"
+     inkscape:label="Image"
+     id="g1"
+     transform="translate(-1507.4825,-1001.0691)">
+    <path
+       style="fill:#4b6777;fill-opacity:1;stroke:#000000;stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;stroke-opacity:1"
+       d="m 1507.8603,2067.2417 661.9259,-763.1047 113.2625,120.8133 353.3948,-423.0789 166.8037,219.7457 91.6887,-62.8337 266.2792,450.4272 -289.8448,-348.0044 -76.3481,53.448 -157.4346,-209.0489 -61.2699,439.0797 -81.3643,-114.1484 -182.6784,339.4235 -63.8803,-191.4501 -248.772,251.0841 -42.2037,-117.5773 z"
+       id="path1"
+       sodipodi:nodetypes="ccccccccccccccccc" />
+    <text
+       xml:space="preserve"
+       style="font-size:288.55px;line-height:1.25;font-family:sans-serif;fill:#4b6777;fill-opacity:1;stroke-width:1.50287"
+       x="2348.5686"
+       y="1907.326"
+       id="text9"
+       transform="scale(1.0424663,0.95926362)"><tspan
+         sodipodi:role="line"
+         id="tspan9"
+         x="2348.5686"
+         y="1907.326"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:288.55px;font-family:Oswald;-inkscape-font-specification:'Oswald Bold';fill:#4b6777;fill-opacity:1;stroke-width:1.50287">TEIDE</tspan></text>
+  </g>
+</svg>

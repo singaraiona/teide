@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teide — Pure C Columnar Dataframe Library</title>
+  <meta name="description" content="A columnar dataframe library written from the ground up in pure C17. Zero dependencies. Lazy fusion optimizer. Python API.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="assets/teide-logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav class="nav">
+    <div class="container">
+      <a href="#" class="nav-brand">
+        <img src="assets/teide-logo.svg" alt="Teide" width="28" height="28">
+        Teide
+      </a>
+      <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+      <ul class="nav-links">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#code">Example</a></li>
+        <li><a href="#getstarted">Get Started</a></li>
+        <li>
+          <a href="https://github.com/hetoku/teide" class="nav-github" target="_blank" rel="noopener">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            GitHub
+          </a>
+        </li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-decor">
+      <div class="stripe stripe-1"></div>
+      <div class="stripe stripe-2"></div>
+      <div class="stripe stripe-3"></div>
+      <div class="stripe stripe-4"></div>
+    </div>
+    <svg class="hero-mountain-decor" viewBox="0 0 800 400" preserveAspectRatio="xMidYMax meet" xmlns="http://www.w3.org/2000/svg">
+      <path fill="#4b6777" d="M0,400 L0,350 L160,60 L185,95 L290,0 L330,80 L360,60 L440,220 L400,100 L380,115 L340,70 L320,300 L300,175 L240,300 L225,240 L165,310 L155,265 L60,380 Z"/>
+    </svg>
+    <div class="container">
+      <div class="hero-content">
+        <h1>A dataframe library <span class="accent">from scratch</span></h1>
+        <div class="hero-chips">
+          <span class="chip">Pure C17</span>
+          <span class="chip">Zero dependencies</span>
+          <span class="chip">Single header</span>
+        </div>
+        <p class="hero-subtitle">Lazy pipeline API with automatic fusion optimization, custom memory management, and Python bindings. Everything built from the ground up.</p>
+        <div class="hero-buttons">
+          <a href="#getstarted" class="btn btn-primary">Get started</a>
+          <a href="https://github.com/hetoku/teide" class="btn btn-outline" target="_blank" rel="noopener">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            View on GitHub
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features" class="benefits-section">
+    <div class="container">
+      <div class="section-label">WHAT MAKES TEIDE DIFFERENT</div>
+      <div class="benefits-grid">
+
+        <div class="benefit-item">
+          <div class="benefit-number">01</div>
+          <div class="benefit-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+          </div>
+          <h3>Nothing to install</h3>
+          <p>Pure C17 with zero external dependencies. No package manager, no vendored libraries, no system requirements beyond cmake and a C compiler. One public header file.</p>
+        </div>
+
+        <div class="benefit-item">
+          <div class="benefit-number">02</div>
+          <div class="benefit-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          </div>
+          <h3>Describe, don't execute</h3>
+          <p>Build a pipeline of filter, group, sort, and join operations lazily. Nothing runs until you call <code>.collect()</code>. The optimizer rewrites your pipeline automatically&mdash;fusing passes, pushing down predicates, eliminating dead branches.</p>
+        </div>
+
+        <div class="benefit-item">
+          <div class="benefit-number">03</div>
+          <div class="benefit-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          </div>
+          <h3>Purpose-built internals</h3>
+          <p>Custom buddy allocator with copy-on-write ref counting. Morsel-driven execution processes 1024-element tiles at a time. Thread pool with lock-free dispatch. Every layer designed for columnar workloads.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Code Example -->
+  <section id="code" class="code-section">
+    <div class="container">
+      <div class="section-label">PYTHON API</div>
+      <h2 class="code-section-title">Build a lazy pipeline, call .collect()</h2>
+      <p class="code-section-subtitle">Nothing executes until you ask for results. The optimizer handles the rest.</p>
+
+      <div class="code-block">
+        <div class="code-header">
+          <span class="code-dot red"></span>
+          <span class="code-dot yellow"></span>
+          <span class="code-dot green"></span>
+          <span class="code-filename">example.py</span>
+        </div>
+        <button class="copy-btn" data-copy>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          Copy
+        </button>
+        <pre><code><span class="kw">import</span> <span class="fn">teide</span> <span class="kw">as</span> <span class="fn">td</span>
+
+<span class="cmt"># Load CSV — returns a lazy table handle</span>
+table = td.<span class="fn">read_csv</span>(<span class="str">"measurements.csv"</span>)
+
+<span class="cmt"># Build pipeline — nothing executes yet</span>
+result = (
+    table
+    .<span class="fn">filter</span>(td.<span class="fn">col</span>(<span class="str">"region"</span>) == <span class="str">"EU"</span>)
+    .<span class="fn">group_by</span>([<span class="str">"product"</span>])
+    .<span class="fn">agg</span>(
+        total=(<span class="str">"revenue"</span>, <span class="str">"sum"</span>),
+        avg_price=(<span class="str">"price"</span>, <span class="str">"avg"</span>),
+        count=(<span class="str">"id"</span>, <span class="str">"count"</span>),
+    )
+    .<span class="fn">sort</span>(<span class="str">"total"</span>, descending=<span class="kw">True</span>)
+)
+
+<span class="cmt"># Execute — fused optimizer kicks in</span>
+df = result.<span class="fn">collect</span>()
+<span class="kw">print</span>(df)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Get Started -->
+  <section id="getstarted" class="getstarted-section">
+    <div class="container">
+      <div class="section-label">GETTING STARTED</div>
+      <h2 class="getstarted-title">Build from source in seconds</h2>
+      <p class="getstarted-subtitle">No package manager needed. Just cmake and a C compiler.</p>
+
+      <div class="getstarted-grid">
+        <div class="getstarted-block">
+          <h3>Build</h3>
+          <pre><code>git clone https://github.com/hetoku/teide.git
+cd teide
+
+# Debug (with sanitizers)
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+
+# Release (optimized)
+cmake -B build_release -DCMAKE_BUILD_TYPE=Release
+cmake --build build_release
+
+# Run tests
+cd build &amp;&amp; ctest --output-on-failure</code></pre>
+        </div>
+
+        <div class="getstarted-block">
+          <h3>Python</h3>
+          <pre><code># Use the release build
+export TEIDE_LIB=build_release/libteide.so
+
+python3 -c "
+import teide as td
+
+table = td.read_csv('data.csv')
+result = table.group_by(['id1']).agg(
+    v1_sum=('v1', 'sum')
+)
+print(result.collect())
+"</code></pre>
+          <p>
+            Read the full
+            <a href="https://github.com/hetoku/teide/blob/main/SPEC.md">specification</a>
+            or browse the
+            <a href="https://github.com/hetoku/teide">source on GitHub</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-links">
+        <a href="https://github.com/hetoku/teide" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/hetoku/teide/blob/main/SPEC.md" target="_blank" rel="noopener">Spec</a>
+        <a href="https://github.com/hetoku/teide/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+      </div>
+      <p>Pure C17. MIT License.</p>
+    </div>
+  </footer>
+
+  <!-- Scroll-to-top -->
+  <button class="scroll-top" aria-label="Scroll to top">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>
+  </button>
+
+  <script src="script.js"></script>
+</body>
+</html>

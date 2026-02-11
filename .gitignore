@@ -1,1 +1,20 @@
+# Build directories
+build/
+build_*/
+target/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / tool local settings
+.claude/settings.local.json
+
+# Docs
 SPEC.md
+
+# OS
+.DS_Store
+*.swp

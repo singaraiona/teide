@@ -147,11 +147,11 @@ static MunitResult test_atom_str_sso(const void* params, void* fixture) {
     munit_assert_uint(e->slen, ==, 0);
     td_release(e);
 
-    /* Exactly 7 bytes (max SSO) */
+    /* Exactly 7 bytes — uses long-string path (no room for NUL in sdata[7]) */
     td_t* m = td_str("1234567", 7);
     munit_assert_int(m->type, ==, TD_ATOM_STR);
-    munit_assert_uint(m->slen, ==, 7);
-    munit_assert_memory_equal(7, m->sdata, "1234567");
+    munit_assert_size(td_str_len(m), ==, 7);
+    munit_assert_memory_equal(7, td_str_ptr(m), "1234567");
     td_release(m);
 
     return MUNIT_OK;

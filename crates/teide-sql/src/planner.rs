@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Distinct, Expr, GroupByExpr, ObjectName, ObjectType, Query, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, Value,
+    BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    ObjectType, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -136,15 +136,93 @@ fn plan_query(
     query: &Query,
     tables: Option<&HashMap<String, StoredTable>>,
 ) -> Result<SqlResult, SqlError> {
-    if query.with.is_some() {
-        return Err(SqlError::Plan("WITH (CTEs) not supported yet".into()));
+    // Handle CTEs (WITH clause)
+    let cte_tables: HashMap<String, StoredTable>;
+    let effective_tables: Option<&HashMap<String, StoredTable>>;
+
+    if let Some(with) = &query.with {
+        let mut cte_map: HashMap<String, StoredTable> = match tables {
+            Some(t) => t.clone(),
+            None => HashMap::new(),
+        };
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.to_lowercase();
+            let result = plan_query(ctx, &cte.query, Some(&cte_map))?;
+            cte_map.insert(
+                cte_name,
+                StoredTable {
+                    table: result.table,
+                    columns: result.columns,
+                },
+            );
+        }
+        cte_tables = cte_map;
+        effective_tables = Some(&cte_tables);
+    } else {
+        effective_tables = tables;
     }
 
+    // Handle UNION ALL / set operations
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
+        SetExpr::SetOperation {
+            op: sqlparser::ast::SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All) {
+                return Err(SqlError::Plan(
+                    "UNION (without ALL) not supported yet; use UNION ALL".into(),
+                ));
+            }
+            // Execute both sides
+            let left_query = Query {
+                with: None,
+                body: left.clone(),
+                order_by: None,
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+            };
+            let right_query = Query {
+                with: None,
+                body: right.clone(),
+                order_by: None,
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+            };
+            let left_result = plan_query(ctx, &left_query, effective_tables)?;
+            let right_result = plan_query(ctx, &right_query, effective_tables)?;
+
+            if left_result.columns.len() != right_result.columns.len() {
+                return Err(SqlError::Plan(format!(
+                    "UNION ALL: column count mismatch ({} vs {})",
+                    left_result.columns.len(),
+                    right_result.columns.len()
+                )));
+            }
+
+            // Concatenate tables column by column
+            let result = concat_tables(ctx, &left_result.table, &right_result.table)?;
+
+            // Apply ORDER BY and LIMIT from the outer query
+            return apply_post_processing(ctx, query, result, left_result.columns, effective_tables);
+        }
         SetExpr::SetOperation { .. } => {
             return Err(SqlError::Plan(
-                "UNION/INTERSECT/EXCEPT not supported yet".into(),
+                "Only UNION ALL is supported for set operations".into(),
             ))
         }
         _ => {
@@ -154,30 +232,26 @@ fn plan_query(
         }
     };
 
-    for item in &select.from {
-        if !item.joins.is_empty() {
-            return Err(SqlError::Plan("JOINs not supported yet".into()));
-        }
-    }
-
     // DISTINCT flag
     let is_distinct = matches!(&select.distinct, Some(Distinct::Distinct));
 
-    // Extract FROM table name
-    let from_name = extract_from(&select.from)?;
+    // Resolve FROM clause (possibly with JOINs)
+    let (table, schema) = resolve_from(ctx, &select.from, effective_tables)?;
 
-    // Resolve: check session registry first, then fall back to CSV
-    let table = resolve_table(ctx, &from_name, tables)?;
+    // Build SELECT alias → expression map (for GROUP BY on aliases)
+    let select_items = &select.projection;
+    let mut alias_exprs: HashMap<String, Expr> = HashMap::new();
+    for item in select_items {
+        if let SelectItem::ExprWithAlias { expr, alias } = item {
+            alias_exprs.insert(alias.value.to_lowercase(), expr.clone());
+        }
+    }
 
-    // Build schema from native table column names
-    let schema = build_schema(&table);
-
-    // GROUP BY column names
-    let group_by_cols = extract_group_by_columns(&select.group_by, &schema)?;
+    // GROUP BY column names (accepts table columns and SELECT aliases)
+    let group_by_cols = extract_group_by_columns(&select.group_by, &schema, &alias_exprs)?;
     let has_group_by = !group_by_cols.is_empty();
 
     // Detect aggregates in SELECT
-    let select_items = &select.projection;
     let has_aggregates = select_items.iter().any(|item| match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => is_aggregate(e),
         _ => false,
@@ -196,7 +270,7 @@ fn plan_query(
 
     // Stage 2: GROUP BY / aggregation / DISTINCT
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
-        plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema)?
+        plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs)?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
         let aliases = extract_projection_aliases(select_items, &schema)?;
@@ -306,8 +380,74 @@ fn resolve_table(
     ctx.read_csv(&path).map_err(SqlError::from)
 }
 
-/// Extract raw table name from FROM clause (not normalized to a file path).
-fn extract_from(from: &[TableWithJoins]) -> Result<String, SqlError> {
+/// Extract equi-join keys from an ON condition.
+/// Returns (left_col_name, right_col_name) pairs.
+fn extract_join_keys(
+    expr: &Expr,
+    left_schema: &HashMap<String, usize>,
+    right_schema: &HashMap<String, usize>,
+) -> Result<Vec<(String, String)>, SqlError> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let l_name = extract_col_name(left)?;
+            let r_name = extract_col_name(right)?;
+
+            // Determine which side belongs to which table
+            if left_schema.contains_key(&l_name) && right_schema.contains_key(&r_name) {
+                Ok(vec![(l_name, r_name)])
+            } else if left_schema.contains_key(&r_name) && right_schema.contains_key(&l_name) {
+                Ok(vec![(r_name, l_name)])
+            } else {
+                Err(SqlError::Plan(format!(
+                    "JOIN ON columns '{l_name}' and '{r_name}' not found in respective tables"
+                )))
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut keys = extract_join_keys(left, left_schema, right_schema)?;
+            keys.extend(extract_join_keys(right, left_schema, right_schema)?);
+            Ok(keys)
+        }
+        _ => Err(SqlError::Plan(
+            "Only equi-join conditions (col1 = col2 [AND ...]) are supported".into(),
+        )),
+    }
+}
+
+/// Extract a column name from an expression (handles Identifier and CompoundIdentifier).
+fn extract_col_name(expr: &Expr) -> Result<String, SqlError> {
+    match expr {
+        Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 {
+                Ok(parts[1].value.to_lowercase())
+            } else {
+                Err(SqlError::Plan(format!(
+                    "Unsupported compound identifier in JOIN: {expr}"
+                )))
+            }
+        }
+        _ => Err(SqlError::Plan(format!(
+            "Unsupported expression in JOIN ON: {expr}"
+        ))),
+    }
+}
+
+/// Resolve the FROM clause into a working table + schema.
+/// Handles simple tables, table aliases, FROM subqueries, and JOINs.
+fn resolve_from(
+    ctx: &Context,
+    from: &[TableWithJoins],
+    tables: Option<&HashMap<String, StoredTable>>,
+) -> Result<(Table, HashMap<String, usize>), SqlError> {
     if from.is_empty() {
         return Err(SqlError::Plan("Missing FROM clause".into()));
     }
@@ -317,12 +457,159 @@ fn extract_from(from: &[TableWithJoins]) -> Result<String, SqlError> {
         ));
     }
 
-    match &from[0].relation {
-        TableFactor::Table { name, .. } => Ok(object_name_to_string(name)),
+    let twj = &from[0];
+
+    // Resolve the base (left) table
+    let (mut left_table, mut left_schema) = resolve_table_factor(ctx, &twj.relation, tables)?;
+
+    // Process JOINs
+    for join in &twj.joins {
+        let (right_table, right_schema) = resolve_table_factor(ctx, &join.relation, tables)?;
+
+        // Determine join type
+        let join_type: u8 = match &join.join_operator {
+            JoinOperator::Inner(_) => 0,
+            JoinOperator::LeftOuter(_) => 1,
+            JoinOperator::RightOuter(_) => {
+                // RIGHT JOIN = swap left/right then LEFT JOIN
+                // We'll handle this by swapping and post-reordering
+                1
+            }
+            JoinOperator::CrossJoin => {
+                return Err(SqlError::Plan("CROSS JOIN not supported yet".into()));
+            }
+            _ => {
+                return Err(SqlError::Plan(format!(
+                    "Unsupported join type: {:?}",
+                    join.join_operator
+                )));
+            }
+        };
+
+        let is_right_join = matches!(&join.join_operator, JoinOperator::RightOuter(_));
+
+        // Extract ON condition
+        let on_expr = match &join.join_operator {
+            JoinOperator::Inner(c)
+            | JoinOperator::LeftOuter(c)
+            | JoinOperator::RightOuter(c) => match c {
+                JoinConstraint::On(expr) => expr.clone(),
+                _ => {
+                    return Err(SqlError::Plan(
+                        "Only ON conditions are supported for JOINs".into(),
+                    ))
+                }
+            },
+            _ => {
+                return Err(SqlError::Plan("JOIN requires ON condition".into()));
+            }
+        };
+
+        // For RIGHT JOIN, determine which is actual_left/right
+        // We clone_ref to avoid borrow conflicts with the graph
+        let (al_table, al_schema, ar_table, ar_schema) = if is_right_join {
+            (right_table.clone_ref(), right_schema.clone(), left_table.clone_ref(), left_schema.clone())
+        } else {
+            (left_table.clone_ref(), left_schema.clone(), right_table.clone_ref(), right_schema.clone())
+        };
+
+        // Extract equi-join keys
+        let join_keys = extract_join_keys(&on_expr, &al_schema, &ar_schema)?;
+        if join_keys.is_empty() {
+            return Err(SqlError::Plan("JOIN ON must have at least one equi-join key".into()));
+        }
+
+        // Build join graph (scoped to avoid borrow conflict)
+        let result = {
+            let mut g = ctx.graph(&al_table);
+            let left_df_node = g.const_df(&al_table);
+            let right_df_node = g.const_df(&ar_table);
+
+            let left_key_nodes: Vec<teide::Column> =
+                join_keys.iter().map(|(lk, _)| g.scan(lk)).collect();
+
+            // Right keys: use const_vec to avoid cross-graph references
+            let mut right_key_nodes: Vec<teide::Column> = Vec::new();
+            for (_, rk) in &join_keys {
+                let right_sym = teide::sym_intern(rk);
+                let right_col_ptr =
+                    unsafe { teide::ffi_table_get_col(ar_table.as_raw(), right_sym) };
+                if right_col_ptr.is_null() {
+                    return Err(SqlError::Plan(format!(
+                        "Right key column '{}' not found",
+                        rk
+                    )));
+                }
+                right_key_nodes.push(g.const_vec(right_col_ptr));
+            }
+
+            let joined = g.join(
+                left_df_node,
+                &left_key_nodes,
+                right_df_node,
+                &right_key_nodes,
+                join_type,
+            );
+
+            g.execute(joined)?
+        };
+
+        // Build merged schema
+        let merged_schema = build_schema(&result);
+
+        left_table = result;
+        left_schema = merged_schema;
+    }
+
+    Ok((left_table, left_schema))
+}
+
+/// Resolve a single TableFactor (table name or FROM subquery) into a table + schema.
+fn resolve_table_factor(
+    ctx: &Context,
+    factor: &TableFactor,
+    tables: Option<&HashMap<String, StoredTable>>,
+) -> Result<(Table, HashMap<String, usize>), SqlError> {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            let table_name = object_name_to_string(name);
+            let table = resolve_table(ctx, &table_name, tables)?;
+            let schema = build_schema(&table);
+            Ok((table, schema))
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let alias_name = alias
+                .as_ref()
+                .map(|a| a.name.value.to_lowercase())
+                .ok_or_else(|| SqlError::Plan("Subquery in FROM requires an alias".into()))?;
+            let result = plan_query(ctx, subquery, tables)?;
+            let schema = build_result_schema(&result.table, &result.columns);
+            let _ = alias_name; // alias used for qualification, schema uses column names
+            Ok((result.table, schema))
+        }
         _ => Err(SqlError::Plan(
-            "Only simple table references are supported in FROM".into(),
+            "Only simple table references and subqueries are supported in FROM".into(),
         )),
     }
+}
+
+/// Build a schema from a result table using provided column aliases.
+fn build_result_schema(table: &Table, aliases: &[String]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (i, alias) in aliases.iter().enumerate() {
+        map.insert(alias.clone(), i);
+    }
+    // Also add native column names
+    let ncols = table.ncols() as usize;
+    for i in 0..ncols {
+        let name = table.col_name_str(i);
+        if !name.is_empty() {
+            map.entry(name.to_lowercase()).or_insert(i);
+        }
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +626,7 @@ fn plan_group_select(
     select_items: &[SelectItem],
     group_by_cols: &[String],
     schema: &HashMap<String, usize>,
+    alias_exprs: &HashMap<String, Expr>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     let has_group_by = !group_by_cols.is_empty();
 
@@ -361,6 +649,15 @@ fn plan_group_select(
             }
             _ => return Err(SqlError::Plan("Unsupported SELECT item".into())),
         };
+
+        // Check if this SELECT item is an expression whose alias is a GROUP BY key
+        if let Some(ref alias) = explicit_alias {
+            if group_by_cols.contains(alias) && alias_exprs.contains_key(alias) {
+                select_plan.push(SelectPlan::KeyRef(alias.clone()));
+                final_aliases.push(alias.clone());
+                continue;
+            }
+        }
 
         if let Expr::Identifier(ident) = expr {
             let name = ident.value.to_lowercase();
@@ -407,7 +704,15 @@ fn plan_group_select(
     // Phase 2: Execute GROUP BY with keys + all unique aggregates
     let mut g = ctx.graph(working_table);
 
-    let key_nodes: Vec<Column> = key_names.iter().map(|k| g.scan(k)).collect();
+    let mut key_nodes: Vec<Column> = Vec::new();
+    for k in &key_names {
+        if let Some(expr) = alias_exprs.get(k) {
+            // Expression-based key (e.g., CASE WHEN ... AS bucket, GROUP BY bucket)
+            key_nodes.push(plan_expr(&mut g, expr, schema)?);
+        } else {
+            key_nodes.push(g.scan(k));
+        }
+    }
 
     let mut agg_ops = Vec::new();
     let mut agg_inputs = Vec::new();
@@ -615,6 +920,91 @@ fn skip_rows(ctx: &Context, table: &Table, offset: i64) -> Result<Table, SqlErro
 }
 
 // ---------------------------------------------------------------------------
+// UNION ALL: concatenate two tables
+// ---------------------------------------------------------------------------
+
+fn concat_tables(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+    let ncols = left.ncols();
+    if ncols != right.ncols() {
+        return Err(SqlError::Plan("UNION ALL: column count mismatch".into()));
+    }
+
+    // Build a new table with concatenated columns
+    let result_raw = unsafe { teide::ffi_table_new(ncols) };
+    if result_raw.is_null() {
+        return Err(SqlError::Engine(teide::Error::Oom));
+    }
+
+    let mut result_raw = result_raw;
+    for c in 0..ncols {
+        let l_col = left.get_col_idx(c).ok_or(SqlError::Plan(
+            "UNION ALL: left column missing".into(),
+        ))?;
+        let r_col = right.get_col_idx(c).ok_or(SqlError::Plan(
+            "UNION ALL: right column missing".into(),
+        ))?;
+        let merged = unsafe { teide::ffi_vec_concat(l_col, r_col) };
+        if merged.is_null() || teide::ffi_is_err(merged) {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        let name_id = left.col_name(c);
+        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, merged) };
+        unsafe { teide::ffi_release(merged) };
+    }
+
+    // Wrap in a Table with proper RAII
+    unsafe { teide::ffi_retain(result_raw) };
+    Ok(unsafe { Table::from_raw(result_raw) })
+}
+
+/// Apply ORDER BY and LIMIT from the outer query to a result.
+fn apply_post_processing(
+    ctx: &Context,
+    query: &Query,
+    result_table: Table,
+    result_aliases: Vec<String>,
+    _tables: Option<&HashMap<String, StoredTable>>,
+) -> Result<SqlResult, SqlError> {
+    // ORDER BY
+    let order_by_exprs = extract_order_by(query)?;
+    let result_table = if !order_by_exprs.is_empty() {
+        let mut g = ctx.graph(&result_table);
+        let df_node = g.const_df(&result_table);
+        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases)?;
+        g.execute(root)?
+    } else {
+        result_table
+    };
+
+    // OFFSET + LIMIT
+    let offset_val = extract_offset(query)?;
+    let limit_val = extract_limit(query)?;
+    let result_table = match (offset_val, limit_val) {
+        (Some(off), Some(lim)) => {
+            let total = off + lim;
+            let g = ctx.graph(&result_table);
+            let df_node = g.const_df(&result_table);
+            let head_node = g.head(df_node, total);
+            let trimmed = g.execute(head_node)?;
+            skip_rows(ctx, &trimmed, off)?
+        }
+        (Some(off), None) => skip_rows(ctx, &result_table, off)?,
+        (None, Some(lim)) => {
+            let g = ctx.graph(&result_table);
+            let df_node = g.const_df(&result_table);
+            let root = g.head(df_node, lim);
+            g.execute(root)?
+        }
+        (None, None) => result_table,
+    };
+
+    Ok(SqlResult {
+        table: result_table,
+        columns: result_aliases,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -653,9 +1043,11 @@ fn build_schema(table: &Table) -> HashMap<String, usize> {
 
 
 /// Extract GROUP BY column names.
+/// Accepts table column names or SELECT alias names (for expression-based keys).
 fn extract_group_by_columns(
     group_by: &GroupByExpr,
     schema: &HashMap<String, usize>,
+    alias_exprs: &HashMap<String, Expr>,
 ) -> Result<Vec<String>, SqlError> {
     match group_by {
         GroupByExpr::All(_) => Err(SqlError::Plan("GROUP BY ALL not supported".into())),
@@ -665,7 +1057,7 @@ fn extract_group_by_columns(
                 match expr {
                     Expr::Identifier(ident) => {
                         let name = ident.value.to_lowercase();
-                        if !schema.contains_key(&name) {
+                        if !schema.contains_key(&name) && !alias_exprs.contains_key(&name) {
                             return Err(SqlError::Plan(format!(
                                 "GROUP BY column '{}' not found",
                                 name

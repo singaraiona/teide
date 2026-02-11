@@ -67,6 +67,15 @@ pub(crate) struct StoredTable {
     pub columns: Vec<String>,
 }
 
+impl Clone for StoredTable {
+    fn clone(&self) -> Self {
+        StoredTable {
+            table: self.table.clone_ref(),
+            columns: self.columns.clone(),
+        }
+    }
+}
+
 /// A stateful SQL session that maintains a table registry across queries.
 /// Note: `tables` must be declared before `ctx` so it drops first —
 /// Table::drop calls td_release which requires live arenas.

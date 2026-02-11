@@ -163,6 +163,9 @@ mod ffi {
         pub fn td_str_ptr(s: *mut td_t) -> *const c_char;
         pub fn td_str_len(s: *mut td_t) -> usize;
 
+        // Vector API
+        pub fn td_vec_concat(a: *mut td_t, b: *mut td_t) -> *mut td_t;
+
         // CSV API
         pub fn td_csv_read(path: *const c_char) -> *mut td_t;
         pub fn td_csv_read_opts(path: *const c_char, delimiter: c_char, header: bool) -> *mut td_t;
@@ -250,6 +253,32 @@ mod ffi {
         pub fn td_head(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
         pub fn td_tail(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
         pub fn td_alias(g: *mut td_graph_t, input: *mut td_op_t, name: *const c_char) -> *mut td_op_t;
+
+        // Join
+        pub fn td_join(
+            g: *mut td_graph_t,
+            left_df: *mut td_op_t,
+            left_keys: *mut *mut td_op_t,
+            right_df: *mut td_op_t,
+            right_keys: *mut *mut td_op_t,
+            n_keys: u8,
+            join_type: u8,
+        ) -> *mut td_op_t;
+
+        // Ternary conditional (IF)
+        pub fn td_if(
+            g: *mut td_graph_t,
+            cond: *mut td_op_t,
+            then_val: *mut td_op_t,
+            else_val: *mut td_op_t,
+        ) -> *mut td_op_t;
+
+        // LIKE pattern matching
+        pub fn td_like(
+            g: *mut td_graph_t,
+            input: *mut td_op_t,
+            pattern: *mut td_op_t,
+        ) -> *mut td_op_t;
 
         // Optimizer + executor
         pub fn td_optimize(g: *mut td_graph_t, root: *mut td_op_t) -> *mut td_op_t;
@@ -434,6 +463,12 @@ pub struct Table {
 }
 
 impl Table {
+    /// Wrap a raw pointer as a Table (takes ownership — will call td_release on drop).
+    /// The pointer must already be retained.
+    pub unsafe fn from_raw(raw: *mut ffi::td_t) -> Self {
+        Table { raw, _not_send_sync: PhantomData }
+    }
+
     /// Create a shared reference to this table by incrementing the C ref count.
     /// Both the original and the clone will call `td_release` on drop.
     pub fn clone_ref(&self) -> Self {
@@ -759,6 +794,18 @@ impl Graph<'_> {
         Column { raw: unsafe { ffi::td_max2(self.raw, a.raw, b.raw) } }
     }
 
+    pub fn if_then_else(&self, cond: Column, then_val: Column, else_val: Column) -> Column {
+        Column {
+            raw: unsafe { ffi::td_if(self.raw, cond.raw, then_val.raw, else_val.raw) },
+        }
+    }
+
+    pub fn like(&self, input: Column, pattern: Column) -> Column {
+        Column {
+            raw: unsafe { ffi::td_like(self.raw, input.raw, pattern.raw) },
+        }
+    }
+
     // ---- Unary ops --------------------------------------------------------
 
     pub fn not(&self, a: Column) -> Column {
@@ -885,6 +932,34 @@ impl Graph<'_> {
         Column { raw }
     }
 
+    /// Hash join.
+    pub fn join(
+        &mut self,
+        left_df: Column,
+        left_keys: &[Column],
+        right_df: Column,
+        right_keys: &[Column],
+        join_type: u8,
+    ) -> Column {
+        assert_eq!(left_keys.len(), right_keys.len(), "join key count must match");
+        let mut lk: Vec<*mut ffi::td_op_t> = left_keys.iter().map(|c| c.raw).collect();
+        let mut rk: Vec<*mut ffi::td_op_t> = right_keys.iter().map(|c| c.raw).collect();
+        let raw = unsafe {
+            ffi::td_join(
+                self.raw,
+                left_df.raw,
+                lk.as_mut_ptr(),
+                right_df.raw,
+                rk.as_mut_ptr(),
+                left_keys.len() as u8,
+                join_type,
+            )
+        };
+        self._pinned.push(Box::new(lk));
+        self._pinned.push(Box::new(rk));
+        Column { raw }
+    }
+
     /// Multi-column sort.
     pub fn sort(&mut self, df_node: Column, keys: &[Column], descs: &[bool]) -> Column {
         assert_eq!(
@@ -1007,6 +1082,42 @@ impl Drop for Graph<'_> {
 pub use ffi::td_t;
 pub use ffi::td_op_t;
 pub use ffi::td_graph_t;
+
+/// Low-level helper: get column by symbol ID from a raw table pointer.
+/// Returns null if not found. Caller must NOT release the result.
+pub unsafe fn ffi_table_get_col(df: *mut ffi::td_t, name_id: i64) -> *mut ffi::td_t {
+    unsafe { ffi::td_table_get_col(df, name_id) }
+}
+
+/// Low-level helper: create new table.
+pub unsafe fn ffi_table_new(ncols: i64) -> *mut ffi::td_t {
+    unsafe { ffi::td_table_new(ncols) }
+}
+
+/// Low-level helper: add column to table.
+pub unsafe fn ffi_table_add_col(df: *mut ffi::td_t, name_id: i64, col: *mut ffi::td_t) -> *mut ffi::td_t {
+    unsafe { ffi::td_table_add_col(df, name_id, col) }
+}
+
+/// Low-level helper: concatenate two vectors.
+pub unsafe fn ffi_vec_concat(a: *mut ffi::td_t, b: *mut ffi::td_t) -> *mut ffi::td_t {
+    unsafe { ffi::td_vec_concat(a, b) }
+}
+
+/// Low-level helper: release a td_t pointer.
+pub unsafe fn ffi_release(v: *mut ffi::td_t) {
+    unsafe { ffi::td_release(v) }
+}
+
+/// Low-level helper: retain a td_t pointer.
+pub unsafe fn ffi_retain(v: *mut ffi::td_t) {
+    unsafe { ffi::td_retain(v) }
+}
+
+/// Check if a raw pointer is an error sentinel.
+pub fn ffi_is_err(p: *mut ffi::td_t) -> bool {
+    ffi::td_is_err(p)
+}
 
 // Re-export type constants
 pub mod types {

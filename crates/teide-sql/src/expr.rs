@@ -148,6 +148,109 @@ pub fn plan_expr(
             Ok(g.cast(e, target))
         }
 
+        // CASE WHEN → nested IF
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let else_val = match else_result {
+                Some(e) => plan_expr(g, e, schema)?,
+                None => g.const_f64(f64::NAN), // NULL default
+            };
+            let mut result = else_val;
+
+            if let Some(op) = operand {
+                // Simple CASE: CASE x WHEN v1 THEN r1 ...
+                for (cond_val, then_val) in conditions.iter().zip(results.iter()).rev() {
+                    let x = plan_expr(g, op, schema)?;
+                    let v = plan_expr(g, cond_val, schema)?;
+                    let c = g.eq(x, v);
+                    let t = plan_expr(g, then_val, schema)?;
+                    result = g.if_then_else(c, t, result);
+                }
+            } else {
+                // Searched CASE: CASE WHEN c1 THEN r1 ...
+                for (cond_expr, then_val) in conditions.iter().zip(results.iter()).rev() {
+                    let c = plan_expr(g, cond_expr, schema)?;
+                    let t = plan_expr(g, then_val, schema)?;
+                    result = g.if_then_else(c, t, result);
+                }
+            }
+            Ok(result)
+        }
+
+        // LIKE / NOT LIKE
+        Expr::Like {
+            negated,
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            let input = plan_expr(g, inner, schema)?;
+            let pat = plan_expr(g, pattern, schema)?;
+            let result = g.like(input, pat);
+            if *negated {
+                Ok(g.not(result))
+            } else {
+                Ok(result)
+            }
+        }
+
+        // ILIKE (case-insensitive) — treat same as LIKE for now
+        Expr::ILike {
+            negated,
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            let input = plan_expr(g, inner, schema)?;
+            let pat = plan_expr(g, pattern, schema)?;
+            let result = g.like(input, pat);
+            if *negated {
+                Ok(g.not(result))
+            } else {
+                Ok(result)
+            }
+        }
+
+        // CompoundIdentifier: table_alias.column
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 {
+                let col_name = parts[1].value.to_lowercase();
+                if schema.contains_key(&col_name) {
+                    return Ok(g.scan(&col_name));
+                }
+                // Try fully qualified name "alias.col"
+                let full = format!("{}.{}", parts[0].value.to_lowercase(), col_name);
+                if schema.contains_key(&full) {
+                    return Ok(g.scan(&full));
+                }
+                return Err(SqlError::Plan(format!("Column '{}' not found", col_name)));
+            }
+            Err(SqlError::Plan(format!("Unsupported compound identifier: {expr}")))
+        }
+
+        // Subquery: (SELECT ...) used as a scalar value
+        Expr::Subquery(_query) => {
+            // Execute inner query and extract single value
+            Err(SqlError::Plan(
+                "Scalar subqueries are only supported in WHERE clause via plan_query context".into(),
+            ))
+        }
+
+        // IN (subquery)
+        Expr::InSubquery {
+            expr: _inner,
+            subquery: _sq,
+            negated: _neg,
+        } => {
+            Err(SqlError::Plan(
+                "IN (subquery) not yet supported; use IN (value_list) instead".into(),
+            ))
+        }
+
         // Scalar functions and aggregate detection
         Expr::Function(f) => {
             let name = f.name.to_string().to_lowercase();
@@ -369,6 +472,17 @@ pub fn is_aggregate(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. } => is_aggregate(expr),
         Expr::Nested(inner) => is_aggregate(inner),
         Expr::Cast { expr, .. } => is_aggregate(expr),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_ref().map_or(false, |e| is_aggregate(e))
+                || conditions.iter().any(|c| is_aggregate(c))
+                || results.iter().any(|r| is_aggregate(r))
+                || else_result.as_ref().map_or(false, |e| is_aggregate(e))
+        }
         _ => false,
     }
 }
@@ -714,6 +828,10 @@ pub fn format_agg_name(func: &Function) -> String {
 pub fn expr_default_name(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(ident) => ident.value.to_lowercase(),
+        Expr::CompoundIdentifier(parts) => {
+            // Return just the column name, not the full qualified name
+            parts.last().map(|p| p.value.to_lowercase()).unwrap_or_default()
+        }
         _ => format!("{expr}").to_lowercase(),
     }
 }

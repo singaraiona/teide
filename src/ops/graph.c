@@ -313,6 +313,46 @@ td_op_t* td_or(td_graph_t* g, td_op_t* a, td_op_t* b) { return make_binary(g, OP
 td_op_t* td_min2(td_graph_t* g, td_op_t* a, td_op_t* b){ return make_binary(g, OP_MIN2, a, b, promote(a->out_type, b->out_type)); }
 td_op_t* td_max2(td_graph_t* g, td_op_t* a, td_op_t* b){ return make_binary(g, OP_MAX2, a, b, promote(a->out_type, b->out_type)); }
 
+td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_val) {
+    /* 3-input node: cond, then, else — needs ext node */
+    uint32_t cond_id = cond->id;
+    uint32_t then_id = then_val->id;
+    uint32_t else_id = else_val->id;
+    int8_t out_type = promote(then_val->out_type, else_val->out_type);
+    /* For string types, propagate SYM/ENUM/STR → SYM */
+    if (then_val->out_type == TD_SYM || then_val->out_type == TD_ENUM)
+        out_type = then_val->out_type;
+    else if (else_val->out_type == TD_SYM || else_val->out_type == TD_ENUM)
+        out_type = else_val->out_type;
+    else if (then_val->out_type == TD_STR || else_val->out_type == TD_STR)
+        out_type = TD_SYM;  /* string constants → intern as SYM */
+    uint32_t est = cond->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+
+    /* Re-resolve after potential realloc */
+    cond = &g->nodes[cond_id];
+    then_val = &g->nodes[then_id];
+    else_val = &g->nodes[else_id];
+
+    ext->base.opcode = OP_IF;
+    ext->base.arity = 2;  /* inputs[0]=cond, inputs[1]=then; else via ext */
+    ext->base.inputs[0] = cond;
+    ext->base.inputs[1] = then_val;
+    ext->base.out_type = out_type;
+    ext->base.est_rows = est;
+    /* Store else_val pointer via the literal field */
+    ext->literal = (td_t*)(uintptr_t)else_id;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern) {
+    return make_binary(g, OP_LIKE, input, pattern, TD_BOOL);
+}
+
 /* --------------------------------------------------------------------------
  * Reduction ops
  * -------------------------------------------------------------------------- */

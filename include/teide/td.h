@@ -219,6 +219,8 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_OR           32
 #define OP_MIN2         33
 #define OP_MAX2         34
+#define OP_IF           35
+#define OP_LIKE         36
 
 /* Opcodes — Reductions (pipeline breakers) */
 #define OP_SUM          50
@@ -502,6 +504,8 @@ td_op_t* td_and(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_or(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_min2(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_max2(td_graph_t* g, td_op_t* a, td_op_t* b);
+td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_val);
+td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern);
 
 /* Reduction ops */
 td_op_t* td_sum(td_graph_t* g, td_op_t* a);

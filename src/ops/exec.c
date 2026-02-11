@@ -1600,11 +1600,23 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     td_t* key_vecs[n_keys];
     memset(key_vecs, 0, n_keys * sizeof(td_t*));
 
+    uint8_t key_owned[n_keys]; /* 1 = we allocated via exec_node, must free */
+    memset(key_owned, 0, n_keys * sizeof(uint8_t));
     for (uint8_t k = 0; k < n_keys; k++) {
         td_op_t* key_op = ext->keys[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
             key_vecs[k] = td_table_get_col(df, key_ext->sym);
+        } else {
+            /* Expression key (CASE WHEN etc) — evaluate against current df */
+            td_t* saved_df = g->df;
+            g->df = df;
+            td_t* vec = exec_node(g, key_op);
+            g->df = saved_df;
+            if (vec && !TD_IS_ERR(vec)) {
+                key_vecs[k] = vec;
+                key_owned[k] = 1;
+            }
         }
     }
 
@@ -1986,6 +1998,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
             for (uint8_t a = 0; a < n_aggs; a++)
                 if (agg_owned[a] && agg_vecs[a]) td_release(agg_vecs[a]);
+            for (uint8_t k = 0; k < n_keys; k++)
+                if (key_owned[k] && key_vecs[k]) td_release(key_vecs[k]);
             return result;
         }
     }
@@ -2371,6 +2385,8 @@ cleanup:
     }
     for (uint8_t a = 0; a < n_aggs; a++)
         if (agg_owned[a] && agg_vecs[a]) td_release(agg_vecs[a]);
+    for (uint8_t k = 0; k < n_keys; k++)
+        if (key_owned[k] && key_vecs[k]) td_release(key_vecs[k]);
 
     return result;
 }
@@ -2572,6 +2588,188 @@ join_cleanup:
 }
 
 /* ============================================================================
+ * OP_IF: ternary select  result[i] = cond[i] ? then[i] : else[i]
+ * ============================================================================ */
+
+static td_t* exec_if(td_graph_t* g, td_op_t* op) {
+    /* cond = inputs[0], then = inputs[1], else_id stored in ext->literal */
+    td_t* cond_v = exec_node(g, op->inputs[0]);
+    td_t* then_v = exec_node(g, op->inputs[1]);
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    uint32_t else_id = (uint32_t)(uintptr_t)ext->literal;
+    td_t* else_v = exec_node(g, &g->nodes[else_id]);
+
+    if (!cond_v || TD_IS_ERR(cond_v)) {
+        if (then_v && !TD_IS_ERR(then_v)) td_release(then_v);
+        if (else_v && !TD_IS_ERR(else_v)) td_release(else_v);
+        return cond_v;
+    }
+    if (!then_v || TD_IS_ERR(then_v)) {
+        td_release(cond_v);
+        if (else_v && !TD_IS_ERR(else_v)) td_release(else_v);
+        return then_v;
+    }
+    if (!else_v || TD_IS_ERR(else_v)) {
+        td_release(cond_v); td_release(then_v);
+        return else_v;
+    }
+
+    int64_t len = cond_v->len;
+    bool then_scalar = td_is_atom(then_v);
+    bool else_scalar = td_is_atom(else_v);
+    if (then_scalar && !else_scalar) len = else_v->len;
+    if (!then_scalar) len = then_v->len;
+
+    int8_t out_type = op->out_type;
+    td_t* result = td_vec_new(out_type, len);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(cond_v); td_release(then_v); td_release(else_v);
+        return result;
+    }
+    result->len = len;
+
+    uint8_t* cond_p = (uint8_t*)td_data(cond_v);
+
+    if (out_type == TD_F64) {
+        double t_scalar = then_scalar ? then_v->f64 : 0;
+        double e_scalar = else_scalar ? else_v->f64 : 0;
+        double* t_arr = then_scalar ? NULL : (double*)td_data(then_v);
+        double* e_arr = else_scalar ? NULL : (double*)td_data(else_v);
+        double* dst = (double*)td_data(result);
+        for (int64_t i = 0; i < len; i++)
+            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
+                               : (e_arr ? e_arr[i] : e_scalar);
+    } else if (out_type == TD_I64 || out_type == TD_SYM) {
+        /* For SYM output with TD_STR scalar constants, intern to get SYM IDs */
+        int64_t t_scalar = 0, e_scalar = 0;
+        if (then_scalar) {
+            if (then_v->type == TD_ATOM_STR) {
+                t_scalar = td_sym_intern(td_str_ptr(then_v), td_str_len(then_v));
+            } else {
+                t_scalar = then_v->i64;
+            }
+        }
+        if (else_scalar) {
+            if (else_v->type == TD_ATOM_STR) {
+                e_scalar = td_sym_intern(td_str_ptr(else_v), td_str_len(else_v));
+            } else {
+                e_scalar = else_v->i64;
+            }
+        }
+        int64_t* t_arr = then_scalar ? NULL : (int64_t*)td_data(then_v);
+        int64_t* e_arr = else_scalar ? NULL : (int64_t*)td_data(else_v);
+        int64_t* dst = (int64_t*)td_data(result);
+        for (int64_t i = 0; i < len; i++)
+            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
+                               : (e_arr ? e_arr[i] : e_scalar);
+    } else if (out_type == TD_I32) {
+        int32_t t_scalar = then_scalar ? then_v->i32 : 0;
+        int32_t e_scalar = else_scalar ? else_v->i32 : 0;
+        int32_t* t_arr = then_scalar ? NULL : (int32_t*)td_data(then_v);
+        int32_t* e_arr = else_scalar ? NULL : (int32_t*)td_data(else_v);
+        int32_t* dst = (int32_t*)td_data(result);
+        for (int64_t i = 0; i < len; i++)
+            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
+                               : (e_arr ? e_arr[i] : e_scalar);
+    } else if (out_type == TD_ENUM) {
+        uint32_t t_scalar = then_scalar ? then_v->u32 : 0;
+        uint32_t e_scalar = else_scalar ? else_v->u32 : 0;
+        uint32_t* t_arr = then_scalar ? NULL : (uint32_t*)td_data(then_v);
+        uint32_t* e_arr = else_scalar ? NULL : (uint32_t*)td_data(else_v);
+        uint32_t* dst = (uint32_t*)td_data(result);
+        for (int64_t i = 0; i < len; i++)
+            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
+                               : (e_arr ? e_arr[i] : e_scalar);
+    } else if (out_type == TD_BOOL) {
+        uint8_t t_scalar = then_scalar ? then_v->b8 : 0;
+        uint8_t e_scalar = else_scalar ? else_v->b8 : 0;
+        uint8_t* t_arr = then_scalar ? NULL : (uint8_t*)td_data(then_v);
+        uint8_t* e_arr = else_scalar ? NULL : (uint8_t*)td_data(else_v);
+        uint8_t* dst = (uint8_t*)td_data(result);
+        for (int64_t i = 0; i < len; i++)
+            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
+                               : (e_arr ? e_arr[i] : e_scalar);
+    }
+
+    td_release(cond_v); td_release(then_v); td_release(else_v);
+    return result;
+}
+
+/* ============================================================================
+ * OP_LIKE: SQL LIKE pattern matching on SYM/ENUM columns
+ * ============================================================================ */
+
+/* Simple SQL LIKE matcher: % = any (including empty), _ = single char */
+static bool like_match(const char* str, size_t slen, const char* pat, size_t plen) {
+    size_t si = 0, pi = 0;
+    size_t star_p = (size_t)-1, star_s = 0;
+    while (si < slen) {
+        if (pi < plen && (pat[pi] == str[si] || pat[pi] == '_')) {
+            si++; pi++;
+        } else if (pi < plen && pat[pi] == '%') {
+            star_p = pi; star_s = si;
+            pi++;
+        } else if (star_p != (size_t)-1) {
+            pi = star_p + 1;
+            star_s++;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while (pi < plen && pat[pi] == '%') pi++;
+    return pi == plen;
+}
+
+static td_t* exec_like(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    td_t* pat_v = exec_node(g, op->inputs[1]);
+    if (!input || TD_IS_ERR(input)) { if (pat_v && !TD_IS_ERR(pat_v)) td_release(pat_v); return input; }
+    if (!pat_v || TD_IS_ERR(pat_v)) { td_release(input); return pat_v; }
+
+    /* Get pattern string */
+    const char* pat_str = td_str_ptr(pat_v);
+    size_t pat_len = td_str_len(pat_v);
+
+    int64_t len = input->len;
+    td_t* result = td_vec_new(TD_BOOL, len);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(input); td_release(pat_v);
+        return result;
+    }
+    result->len = len;
+    uint8_t* dst = (uint8_t*)td_data(result);
+
+    int8_t in_type = input->type;
+    if (in_type == TD_ENUM) {
+        uint32_t* data = (uint32_t*)td_data(input);
+        for (int64_t i = 0; i < len; i++) {
+            td_t* s = td_sym_str((int64_t)data[i]);
+            if (!s) { dst[i] = 0; continue; }
+            const char* sp = td_str_ptr(s);
+            size_t sl = td_str_len(s);
+            dst[i] = like_match(sp, sl, pat_str, pat_len) ? 1 : 0;
+        }
+    } else if (in_type == TD_SYM) {
+        int64_t* data = (int64_t*)td_data(input);
+        for (int64_t i = 0; i < len; i++) {
+            td_t* s = td_sym_str(data[i]);
+            if (!s) { dst[i] = 0; continue; }
+            const char* sp = td_str_ptr(s);
+            size_t sl = td_str_len(s);
+            dst[i] = like_match(sp, sl, pat_str, pat_len) ? 1 : 0;
+        }
+    } else {
+        /* Non-string type: all false */
+        memset(dst, 0, (size_t)len);
+    }
+
+    td_release(input); td_release(pat_v);
+    return result;
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -2747,6 +2945,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             }
             td_release(input);
             return result;
+        }
+
+        case OP_IF: {
+            return exec_if(g, op);
+        }
+
+        case OP_LIKE: {
+            return exec_like(g, op);
         }
 
         case OP_ALIAS: {

@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 
 #[allow(non_camel_case_types, dead_code)]
 mod ffi {
-    use std::os::raw::c_char;
+    use std::os::raw::{c_char, c_int};
 
     // ---- Core types -------------------------------------------------------
 
@@ -78,6 +78,7 @@ mod ffi {
     pub const OP_AVG: u16 = 55;
     pub const OP_FIRST: u16 = 56;
     pub const OP_LAST: u16 = 57;
+    pub const OP_COUNT_DISTINCT: u16 = 58;
 
     // ---- Error constants --------------------------------------------------
 
@@ -220,6 +221,7 @@ mod ffi {
         pub fn td_count(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
         pub fn td_first(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
         pub fn td_last(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_count_distinct(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
 
         // Structural ops
         pub fn td_filter(g: *mut td_graph_t, input: *mut td_op_t, predicate: *mut td_op_t) -> *mut td_op_t;
@@ -228,6 +230,7 @@ mod ffi {
             df_node: *mut td_op_t,
             keys: *mut *mut td_op_t,
             descs: *mut u8,
+            nulls_first: *mut u8,
             n_cols: u8,
         ) -> *mut td_op_t;
         pub fn td_group(
@@ -278,6 +281,29 @@ mod ffi {
             g: *mut td_graph_t,
             input: *mut td_op_t,
             pattern: *mut td_op_t,
+        ) -> *mut td_op_t;
+
+        // String functions
+        pub fn td_upper(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_lower(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_strlen(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_trim_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_substr(
+            g: *mut td_graph_t,
+            str_col: *mut td_op_t,
+            start: *mut td_op_t,
+            len: *mut td_op_t,
+        ) -> *mut td_op_t;
+        pub fn td_replace(
+            g: *mut td_graph_t,
+            str_col: *mut td_op_t,
+            from: *mut td_op_t,
+            to: *mut td_op_t,
+        ) -> *mut td_op_t;
+        pub fn td_concat(
+            g: *mut td_graph_t,
+            args: *mut *mut td_op_t,
+            n: c_int,
         ) -> *mut td_op_t;
 
         // Optimizer + executor
@@ -355,6 +381,7 @@ pub enum AggOp {
     Count,
     First,
     Last,
+    CountDistinct,
 }
 
 impl AggOp {
@@ -367,6 +394,7 @@ impl AggOp {
             AggOp::Count => ffi::OP_COUNT,
             AggOp::First => ffi::OP_FIRST,
             AggOp::Last => ffi::OP_LAST,
+            AggOp::CountDistinct => ffi::OP_COUNT_DISTINCT,
         }
     }
 }
@@ -806,6 +834,39 @@ impl Graph<'_> {
         }
     }
 
+    // ---- String ops -------------------------------------------------------
+
+    pub fn upper(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_upper(self.raw, a.raw) } }
+    }
+
+    pub fn lower(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_lower(self.raw, a.raw) } }
+    }
+
+    pub fn strlen(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_strlen(self.raw, a.raw) } }
+    }
+
+    pub fn trim(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_trim_op(self.raw, a.raw) } }
+    }
+
+    pub fn substr(&self, s: Column, start: Column, len: Column) -> Column {
+        Column { raw: unsafe { ffi::td_substr(self.raw, s.raw, start.raw, len.raw) } }
+    }
+
+    pub fn replace(&self, s: Column, from: Column, to: Column) -> Column {
+        Column { raw: unsafe { ffi::td_replace(self.raw, s.raw, from.raw, to.raw) } }
+    }
+
+    pub fn concat(&self, args: &[Column]) -> Column {
+        let mut ptrs: Vec<*mut ffi::td_op_t> = args.iter().map(|c| c.raw).collect();
+        Column {
+            raw: unsafe { ffi::td_concat(self.raw, ptrs.as_mut_ptr(), args.len() as std::ffi::c_int) },
+        }
+    }
+
     // ---- Unary ops --------------------------------------------------------
 
     pub fn not(&self, a: Column) -> Column {
@@ -961,7 +1022,13 @@ impl Graph<'_> {
     }
 
     /// Multi-column sort.
-    pub fn sort(&mut self, df_node: Column, keys: &[Column], descs: &[bool]) -> Column {
+    pub fn sort(
+        &mut self,
+        df_node: Column,
+        keys: &[Column],
+        descs: &[bool],
+        nulls_first: Option<&[bool]>,
+    ) -> Column {
         assert_eq!(
             keys.len(),
             descs.len(),
@@ -971,12 +1038,23 @@ impl Graph<'_> {
         let mut key_ptrs: Vec<*mut ffi::td_op_t> = keys.iter().map(|c| c.raw).collect();
         let mut desc_u8: Vec<u8> = descs.iter().map(|&d| d as u8).collect();
 
+        let nf_ptr = if let Some(nf) = nulls_first {
+            assert_eq!(keys.len(), nf.len(), "nulls_first must match keys length");
+            let mut nf_u8: Vec<u8> = nf.iter().map(|&n| n as u8).collect();
+            let ptr = nf_u8.as_mut_ptr();
+            self._pinned.push(Box::new(nf_u8));
+            ptr
+        } else {
+            std::ptr::null_mut()
+        };
+
         let raw = unsafe {
             ffi::td_sort_op(
                 self.raw,
                 df_node.raw,
                 key_ptrs.as_mut_ptr(),
                 desc_u8.as_mut_ptr(),
+                nf_ptr,
                 keys.len() as u8,
             )
         };

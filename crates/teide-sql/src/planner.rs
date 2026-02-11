@@ -13,7 +13,8 @@ use teide::{Column, Context, Graph, Table};
 
 use crate::expr::{
     agg_op_from_name, collect_aggregates, expr_default_name, format_agg_name, is_aggregate,
-    is_pure_aggregate, plan_agg_input, plan_expr, plan_having_expr, plan_post_agg_expr,
+    is_count_distinct, is_pure_aggregate, plan_agg_input, plan_expr, plan_having_expr,
+    plan_post_agg_expr,
 };
 use crate::{ExecResult, Session, SqlError, SqlResult, StoredTable};
 
@@ -257,11 +258,16 @@ fn plan_query(
         _ => false,
     });
 
-    // Stage 1: WHERE filter
+    // Stage 1: WHERE filter (resolve subqueries first)
     let working_table = if let Some(ref where_expr) = select.selection {
+        let resolved = if has_subqueries(where_expr) {
+            resolve_subqueries(ctx, where_expr, effective_tables)?
+        } else {
+            where_expr.clone()
+        };
         let mut g = ctx.graph(&table);
         let df_node = g.const_df(&table);
-        let pred = plan_expr(&mut g, where_expr, &schema)?;
+        let pred = plan_expr(&mut g, &resolved, &schema)?;
         let filtered = g.filter(df_node, pred);
         g.execute(filtered)?
     } else {
@@ -319,9 +325,12 @@ fn plan_query(
     // Stage 3: ORDER BY
     let order_by_exprs = extract_order_by(query)?;
     let result_table = if !order_by_exprs.is_empty() {
+        let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
+            .map(|i| result_table.col_name_str(i).to_string())
+            .collect();
         let mut g = ctx.graph(&result_table);
         let df_node = g.const_df(&result_table);
-        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases)?;
+        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
         g.execute(root)?
     } else {
         result_table
@@ -701,6 +710,21 @@ fn plan_group_select(
         }
     }
 
+    // Check for COUNT(DISTINCT col) — handle via two-phase aggregation
+    let has_count_distinct = all_aggs.iter().any(|a| is_count_distinct(&a.func));
+    if has_count_distinct {
+        return plan_count_distinct_group(
+            ctx,
+            working_table,
+            &key_names,
+            &all_aggs,
+            &select_plan,
+            &final_aliases,
+            schema,
+            alias_exprs,
+        );
+    }
+
     // Phase 2: Execute GROUP BY with keys + all unique aggregates
     let mut g = ctx.graph(working_table);
 
@@ -817,6 +841,179 @@ enum SelectPlan {
     KeyRef(String),
     PureAgg(usize, String), // (agg index, display alias)
     PostAggExpr(Expr, String),
+}
+
+// ---------------------------------------------------------------------------
+// COUNT(DISTINCT) via two-phase GROUP BY
+// ---------------------------------------------------------------------------
+
+/// Handle GROUP BY queries containing COUNT(DISTINCT col).
+/// Phase 1: GROUP BY [original_keys + distinct_col] to get unique combos
+/// Phase 2: GROUP BY [original_keys] with COUNT(*) to count unique values
+/// Non-DISTINCT aggregates are computed in phase 1 and use FIRST in phase 2.
+#[allow(clippy::too_many_arguments)]
+fn plan_count_distinct_group(
+    ctx: &Context,
+    working_table: &Table,
+    key_names: &[String],
+    all_aggs: &[AggInfo],
+    _select_plan: &[SelectPlan],
+    final_aliases: &[String],
+    schema: &HashMap<String, usize>,
+    alias_exprs: &HashMap<String, Expr>,
+) -> Result<(Table, Vec<String>), SqlError> {
+    // Collect the DISTINCT column names and regular aggs
+    let mut distinct_cols: Vec<String> = Vec::new();
+    let mut regular_aggs: Vec<&AggInfo> = Vec::new();
+
+    for agg in all_aggs {
+        if is_count_distinct(&agg.func) {
+            // Extract the column name from the aggregate argument
+            if let sqlparser::ast::FunctionArguments::List(args) = &agg.func.args {
+                if let Some(sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(ident)),
+                )) = args.args.first()
+                {
+                    let col = ident.value.to_lowercase();
+                    if !distinct_cols.contains(&col) {
+                        distinct_cols.push(col);
+                    }
+                } else {
+                    return Err(SqlError::Plan(
+                        "COUNT(DISTINCT) requires a simple column reference".into(),
+                    ));
+                }
+            }
+        } else {
+            regular_aggs.push(agg);
+        }
+    }
+
+    // Phase 1: GROUP BY [original_keys + distinct_cols] with regular aggs
+    let mut phase1_keys: Vec<String> = key_names.to_vec();
+    for dc in &distinct_cols {
+        if !phase1_keys.contains(dc) {
+            phase1_keys.push(dc.clone());
+        }
+    }
+
+    let mut g = ctx.graph(working_table);
+    let mut key_nodes: Vec<Column> = Vec::new();
+    for k in &phase1_keys {
+        if let Some(expr) = alias_exprs.get(k) {
+            key_nodes.push(plan_expr(&mut g, expr, schema)?);
+        } else {
+            key_nodes.push(g.scan(k));
+        }
+    }
+
+    // Regular aggregates computed in phase 1
+    let mut phase1_agg_ops = Vec::new();
+    let mut phase1_agg_inputs = Vec::new();
+    for agg in &regular_aggs {
+        let op = agg_op_from_name(&agg.func_name)?;
+        let input = plan_agg_input(&mut g, &agg.func, schema)?;
+        phase1_agg_ops.push(op);
+        phase1_agg_inputs.push(input);
+    }
+
+    // Need at least one aggregate; if only COUNT(DISTINCT), use dummy COUNT(*)
+    if phase1_agg_ops.is_empty() {
+        let first_col = schema
+            .iter()
+            .min_by_key(|(_, v)| **v)
+            .map(|(k, _)| k.clone())
+            .ok_or_else(|| SqlError::Plan("Empty schema".into()))?;
+        phase1_agg_ops.push(teide::AggOp::Count);
+        phase1_agg_inputs.push(g.scan(&first_col));
+    }
+
+    let group_node = g.group_by(&key_nodes, &phase1_agg_ops, &phase1_agg_inputs);
+    let phase1_result = g.execute(group_node)?;
+
+    // Phase 2: GROUP BY [original_keys] with COUNT(*) for each distinct col
+    // and FIRST for each regular aggregate
+    let mut g2 = ctx.graph(&phase1_result);
+    let phase2_keys: Vec<Column> = key_names.iter().map(|k| g2.scan(k)).collect();
+
+    // For no-GROUP-BY case (e.g., SELECT COUNT(DISTINCT id1) FROM t),
+    // we need a scalar reduction. Use the distinct col as key in phase 1,
+    // then count rows.
+    if key_names.is_empty() {
+        // Phase 1 grouped by distinct_cols → nrows = unique count.
+        // Use a scalar GROUP BY (no keys) with COUNT(*) to produce a 1-row table.
+        let first_col_name = phase1_result.col_name_str(0).to_string();
+        let mut g2 = ctx.graph(&phase1_result);
+        let count_input = g2.scan(&first_col_name);
+        let group_node = g2.group_by(&[], &[teide::AggOp::Count], &[count_input]);
+        let result = g2.execute(group_node)?;
+        return Ok((result, final_aliases.to_vec()));
+    }
+
+    let mut phase2_agg_ops = Vec::new();
+    let mut phase2_agg_inputs = Vec::new();
+
+    // COUNT(DISTINCT col) → COUNT(*) on the distinct col (counts unique groups)
+    for dc in &distinct_cols {
+        phase2_agg_ops.push(teide::AggOp::Count);
+        phase2_agg_inputs.push(g2.scan(dc));
+    }
+
+    // Regular aggs → re-aggregate in phase 2 with compatible ops:
+    // SUM→SUM, MIN→MIN, MAX→MAX, COUNT→SUM (sum of partial counts), AVG→not directly supported
+    let phase1_schema = build_schema(&phase1_result);
+    for agg in &regular_aggs {
+        let native = predict_phase1_col(&phase1_result, &agg.alias, phase1_keys.len(), all_aggs, agg);
+        if phase1_schema.contains_key(&native) {
+            let phase2_op = match agg.func_name.as_str() {
+                "sum" => teide::AggOp::Sum,
+                "min" => teide::AggOp::Min,
+                "max" => teide::AggOp::Max,
+                "count" => teide::AggOp::Sum, // sum of partial counts
+                "avg" => {
+                    return Err(SqlError::Plan(
+                        "AVG cannot be mixed with COUNT(DISTINCT) yet".into(),
+                    ));
+                }
+                _ => teide::AggOp::First,
+            };
+            phase2_agg_ops.push(phase2_op);
+            phase2_agg_inputs.push(g2.scan(&native));
+        } else {
+            return Err(SqlError::Plan(format!(
+                "Aggregate '{}' not found in phase 1 result (looked for '{}')",
+                agg.alias, native
+            )));
+        }
+    }
+
+    let group_node2 = g2.group_by(&phase2_keys, &phase2_agg_ops, &phase2_agg_inputs);
+    let phase2_result = g2.execute(group_node2)?;
+
+    Ok((phase2_result, final_aliases.to_vec()))
+}
+
+/// Predict the native column name for an aggregate in the phase 1 result.
+fn predict_phase1_col(
+    result: &Table,
+    _alias: &str,
+    n_keys: usize,
+    all_aggs: &[AggInfo],
+    target: &AggInfo,
+) -> String {
+    // Find the index of this agg among non-count-distinct aggs
+    let mut reg_idx = 0;
+    for agg in all_aggs {
+        if std::ptr::eq(agg, target) {
+            break;
+        }
+        if !is_count_distinct(&agg.func) {
+            reg_idx += 1;
+        }
+    }
+    // The phase1 result has keys first, then regular agg columns
+    let col_idx = n_keys + reg_idx;
+    result.col_name_str(col_idx).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -968,9 +1165,12 @@ fn apply_post_processing(
     // ORDER BY
     let order_by_exprs = extract_order_by(query)?;
     let result_table = if !order_by_exprs.is_empty() {
+        let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
+            .map(|i| result_table.col_name_str(i).to_string())
+            .collect();
         let mut g = ctx.graph(&result_table);
         let df_node = g.const_df(&result_table);
-        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases)?;
+        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
         g.execute(root)?
     } else {
         result_table
@@ -1040,7 +1240,144 @@ fn build_schema(table: &Table) -> HashMap<String, usize> {
     map
 }
 
+// ---------------------------------------------------------------------------
+// Subquery resolution: walk AST, execute subqueries, replace with literals
+// ---------------------------------------------------------------------------
 
+/// Recursively walk an expression and replace scalar subqueries and IN subqueries
+/// with their evaluated values.
+fn resolve_subqueries(
+    ctx: &Context,
+    expr: &Expr,
+    tables: Option<&HashMap<String, StoredTable>>,
+) -> Result<Expr, SqlError> {
+    match expr {
+        // Scalar subquery: (SELECT single_value FROM ...)
+        Expr::Subquery(query) => {
+            let result = plan_query(ctx, query, tables)?;
+            if result.columns.len() != 1 {
+                return Err(SqlError::Plan(format!(
+                    "Scalar subquery must return exactly 1 column, got {}",
+                    result.columns.len()
+                )));
+            }
+            let nrows = result.table.nrows();
+            if nrows != 1 {
+                return Err(SqlError::Plan(format!(
+                    "Scalar subquery must return exactly 1 row, got {}",
+                    nrows
+                )));
+            }
+            scalar_value_from_table(&result.table, 0, 0)
+        }
+
+        // IN (subquery): rewrite to IN (value_list)
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => {
+            let resolved_inner = resolve_subqueries(ctx, inner, tables)?;
+            let result = plan_query(ctx, subquery, tables)?;
+            if result.columns.len() != 1 {
+                return Err(SqlError::Plan(format!(
+                    "IN subquery must return exactly 1 column, got {}",
+                    result.columns.len()
+                )));
+            }
+            let nrows = result.table.nrows() as usize;
+            let mut values = Vec::with_capacity(nrows);
+            for r in 0..nrows {
+                values.push(scalar_value_from_table(&result.table, 0, r)?);
+            }
+            Ok(Expr::InList {
+                expr: Box::new(resolved_inner),
+                list: values,
+                negated: *negated,
+            })
+        }
+
+        // Recurse into compound expressions
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(resolve_subqueries(ctx, left, tables)?),
+            op: op.clone(),
+            right: Box::new(resolve_subqueries(ctx, right, tables)?),
+        }),
+        Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(resolve_subqueries(ctx, inner, tables)?),
+        }),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
+            resolve_subqueries(ctx, inner, tables)?,
+        ))),
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => Ok(Expr::Between {
+            expr: Box::new(resolve_subqueries(ctx, inner, tables)?),
+            negated: *negated,
+            low: Box::new(resolve_subqueries(ctx, low, tables)?),
+            high: Box::new(resolve_subqueries(ctx, high, tables)?),
+        }),
+        Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
+            resolve_subqueries(ctx, inner, tables)?,
+        ))),
+        Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
+            resolve_subqueries(ctx, inner, tables)?,
+        ))),
+
+        // Leaf nodes: no subqueries to resolve
+        _ => Ok(expr.clone()),
+    }
+}
+
+/// Extract a scalar value from a result table cell as an AST expression literal.
+fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr, SqlError> {
+    let col_type = table.col_type(col);
+    match col_type {
+        teide::types::F64 => {
+            let v = table.get_f64(col, row).unwrap_or(f64::NAN);
+            if v.is_nan() {
+                Ok(Expr::Value(Value::Null))
+            } else {
+                Ok(Expr::Value(Value::Number(format!("{v}"), false)))
+            }
+        }
+        teide::types::I64 | teide::types::I32 => {
+            let v = table.get_i64(col, row).unwrap_or(0);
+            Ok(Expr::Value(Value::Number(format!("{v}"), false)))
+        }
+        teide::types::SYM | teide::types::ENUM => {
+            let v = table.get_str(col, row).unwrap_or("");
+            Ok(Expr::Value(Value::SingleQuotedString(v.to_string())))
+        }
+        teide::types::BOOL => {
+            let v = table.get_i64(col, row).unwrap_or(0);
+            Ok(Expr::Value(Value::Boolean(v != 0)))
+        }
+        _ => Err(SqlError::Plan(format!(
+            "Unsupported column type {} in subquery result",
+            col_type
+        ))),
+    }
+}
+
+/// Check if an expression tree contains any subqueries that need resolution.
+fn has_subqueries(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) | Expr::InSubquery { .. } => true,
+        Expr::BinaryOp { left, right, .. } => has_subqueries(left) || has_subqueries(right),
+        Expr::UnaryOp { expr, .. } => has_subqueries(expr),
+        Expr::Nested(inner) => has_subqueries(inner),
+        Expr::Between {
+            expr, low, high, ..
+        } => has_subqueries(expr) || has_subqueries(low) || has_subqueries(high),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => has_subqueries(inner),
+        _ => false,
+    }
+}
 
 /// Extract GROUP BY column names.
 /// Accepts table column names or SELECT alias names (for expression-based keys).
@@ -1110,51 +1447,105 @@ fn extract_projection_aliases(
     Ok(aliases)
 }
 
-/// Extract ORDER BY expressions from the query.
-fn extract_order_by(query: &Query) -> Result<Vec<(String, bool)>, SqlError> {
+/// An ORDER BY item: either a column name, positional index, or arbitrary expression.
+enum OrderByItem {
+    Name(String),
+    Position(usize), // 1-based index
+    Expression(Expr),
+}
+
+/// Extract ORDER BY items from the query.
+fn extract_order_by(query: &Query) -> Result<Vec<(OrderByItem, bool, Option<bool>)>, SqlError> {
     match &query.order_by {
         None => Ok(Vec::new()),
         Some(order_by) => {
             let mut result = Vec::new();
             for ob in &order_by.exprs {
-                let name = match &ob.expr {
-                    Expr::Identifier(ident) => ident.value.to_lowercase(),
-                    _ => {
-                        return Err(SqlError::Plan(
-                            "Only column/alias names supported in ORDER BY".into(),
-                        ))
+                let item = match &ob.expr {
+                    Expr::Identifier(ident) => OrderByItem::Name(ident.value.to_lowercase()),
+                    Expr::Value(Value::Number(n, _)) => {
+                        let pos = n.parse::<usize>().map_err(|_| {
+                            SqlError::Plan(format!("Invalid positional ORDER BY: {n}"))
+                        })?;
+                        if pos == 0 {
+                            return Err(SqlError::Plan(
+                                "ORDER BY position is 1-based, got 0".into(),
+                            ));
+                        }
+                        OrderByItem::Position(pos)
                     }
+                    other => OrderByItem::Expression(other.clone()),
                 };
                 let desc = ob.asc.map(|asc| !asc).unwrap_or(false);
-                result.push((name, desc));
+                // ob.nulls_first: Some(true)=NULLS FIRST, Some(false)=NULLS LAST, None=default
+                result.push((item, desc, ob.nulls_first));
             }
             Ok(result)
         }
     }
 }
 
-/// Plan ORDER BY.
+/// Plan ORDER BY: handles column names, positional refs, and expressions.
+/// `table_col_names` are the actual C-level column names in the table (may differ
+/// from `result_aliases` when expressions produce internal names like `_e1`).
 fn plan_order_by(
     g: &mut Graph,
     input: Column,
-    order_by: &[(String, bool)],
+    order_by: &[(OrderByItem, bool, Option<bool>)],
     result_aliases: &[String],
+    table_col_names: &[String],
 ) -> Result<Column, SqlError> {
+    // Build a schema from the result aliases for expression planning
+    let schema: HashMap<String, usize> = result_aliases
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), i))
+        .collect();
+
     let mut sort_keys = Vec::new();
     let mut descs = Vec::new();
+    let mut has_explicit_nulls = false;
+    let mut nulls_first_flags: Vec<bool> = Vec::new();
 
-    for (name, desc) in order_by {
-        if !result_aliases.contains(name) {
-            return Err(SqlError::Plan(format!(
-                "ORDER BY column '{}' not found in result columns",
-                name
-            )));
-        }
-        sort_keys.push(g.scan(name));
+    for (item, desc, nulls_first) in order_by {
+        let key = match item {
+            OrderByItem::Name(name) => {
+                let idx = result_aliases.iter().position(|a| a == name).ok_or_else(|| {
+                    SqlError::Plan(format!(
+                        "ORDER BY column '{}' not found in result columns",
+                        name
+                    ))
+                })?;
+                // Use actual table column name, not the SQL alias
+                g.scan(&table_col_names[idx])
+            }
+            OrderByItem::Position(pos) => {
+                if *pos > result_aliases.len() {
+                    return Err(SqlError::Plan(format!(
+                        "ORDER BY position {} exceeds column count {}",
+                        pos,
+                        result_aliases.len()
+                    )));
+                }
+                g.scan(&table_col_names[*pos - 1])
+            }
+            OrderByItem::Expression(expr) => plan_expr(g, expr, &schema)?,
+        };
+        sort_keys.push(key);
         descs.push(*desc);
+        if nulls_first.is_some() {
+            has_explicit_nulls = true;
+        }
+        // Default: NULLS LAST for ASC, NULLS FIRST for DESC (PostgreSQL convention)
+        nulls_first_flags.push(nulls_first.unwrap_or(*desc));
     }
 
-    Ok(g.sort(input, &sort_keys, &descs))
+    let nf = if has_explicit_nulls {
+        Some(nulls_first_flags.as_slice())
+    } else {
+        None // let C-side apply defaults
+    };
+    Ok(g.sort(input, &sort_keys, &descs, nf))
 }
 
 /// Extract LIMIT value.

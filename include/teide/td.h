@@ -221,6 +221,13 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_MAX2         34
 #define OP_IF           35
 #define OP_LIKE         36
+#define OP_UPPER        37
+#define OP_LOWER        38
+#define OP_STRLEN       39
+#define OP_SUBSTR       40
+#define OP_REPLACE      41
+#define OP_TRIM         42
+#define OP_CONCAT       43
 
 /* Opcodes — Reductions (pipeline breakers) */
 #define OP_SUM          50
@@ -231,6 +238,7 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_AVG          55
 #define OP_FIRST        56
 #define OP_LAST         57
+#define OP_COUNT_DISTINCT 58
 
 /* Opcodes — Structural (pipeline breakers) */
 #define OP_FILTER       60
@@ -280,6 +288,7 @@ typedef struct td_op_ext {
         struct {               /* OP_SORT: multi-column sort */
             td_op_t**  columns;
             uint8_t*   desc;
+            uint8_t*   nulls_first; /* 1=nulls first, 0=nulls last */
             uint8_t    n_cols;
         } sort;
         struct {               /* OP_JOIN: join specification */
@@ -506,6 +515,13 @@ td_op_t* td_min2(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_max2(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_val);
 td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern);
+td_op_t* td_upper(td_graph_t* g, td_op_t* a);
+td_op_t* td_lower(td_graph_t* g, td_op_t* a);
+td_op_t* td_strlen(td_graph_t* g, td_op_t* a);
+td_op_t* td_substr(td_graph_t* g, td_op_t* str, td_op_t* start, td_op_t* len);
+td_op_t* td_replace(td_graph_t* g, td_op_t* str, td_op_t* from, td_op_t* to);
+td_op_t* td_trim_op(td_graph_t* g, td_op_t* a);
+td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n);
 
 /* Reduction ops */
 td_op_t* td_sum(td_graph_t* g, td_op_t* a);
@@ -516,11 +532,13 @@ td_op_t* td_count(td_graph_t* g, td_op_t* a);
 td_op_t* td_avg(td_graph_t* g, td_op_t* a);
 td_op_t* td_first(td_graph_t* g, td_op_t* a);
 td_op_t* td_last(td_graph_t* g, td_op_t* a);
+td_op_t* td_count_distinct(td_graph_t* g, td_op_t* a);
 
 /* Structural ops */
 td_op_t* td_filter(td_graph_t* g, td_op_t* input, td_op_t* predicate);
 td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
-                     td_op_t** keys, uint8_t* descs, uint8_t n_cols);
+                     td_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
+                     uint8_t n_cols);
 td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
                    uint16_t* agg_ops, td_op_t** agg_ins, uint8_t n_aggs);
 td_op_t* td_join(td_graph_t* g,

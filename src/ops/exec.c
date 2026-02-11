@@ -4,6 +4,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <ctype.h>
 
 /* --------------------------------------------------------------------------
  * Arena-based scratch allocation helpers
@@ -565,6 +566,9 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
  * Sort execution (simple insertion sort)
  * ============================================================================ */
 
+/* Forward declaration — exec_node is defined later */
+static td_t* exec_node(td_graph_t* g, td_op_t* op);
+
 static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     if (!df || TD_IS_ERR(df)) return df;
 
@@ -581,7 +585,9 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     for (int64_t i = 0; i < nrows; i++) indices[i] = i;
 
     td_t* sort_vecs[n_sort];
+    uint8_t sort_owned[n_sort];
     memset(sort_vecs, 0, n_sort * sizeof(td_t*));
+    memset(sort_owned, 0, n_sort);
 
     for (uint8_t k = 0; k < n_sort; k++) {
         td_op_t* key_op = ext->sort.columns[k];
@@ -589,7 +595,12 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
             sort_vecs[k] = td_table_get_col(df, key_ext->sym);
         } else {
-            sort_vecs[k] = NULL;
+            /* Expression key: evaluate against current DataFrame */
+            td_t* saved = g->df;
+            g->df = df;
+            sort_vecs[k] = exec_node(g, key_op);
+            g->df = saved;
+            sort_owned[k] = 1;
         }
     }
 
@@ -603,11 +614,18 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
                 td_t* col = sort_vecs[k];
                 if (!col) continue;
                 int desc = ext->sort.desc ? ext->sort.desc[k] : 0;
+                int nf = ext->sort.nulls_first ? ext->sort.nulls_first[k] : desc;
+                int null_cmp = 0;
 
                 if (col->type == TD_F64) {
                     double a = ((double*)td_data(col))[ij];
                     double b = ((double*)td_data(col))[key];
-                    if (a < b) cmp = -1;
+                    int a_null = isnan(a);
+                    int b_null = isnan(b);
+                    if (a_null && b_null) { cmp = 0; null_cmp = 1; }
+                    else if (a_null) { cmp = nf ? -1 : 1; null_cmp = 1; }
+                    else if (b_null) { cmp = nf ? 1 : -1; null_cmp = 1; }
+                    else if (a < b) cmp = -1;
                     else if (a > b) cmp = 1;
                 } else if (col->type == TD_I64 || col->type == TD_SYM || col->type == TD_TIMESTAMP) {
                     int64_t a = ((int64_t*)td_data(col))[ij];
@@ -627,7 +645,9 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
                     if (sa && sb) cmp = td_str_cmp(sa, sb);
                 }
 
-                if (desc) cmp = -cmp;
+                /* Null comparisons already encode absolute direction;
+                   only flip for non-null value comparisons */
+                if (desc && !null_cmp) cmp = -cmp;
             }
             if (cmp <= 0) break;
             indices[j + 1] = indices[j];
@@ -661,12 +681,15 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         td_release(new_col);
     }
 
+    /* Free expression-evaluated sort keys */
+    for (uint8_t k = 0; k < n_sort; k++) {
+        if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+            td_release(sort_vecs[k]);
+    }
+
     scratch_free(indices_hdr);
     return result;
 }
-
-/* Forward declaration — exec_node is defined after exec_group */
-static td_t* exec_node(td_graph_t* g, td_op_t* op);
 
 /* ============================================================================
  * Group-by execution — with parallel local hash tables + merge
@@ -2770,6 +2793,229 @@ static td_t* exec_like(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
+ * String functions: UPPER, LOWER, TRIM, STRLEN, SUBSTR, REPLACE, CONCAT
+ * ============================================================================ */
+
+/* Helper: resolve sym/enum element to string */
+static inline void sym_elem(const td_t* input, int64_t i,
+                            const char** out_str, size_t* out_len) {
+    int64_t sym_id;
+    if (input->type == TD_ENUM)
+        sym_id = (int64_t)((const uint32_t*)td_data((td_t*)input))[i];
+    else
+        sym_id = ((const int64_t*)td_data((td_t*)input))[i];
+    td_t* atom = td_sym_str(sym_id);
+    if (!atom) { *out_str = ""; *out_len = 0; return; }
+    *out_str = td_str_ptr(atom);
+    *out_len = td_str_len(atom);
+}
+
+/* UPPER / LOWER / TRIM — unary SYM/ENUM → SYM */
+static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    if (!input || TD_IS_ERR(input)) return input;
+
+    int64_t len = input->len;
+    td_t* result = td_vec_new(TD_SYM, len);
+    if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
+    result->len = len;
+    int64_t* dst = (int64_t*)td_data(result);
+
+    uint16_t opc = op->opcode;
+    for (int64_t i = 0; i < len; i++) {
+        const char* sp; size_t sl;
+        sym_elem(input, i, &sp, &sl);
+        char buf[1024];
+        size_t out_len = sl < sizeof(buf) ? sl : sizeof(buf) - 1;
+        if (opc == OP_UPPER) {
+            for (size_t j = 0; j < out_len; j++) buf[j] = (char)toupper((unsigned char)sp[j]);
+        } else if (opc == OP_LOWER) {
+            for (size_t j = 0; j < out_len; j++) buf[j] = (char)tolower((unsigned char)sp[j]);
+        } else { /* OP_TRIM */
+            size_t start = 0, end = sl;
+            while (start < sl && isspace((unsigned char)sp[start])) start++;
+            while (end > start && isspace((unsigned char)sp[end - 1])) end--;
+            out_len = end - start;
+            if (out_len > sizeof(buf) - 1) out_len = sizeof(buf) - 1;
+            memcpy(buf, sp + start, out_len);
+        }
+        buf[out_len] = '\0';
+        dst[i] = td_sym_intern(buf, out_len);
+    }
+    td_release(input);
+    return result;
+}
+
+/* LENGTH — SYM/ENUM → I64 */
+static td_t* exec_strlen(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    if (!input || TD_IS_ERR(input)) return input;
+
+    int64_t len = input->len;
+    td_t* result = td_vec_new(TD_I64, len);
+    if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
+    result->len = len;
+    int64_t* dst = (int64_t*)td_data(result);
+
+    for (int64_t i = 0; i < len; i++) {
+        const char* sp; size_t sl;
+        sym_elem(input, i, &sp, &sl);
+        dst[i] = (int64_t)sl;
+    }
+    td_release(input);
+    return result;
+}
+
+/* SUBSTR(str, start, len) — 1-based start */
+static td_t* exec_substr(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    td_t* start_v = exec_node(g, op->inputs[1]);
+    if (!input || TD_IS_ERR(input)) { if (start_v && !TD_IS_ERR(start_v)) td_release(start_v); return input; }
+    if (!start_v || TD_IS_ERR(start_v)) { td_release(input); return start_v; }
+
+    /* Get len arg from ext node's literal field */
+    td_op_ext_t* ext = find_ext(g, op->id);
+    uint32_t len_id = (uint32_t)(uintptr_t)ext->literal;
+    td_t* len_v = exec_node(g, &g->nodes[len_id]);
+    if (!len_v || TD_IS_ERR(len_v)) { td_release(input); td_release(start_v); return len_v; }
+
+    int64_t nrows = input->len;
+    td_t* result = td_vec_new(TD_SYM, nrows);
+    if (!result || TD_IS_ERR(result)) { td_release(input); td_release(start_v); td_release(len_v); return result; }
+    result->len = nrows;
+    int64_t* dst = (int64_t*)td_data(result);
+
+    /* start_v and len_v may be atom scalars or vectors */
+    int64_t s_scalar = 0, l_scalar = 0;
+    const int64_t* s_data = NULL;
+    const int64_t* l_data = NULL;
+    if (start_v->type == TD_ATOM_I64) s_scalar = start_v->i64;
+    else if (start_v->type == TD_ATOM_F64) s_scalar = (int64_t)start_v->f64;
+    else if (start_v->len == 1) s_scalar = ((int64_t*)td_data(start_v))[0];
+    else s_data = (const int64_t*)td_data(start_v);
+    if (len_v->type == TD_ATOM_I64) l_scalar = len_v->i64;
+    else if (len_v->type == TD_ATOM_F64) l_scalar = (int64_t)len_v->f64;
+    else if (len_v->len == 1) l_scalar = ((int64_t*)td_data(len_v))[0];
+    else l_data = (const int64_t*)td_data(len_v);
+
+    for (int64_t i = 0; i < nrows; i++) {
+        const char* sp; size_t sl;
+        sym_elem(input, i, &sp, &sl);
+        int64_t st = (s_data ? s_data[i] : s_scalar) - 1; /* 1-based → 0-based */
+        int64_t ln = l_data ? l_data[i] : l_scalar;
+        if (st < 0) st = 0;
+        if ((size_t)st >= sl) { dst[i] = td_sym_intern("", 0); continue; }
+        if (ln < 0 || ln > (int64_t)(sl - (size_t)st)) ln = (int64_t)sl - st;
+        dst[i] = td_sym_intern(sp + st, (size_t)ln);
+    }
+    td_release(input); td_release(start_v); td_release(len_v);
+    return result;
+}
+
+/* REPLACE(str, from, to) */
+static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    td_t* from_v = exec_node(g, op->inputs[1]);
+    if (!input || TD_IS_ERR(input)) { if (from_v && !TD_IS_ERR(from_v)) td_release(from_v); return input; }
+    if (!from_v || TD_IS_ERR(from_v)) { td_release(input); return from_v; }
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    uint32_t to_id = (uint32_t)(uintptr_t)ext->literal;
+    td_t* to_v = exec_node(g, &g->nodes[to_id]);
+    if (!to_v || TD_IS_ERR(to_v)) { td_release(input); td_release(from_v); return to_v; }
+
+    /* from_v and to_v should be string constants (SYM atoms) */
+    const char* from_str = td_str_ptr(from_v);
+    size_t from_len = td_str_len(from_v);
+    const char* to_str = td_str_ptr(to_v);
+    size_t to_len = td_str_len(to_v);
+
+    int64_t nrows = input->len;
+    td_t* result = td_vec_new(TD_SYM, nrows);
+    if (!result || TD_IS_ERR(result)) { td_release(input); td_release(from_v); td_release(to_v); return result; }
+    result->len = nrows;
+    int64_t* dst = (int64_t*)td_data(result);
+
+    for (int64_t i = 0; i < nrows; i++) {
+        const char* sp; size_t sl;
+        sym_elem(input, i, &sp, &sl);
+        /* Simple find-and-replace-all */
+        char buf[4096];
+        size_t bi = 0;
+        for (size_t j = 0; j < sl; ) {
+            if (from_len > 0 && j + from_len <= sl && memcmp(sp + j, from_str, from_len) == 0) {
+                if (bi + to_len < sizeof(buf)) { memcpy(buf + bi, to_str, to_len); bi += to_len; }
+                j += from_len;
+            } else {
+                if (bi < sizeof(buf) - 1) buf[bi++] = sp[j];
+                j++;
+            }
+        }
+        buf[bi] = '\0';
+        dst[i] = td_sym_intern(buf, bi);
+    }
+    td_release(input); td_release(from_v); td_release(to_v);
+    return result;
+}
+
+/* CONCAT(a, b, ...) */
+static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
+    td_op_ext_t* ext = find_ext(g, op->id);
+    int n_args = (int)ext->sym;
+
+    /* Evaluate all inputs */
+    td_t* args[16];
+    int nn = n_args < 16 ? n_args : 16;
+    args[0] = exec_node(g, op->inputs[0]);
+    args[1] = exec_node(g, op->inputs[1]);
+    uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+    for (int i = 2; i < nn; i++) {
+        args[i] = exec_node(g, &g->nodes[trail[i - 2]]);
+    }
+    /* Error check */
+    for (int i = 0; i < nn; i++) {
+        if (!args[i] || TD_IS_ERR(args[i])) {
+            td_t* err = args[i];
+            for (int j = 0; j < nn; j++) {
+                if (j != i && args[j] && !TD_IS_ERR(args[j])) td_release(args[j]);
+            }
+            return err;
+        }
+    }
+
+    int64_t nrows = args[0]->len;
+    td_t* result = td_vec_new(TD_SYM, nrows);
+    if (!result || TD_IS_ERR(result)) {
+        for (int i = 0; i < nn; i++) td_release(args[i]);
+        return result;
+    }
+    result->len = nrows;
+    int64_t* dst = (int64_t*)td_data(result);
+
+    for (int64_t r = 0; r < nrows; r++) {
+        char buf[4096];
+        size_t bi = 0;
+        for (int a = 0; a < nn; a++) {
+            int8_t t = args[a]->type;
+            if (t == TD_SYM || t == TD_ENUM) {
+                const char* sp; size_t sl;
+                sym_elem(args[a], r, &sp, &sl);
+                if (bi + sl < sizeof(buf)) { memcpy(buf + bi, sp, sl); bi += sl; }
+            } else if (t == TD_STR || t == TD_ATOM_STR) {
+                /* String constant (atom or vector) */
+                const char* sp = td_str_ptr(args[a]);
+                size_t sl = td_str_len(args[a]);
+                if (sp && bi + sl < sizeof(buf)) { memcpy(buf + bi, sp, sl); bi += sl; }
+            }
+        }
+        buf[bi] = '\0';
+        dst[r] = td_sym_intern(buf, bi);
+    }
+    for (int i = 0; i < nn; i++) td_release(args[i]);
+    return result;
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -2953,6 +3199,22 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
 
         case OP_LIKE: {
             return exec_like(g, op);
+        }
+
+        case OP_UPPER: case OP_LOWER: case OP_TRIM: {
+            return exec_string_unary(g, op);
+        }
+        case OP_STRLEN: {
+            return exec_strlen(g, op);
+        }
+        case OP_SUBSTR: {
+            return exec_substr(g, op);
+        }
+        case OP_REPLACE: {
+            return exec_replace(g, op);
+        }
+        case OP_CONCAT: {
+            return exec_concat(g, op);
         }
 
         case OP_ALIAS: {

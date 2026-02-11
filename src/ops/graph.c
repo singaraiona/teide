@@ -353,6 +353,90 @@ td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern) {
     return make_binary(g, OP_LIKE, input, pattern, TD_BOOL);
 }
 
+/* String ops */
+td_op_t* td_upper(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_UPPER, a, TD_SYM); }
+td_op_t* td_lower(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_LOWER, a, TD_SYM); }
+td_op_t* td_strlen(td_graph_t* g, td_op_t* a)  { return make_unary(g, OP_STRLEN, a, TD_I64); }
+td_op_t* td_trim_op(td_graph_t* g, td_op_t* a) { return make_unary(g, OP_TRIM, a, TD_SYM); }
+
+td_op_t* td_substr(td_graph_t* g, td_op_t* str, td_op_t* start, td_op_t* len) {
+    /* 3-input: str=inputs[0], start=inputs[1], len stored via literal field */
+    uint32_t s_id = str->id;
+    uint32_t st_id = start->id;
+    uint32_t l_id = len->id;
+    uint32_t est = str->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    str   = &g->nodes[s_id];
+    start = &g->nodes[st_id];
+
+    ext->base.opcode = OP_SUBSTR;
+    ext->base.arity = 2;
+    ext->base.inputs[0] = str;
+    ext->base.inputs[1] = start;
+    ext->base.out_type = TD_SYM;
+    ext->base.est_rows = est;
+    ext->literal = (td_t*)(uintptr_t)l_id;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_replace(td_graph_t* g, td_op_t* str, td_op_t* from, td_op_t* to) {
+    /* 3-input: str=inputs[0], from=inputs[1], to stored via literal field */
+    uint32_t s_id = str->id;
+    uint32_t f_id = from->id;
+    uint32_t t_id = to->id;
+    uint32_t est = str->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    str  = &g->nodes[s_id];
+    from = &g->nodes[f_id];
+
+    ext->base.opcode = OP_REPLACE;
+    ext->base.arity = 2;
+    ext->base.inputs[0] = str;
+    ext->base.inputs[1] = from;
+    ext->base.out_type = TD_SYM;
+    ext->base.est_rows = est;
+    ext->literal = (td_t*)(uintptr_t)t_id;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n) {
+    /* Variadic: first 2 in inputs[], rest in trailing IDs */
+    if (n < 2) return NULL;
+    size_t extra = (n > 2) ? (size_t)(n - 2) * sizeof(uint32_t) : 0;
+
+    /* Save IDs before alloc */
+    uint32_t ids[16]; /* reasonable max */
+    int nn = n < 16 ? n : 16;
+    for (int i = 0; i < nn; i++) ids[i] = args[i]->id;
+    uint32_t est = args[0]->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, extra);
+    if (!ext) return NULL;
+
+    ext->base.opcode = OP_CONCAT;
+    ext->base.arity = 2;
+    ext->base.inputs[0] = &g->nodes[ids[0]];
+    ext->base.inputs[1] = &g->nodes[ids[1]];
+    ext->base.out_type = TD_SYM;
+    ext->base.est_rows = est;
+    ext->sym = n; /* total arg count stored in sym field */
+
+    /* Extra args in trailing bytes */
+    uint32_t* trail = (uint32_t*)EXT_TRAIL(ext);
+    for (int i = 2; i < nn; i++) trail[i - 2] = ids[i];
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 /* --------------------------------------------------------------------------
  * Reduction ops
  * -------------------------------------------------------------------------- */
@@ -365,6 +449,7 @@ td_op_t* td_count(td_graph_t* g, td_op_t* a)  { return make_unary(g, OP_COUNT, a
 td_op_t* td_avg(td_graph_t* g, td_op_t* a)    { return make_unary(g, OP_AVG, a, TD_F64); }
 td_op_t* td_first(td_graph_t* g, td_op_t* a)  { return make_unary(g, OP_FIRST, a, a->out_type); }
 td_op_t* td_last(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_LAST, a, a->out_type); }
+td_op_t* td_count_distinct(td_graph_t* g, td_op_t* a) { return make_unary(g, OP_COUNT_DISTINCT, a, TD_I64); }
 
 /* --------------------------------------------------------------------------
  * Structural ops
@@ -384,10 +469,12 @@ td_op_t* td_filter(td_graph_t* g, td_op_t* input, td_op_t* predicate) {
 }
 
 td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
-                     td_op_t** keys, uint8_t* descs, uint8_t n_cols) {
+                     td_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
+                     uint8_t n_cols) {
     size_t keys_sz = (size_t)n_cols * sizeof(td_op_t*);
     size_t descs_sz = (size_t)n_cols;
-    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz + descs_sz);
+    size_t nf_sz = (size_t)n_cols;
+    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz + descs_sz + nf_sz);
     if (!ext) return NULL;
 
     ext->base.opcode = OP_SORT;
@@ -402,6 +489,14 @@ td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
     memcpy(ext->sort.columns, keys, keys_sz);
     ext->sort.desc = (uint8_t*)(trail + keys_sz);
     memcpy(ext->sort.desc, descs, descs_sz);
+    ext->sort.nulls_first = (uint8_t*)(trail + keys_sz + descs_sz);
+    if (nulls_first) {
+        memcpy(ext->sort.nulls_first, nulls_first, nf_sz);
+    } else {
+        /* Default: NULLS LAST for ASC, NULLS FIRST for DESC (PostgreSQL convention) */
+        for (uint8_t i = 0; i < n_cols; i++)
+            ext->sort.nulls_first[i] = descs[i] ? 1 : 0;
+    }
     ext->sort.n_cols = n_cols;
 
     g->nodes[ext->base.id] = ext->base;

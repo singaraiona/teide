@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
 
 use teide::{AggOp, Column, Graph};
@@ -63,6 +63,7 @@ pub fn plan_expr(
                 BinaryOperator::GtEq => Ok(g.ge(l, r)),
                 BinaryOperator::And => Ok(g.and(l, r)),
                 BinaryOperator::Or => Ok(g.or(l, r)),
+                BinaryOperator::StringConcat => Ok(g.concat(&[l, r])),
                 _ => Err(SqlError::Plan(format!("Unsupported operator: {op}"))),
             }
         }
@@ -232,22 +233,17 @@ pub fn plan_expr(
             Err(SqlError::Plan(format!("Unsupported compound identifier: {expr}")))
         }
 
-        // Subquery: (SELECT ...) used as a scalar value
+        // Subquery: these should be resolved by resolve_subqueries() before plan_expr
         Expr::Subquery(_query) => {
-            // Execute inner query and extract single value
             Err(SqlError::Plan(
-                "Scalar subqueries are only supported in WHERE clause via plan_query context".into(),
+                "Scalar subquery must be pre-resolved; this is a planner bug".into(),
             ))
         }
 
-        // IN (subquery)
-        Expr::InSubquery {
-            expr: _inner,
-            subquery: _sq,
-            negated: _neg,
-        } => {
+        // IN (subquery): should be rewritten to IN (list) by resolve_subqueries()
+        Expr::InSubquery { .. } => {
             Err(SqlError::Plan(
-                "IN (subquery) not yet supported; use IN (value_list) instead".into(),
+                "IN (subquery) must be pre-resolved; this is a planner bug".into(),
             ))
         }
 
@@ -261,6 +257,31 @@ pub fn plan_expr(
             } else {
                 plan_scalar_function(g, &name, f, schema)
             }
+        }
+
+        Expr::Trim { expr, .. } => {
+            let a = plan_expr(g, expr, schema)?;
+            Ok(g.trim(a))
+        }
+
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let s = plan_expr(g, expr, schema)?;
+            let start = if let Some(from) = substring_from {
+                plan_expr(g, from, schema)?
+            } else {
+                g.const_i64(1)
+            };
+            let len = if let Some(for_expr) = substring_for {
+                plan_expr(g, for_expr, schema)?
+            } else {
+                g.const_i64(i64::MAX)
+            };
+            Ok(g.substr(s, start, len))
         }
 
         _ => Err(SqlError::Plan(format!("Unsupported expression: {expr}"))),
@@ -356,7 +377,7 @@ fn plan_scalar_function(
             Ok(result)
         }
 
-        // COALESCE(a, b, ...) → first non-null (approximated via isnull chains)
+        // COALESCE(a, b, ...) → nested IF(NOT ISNULL(a), a, IF(NOT ISNULL(b), b, c))
         "coalesce" => {
             if args.is_empty() {
                 return Err(SqlError::Plan("COALESCE requires at least 1 argument".into()));
@@ -364,31 +385,82 @@ fn plan_scalar_function(
             if args.len() == 1 {
                 return plan_expr(g, &args[0], schema);
             }
-            // COALESCE(a, b) → if a IS NOT NULL then a else b
-            // We approximate: a * (1 - isnull(a)) + b * isnull(a)
-            // This only works for numeric types; for strings it will fail at runtime
-            let a = plan_expr(g, &args[0], schema)?;
-            let is_null_a = g.isnull(a);
-            let not_null_a = g.not(is_null_a);
-            let cast_not_null = g.cast(not_null_a, teide::types::F64);
-            let cast_null = g.cast(is_null_a, teide::types::F64);
-            let a2 = plan_expr(g, &args[0], schema)?;
-            let b = plan_expr(g, &args[1], schema)?;
-            let part_a = g.mul(a2, cast_not_null);
-            let part_b = g.mul(b, cast_null);
-            Ok(g.add(part_a, part_b))
+            // Build right-to-left: last arg is the fallback, then wrap in IF chains
+            let mut result = plan_expr(g, args.last().unwrap(), schema)?;
+            for arg in args[..args.len() - 1].iter().rev() {
+                let val = plan_expr(g, arg, schema)?;
+                let is_null = g.isnull(val);
+                let not_null = g.not(is_null);
+                let val_again = plan_expr(g, arg, schema)?;
+                result = g.if_then_else(not_null, val_again, result);
+            }
+            Ok(result)
         }
 
-        // NULLIF(a, b) → if a = b then NULL else a
+        // NULLIF(a, b) → IF(a = b, NULL, a)
         "nullif" => {
             check_arg_count(name, &args, 2)?;
-            // Return a / (a != b) — division by zero (false=0) produces NaN (= NULL)
             let a = plan_expr(g, &args[0], schema)?;
             let b = plan_expr(g, &args[1], schema)?;
-            let ne = g.ne(a, b);
+            let eq = g.eq(a, b);
+            let null_val = g.const_f64(f64::NAN);
             let a2 = plan_expr(g, &args[0], schema)?;
-            let cast_ne = g.cast(ne, teide::types::F64);
-            Ok(g.mul(a2, cast_ne))
+            Ok(g.if_then_else(eq, null_val, a2))
+        }
+
+        // String functions
+        "upper" => {
+            check_arg_count(name, &args, 1)?;
+            let a = plan_expr(g, &args[0], schema)?;
+            Ok(g.upper(a))
+        }
+        "lower" => {
+            check_arg_count(name, &args, 1)?;
+            let a = plan_expr(g, &args[0], schema)?;
+            Ok(g.lower(a))
+        }
+        "length" | "len" | "char_length" | "character_length" => {
+            check_arg_count(name, &args, 1)?;
+            let a = plan_expr(g, &args[0], schema)?;
+            Ok(g.strlen(a))
+        }
+        "trim" | "btrim" => {
+            check_arg_count(name, &args, 1)?;
+            let a = plan_expr(g, &args[0], schema)?;
+            Ok(g.trim(a))
+        }
+        "substr" | "substring" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(SqlError::Plan(format!(
+                    "SUBSTR requires 2 or 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = plan_expr(g, &args[0], schema)?;
+            let start = plan_expr(g, &args[1], schema)?;
+            let len = if args.len() == 3 {
+                plan_expr(g, &args[2], schema)?
+            } else {
+                g.const_i64(i64::MAX) // take remainder
+            };
+            Ok(g.substr(s, start, len))
+        }
+        "replace" => {
+            check_arg_count(name, &args, 3)?;
+            let s = plan_expr(g, &args[0], schema)?;
+            let from = plan_expr(g, &args[1], schema)?;
+            let to = plan_expr(g, &args[2], schema)?;
+            Ok(g.replace(s, from, to))
+        }
+        "concat" => {
+            if args.len() < 2 {
+                return Err(SqlError::Plan("CONCAT requires at least 2 arguments".into()));
+            }
+            let cols: Vec<_> = args
+                .iter()
+                .map(|a| plan_expr(g, a, schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(g.concat(&cols))
         }
 
         _ => Err(SqlError::Plan(format!("Unsupported function: {name}"))),
@@ -459,6 +531,19 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
 /// Check if a function name is a known aggregate.
 pub fn is_aggregate_name(name: &str) -> bool {
     matches!(name, "sum" | "avg" | "min" | "max" | "count")
+}
+
+/// Check if a function is COUNT(DISTINCT ...).
+pub fn is_count_distinct(func: &Function) -> bool {
+    let name = func.name.to_string().to_lowercase();
+    if name != "count" {
+        return false;
+    }
+    if let FunctionArguments::List(ref list) = func.args {
+        matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+    } else {
+        false
+    }
 }
 
 /// Check if a sqlparser Expr contains any aggregate function call.

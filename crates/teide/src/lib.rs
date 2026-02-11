@@ -151,6 +151,9 @@ mod ffi {
         pub fn td_sym_str(id: i64) -> *mut td_t;
 
         // Table API
+        pub fn td_table_new(ncols: i64) -> *mut td_t;
+        pub fn td_table_add_col(df: *mut td_t, name: i64, col: *mut td_t) -> *mut td_t;
+        pub fn td_table_get_col(df: *mut td_t, name: i64) -> *mut td_t;
         pub fn td_table_nrows(df: *mut td_t) -> i64;
         pub fn td_table_ncols(df: *mut td_t) -> i64;
         pub fn td_table_col_name(df: *mut td_t, idx: i64) -> i64;
@@ -175,10 +178,19 @@ mod ffi {
         pub fn td_const_bool(g: *mut td_graph_t, val: bool) -> *mut td_op_t;
         pub fn td_const_str(g: *mut td_graph_t, s: *const c_char) -> *mut td_op_t;
         pub fn td_const_df(g: *mut td_graph_t, df: *mut td_t) -> *mut td_op_t;
+        pub fn td_const_vec(g: *mut td_graph_t, vec: *mut td_t) -> *mut td_op_t;
 
         // Unary element-wise ops
         pub fn td_neg(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
         pub fn td_not(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_abs(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_sqrt_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_log_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_exp_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_ceil_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_floor_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_isnull(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_cast(g: *mut td_graph_t, a: *mut td_op_t, target_type: i8) -> *mut td_op_t;
 
         // Binary element-wise ops
         pub fn td_add(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
@@ -194,6 +206,8 @@ mod ffi {
         pub fn td_ge(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
         pub fn td_and(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
         pub fn td_or(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_min2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
+        pub fn td_max2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
 
         // Reduction ops
         pub fn td_sum(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
@@ -234,6 +248,7 @@ mod ffi {
             n_cols: u8,
         ) -> *mut td_op_t;
         pub fn td_head(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
+        pub fn td_tail(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
         pub fn td_alias(g: *mut td_graph_t, input: *mut td_op_t, name: *const c_char) -> *mut td_op_t;
 
         // Optimizer + executor
@@ -342,6 +357,11 @@ fn check_ptr(ptr: *mut ffi::td_t) -> Result<*mut ffi::td_t> {
 // ---------------------------------------------------------------------------
 // Context — manages global engine state (arena, sym table, thread pool)
 // ---------------------------------------------------------------------------
+
+/// Intern a string into the global symbol table. Returns a stable i64 ID.
+pub fn sym_intern(s: &str) -> i64 {
+    unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) }
+}
 
 /// Engine context. Initializes the arena allocator, symbol table, and thread
 /// pool on construction. Tears them down in reverse order on drop.
@@ -454,6 +474,12 @@ impl Table {
             let slice = std::slice::from_raw_parts(ptr as *const u8, len);
             std::str::from_utf8_unchecked(slice)
         }
+    }
+
+    /// Add a column to this table. The table pointer may change (COW semantics).
+    /// `name` is a pre-interned symbol ID.
+    pub fn add_column_raw(&mut self, name_id: i64, col: *mut ffi::td_t) {
+        self.raw = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
     }
 
     /// Raw column vector at index (returns None for out-of-range or error).
@@ -725,6 +751,14 @@ impl Graph<'_> {
         }
     }
 
+    pub fn min2(&self, a: Column, b: Column) -> Column {
+        Column { raw: unsafe { ffi::td_min2(self.raw, a.raw, b.raw) } }
+    }
+
+    pub fn max2(&self, a: Column, b: Column) -> Column {
+        Column { raw: unsafe { ffi::td_max2(self.raw, a.raw, b.raw) } }
+    }
+
     // ---- Unary ops --------------------------------------------------------
 
     pub fn not(&self, a: Column) -> Column {
@@ -737,6 +771,38 @@ impl Graph<'_> {
         Column {
             raw: unsafe { ffi::td_neg(self.raw, a.raw) },
         }
+    }
+
+    pub fn abs(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_abs(self.raw, a.raw) } }
+    }
+
+    pub fn sqrt(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_sqrt_op(self.raw, a.raw) } }
+    }
+
+    pub fn log(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_log_op(self.raw, a.raw) } }
+    }
+
+    pub fn exp(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_exp_op(self.raw, a.raw) } }
+    }
+
+    pub fn ceil(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_ceil_op(self.raw, a.raw) } }
+    }
+
+    pub fn floor(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_floor_op(self.raw, a.raw) } }
+    }
+
+    pub fn isnull(&self, a: Column) -> Column {
+        Column { raw: unsafe { ffi::td_isnull(self.raw, a.raw) } }
+    }
+
+    pub fn cast(&self, a: Column, target_type: i8) -> Column {
+        Column { raw: unsafe { ffi::td_cast(self.raw, a.raw, target_type) } }
     }
 
     // ---- Reduction ops ----------------------------------------------------
@@ -879,6 +945,13 @@ impl Graph<'_> {
         }
     }
 
+    /// Take the last `n` rows.
+    pub fn tail(&self, input: Column, n: i64) -> Column {
+        Column {
+            raw: unsafe { ffi::td_tail(self.raw, input.raw, n) },
+        }
+    }
+
     /// Rename/alias a column.
     pub fn alias(&self, input: Column, name: &str) -> Column {
         let c_name = CString::new(name).expect("alias name must not contain NUL");
@@ -897,6 +970,23 @@ impl Graph<'_> {
         // Retain so Table's Drop can release it
         unsafe { ffi::td_retain(result) };
         Ok(Table { raw: result, _not_send_sync: PhantomData })
+    }
+
+    /// Execute a graph node and return the raw result (vector or table).
+    /// Caller is responsible for releasing the result.
+    pub fn execute_raw(&self, root: Column) -> Result<*mut ffi::td_t> {
+        let optimized = unsafe { ffi::td_optimize(self.raw, root.raw) };
+        let result = unsafe { ffi::td_execute(self.raw, optimized) };
+        let result = check_ptr(result)?;
+        unsafe { ffi::td_retain(result) };
+        Ok(result)
+    }
+
+    /// Inject a pre-computed vector as a constant node in the graph.
+    pub fn const_vec(&self, vec: *mut ffi::td_t) -> Column {
+        Column {
+            raw: unsafe { ffi::td_const_vec(self.raw, vec) },
+        }
     }
 }
 

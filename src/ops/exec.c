@@ -155,16 +155,23 @@ static void binary_range(td_op_t* op, int8_t out_type,
     double* lp_f64 = NULL; int64_t* lp_i64 = NULL; uint8_t* lp_bool = NULL;
     double* rp_f64 = NULL; int64_t* rp_i64 = NULL; uint8_t* rp_bool = NULL;
 
+    int32_t* lp_i32 = NULL; uint32_t* lp_u32 = NULL;
+    int32_t* rp_i32 = NULL; uint32_t* rp_u32 = NULL;
+
     if (!l_scalar) {
         char* lbase = (char*)td_data(lhs) + start * td_elem_size(lhs->type);
         if (lhs->type == TD_F64) lp_f64 = (double*)lbase;
-        else if (lhs->type == TD_I64) lp_i64 = (int64_t*)lbase;
+        else if (lhs->type == TD_I64 || lhs->type == TD_SYM) lp_i64 = (int64_t*)lbase;
+        else if (lhs->type == TD_I32) lp_i32 = (int32_t*)lbase;
+        else if (lhs->type == TD_ENUM) lp_u32 = (uint32_t*)lbase;
         else if (lhs->type == TD_BOOL) lp_bool = (uint8_t*)lbase;
     }
     if (!r_scalar) {
         char* rbase = (char*)td_data(rhs) + start * td_elem_size(rhs->type);
         if (rhs->type == TD_F64) rp_f64 = (double*)rbase;
-        else if (rhs->type == TD_I64) rp_i64 = (int64_t*)rbase;
+        else if (rhs->type == TD_I64 || rhs->type == TD_SYM) rp_i64 = (int64_t*)rbase;
+        else if (rhs->type == TD_I32) rp_i32 = (int32_t*)rbase;
+        else if (rhs->type == TD_ENUM) rp_u32 = (uint32_t*)rbase;
         else if (rhs->type == TD_BOOL) rp_bool = (uint8_t*)rbase;
     }
 
@@ -172,12 +179,16 @@ static void binary_range(td_op_t* op, int8_t out_type,
         double lv, rv;
         if (lp_f64)       lv = lp_f64[i];
         else if (lp_i64)  lv = (double)lp_i64[i];
+        else if (lp_i32)  lv = (double)lp_i32[i];
+        else if (lp_u32)  lv = (double)lp_u32[i];
         else if (lp_bool) lv = (double)lp_bool[i];
         else if (l_scalar && (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64)) lv = l_f64;
         else              lv = (double)l_i64;
 
         if (rp_f64)       rv = rp_f64[i];
         else if (rp_i64)  rv = (double)rp_i64[i];
+        else if (rp_i32)  rv = (double)rp_i32[i];
+        else if (rp_u32)  rv = (double)rp_u32[i];
         else if (rp_bool) rv = (double)rp_bool[i];
         else if (r_scalar && (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64)) rv = r_f64;
         else              rv = (double)r_i64;
@@ -265,14 +276,37 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
     if (!result || TD_IS_ERR(result)) return result;
     result->len = len;
 
+    /* ENUM/SYM vs STR comparison: resolve string constant to intern ID so we
+       can compare numerically against ENUM uint32_t intern indices.
+       td_sym_find returns -1 if string not in table → no match. */
+    bool str_resolved = false;
+    int64_t resolved_sym_id = 0;
+    if (r_scalar && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR) &&
+        (lhs->type == TD_ENUM || lhs->type == TD_SYM)) {
+        const char* s = td_str_ptr(rhs);
+        size_t slen = td_str_len(rhs);
+        resolved_sym_id = td_sym_find(s, slen);
+        str_resolved = true;
+    } else if (l_scalar && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR) &&
+               (rhs->type == TD_ENUM || rhs->type == TD_SYM)) {
+        const char* s = td_str_ptr(lhs);
+        size_t slen = td_str_len(lhs);
+        resolved_sym_id = td_sym_find(s, slen);
+        str_resolved = true;
+    }
+
     double l_f64_val = 0, r_f64_val = 0;
     int64_t l_i64_val = 0, r_i64_val = 0;
     if (l_scalar) {
-        if (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64) l_f64_val = lhs->f64;
+        if (str_resolved && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR))
+            l_i64_val = resolved_sym_id;
+        else if (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64) l_f64_val = lhs->f64;
         else l_i64_val = lhs->i64;
     }
     if (r_scalar) {
-        if (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64) r_f64_val = rhs->f64;
+        if (str_resolved && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR))
+            r_i64_val = resolved_sym_id;
+        else if (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64) r_f64_val = rhs->f64;
         else r_i64_val = rhs->i64;
     }
 
@@ -630,6 +664,9 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     scratch_free(indices_hdr);
     return result;
 }
+
+/* Forward declaration — exec_node is defined after exec_group */
+static td_t* exec_node(td_graph_t* g, td_op_t* op);
 
 /* ============================================================================
  * Group-by execution — with parallel local hash tables + merge
@@ -1313,7 +1350,7 @@ static inline void da_accum_free(da_accum_t* a) {
 /* Unified agg result emitter — used by both DA and HT paths.
  * Arrays indexed by [gi * n_aggs + a], counts by [gi]. */
 static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
-                              td_t** agg_vecs, uint32_t grp_count, uint8_t n_keys,
+                              td_t** agg_vecs, uint32_t grp_count,
                               uint8_t n_aggs,
                               double*  sum_f64,  int64_t* sum_i64,
                               double*  min_f64,  double*  max_f64,
@@ -1389,7 +1426,24 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                 name_id = agg_ext->sym;
             }
         } else {
-            name_id = (int64_t)(n_keys + a);
+            /* Expression agg input — synthetic name like "_e0_sum" */
+            char nbuf[32];
+            int np = 0;
+            nbuf[np++] = '_'; nbuf[np++] = 'e';
+            nbuf[np++] = (char)('0' + a);
+            const char* nsfx = "";
+            size_t nslen = 0;
+            switch (agg_op) {
+                case OP_SUM:   nsfx = "_sum";   nslen = 4; break;
+                case OP_COUNT: nsfx = "_count"; nslen = 6; break;
+                case OP_AVG:   nsfx = "_mean";  nslen = 5; break;
+                case OP_MIN:   nsfx = "_min";   nslen = 4; break;
+                case OP_MAX:   nsfx = "_max";   nslen = 4; break;
+                case OP_FIRST: nsfx = "_first"; nslen = 6; break;
+                case OP_LAST:  nsfx = "_last";  nslen = 5; break;
+            }
+            memcpy(nbuf + np, nsfx, nslen);
+            name_id = td_sym_intern(nbuf, (size_t)np + nslen);
         }
         *result = td_table_add_col(*result, name_id, new_col);
         td_release(new_col);
@@ -1556,13 +1610,27 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
 
     /* Resolve agg input columns (VLA — n_aggs ≤ 8) */
     td_t* agg_vecs[n_aggs];
+    uint8_t agg_owned[n_aggs]; /* 1 = we allocated via exec_node, must free */
     memset(agg_vecs, 0, n_aggs * sizeof(td_t*));
+    memset(agg_owned, 0, n_aggs * sizeof(uint8_t));
 
     for (uint8_t a = 0; a < n_aggs; a++) {
         td_op_t* agg_op = ext->agg_ins[a];
         td_op_ext_t* agg_ext = find_ext(g, agg_op->id);
         if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
             agg_vecs[a] = td_table_get_col(df, agg_ext->sym);
+        } else if (agg_ext && agg_ext->base.opcode == OP_CONST && agg_ext->literal) {
+            agg_vecs[a] = agg_ext->literal;
+        } else {
+            /* Expression node (ADD/MUL etc) — evaluate against current df */
+            td_t* saved_df = g->df;
+            g->df = df;
+            td_t* vec = exec_node(g, agg_op);
+            g->df = saved_df;
+            if (vec && !TD_IS_ERR(vec)) {
+                agg_vecs[a] = vec;
+                agg_owned[a] = 1;
+            }
         }
     }
 
@@ -1906,7 +1974,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 gi++;
             }
 
-            emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_keys, n_aggs,
+            emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                              dense_f64, dense_i64, dense_min_f64, dense_max_f64,
                              dense_min_i64, dense_max_i64, dense_counts);
 
@@ -1916,6 +1984,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             scratch_free(_h_dcnt);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
+            for (uint8_t a = 0; a < n_aggs; a++)
+                if (agg_owned[a] && agg_vecs[a]) td_release(agg_vecs[a]);
             return result;
         }
     }
@@ -2260,7 +2330,24 @@ sequential_fallback:;
                 name_id = agg_ext->sym;
             }
         } else {
-            name_id = (int64_t)(n_keys + a);
+            /* Expression agg input — synthetic name like "_e0_sum" */
+            char nbuf[32];
+            int np = 0;
+            nbuf[np++] = '_'; nbuf[np++] = 'e';
+            nbuf[np++] = (char)('0' + a);
+            const char* nsfx = "";
+            size_t nslen = 0;
+            switch (agg_op) {
+                case OP_SUM:   nsfx = "_sum";   nslen = 4; break;
+                case OP_COUNT: nsfx = "_count"; nslen = 6; break;
+                case OP_AVG:   nsfx = "_mean";  nslen = 5; break;
+                case OP_MIN:   nsfx = "_min";   nslen = 4; break;
+                case OP_MAX:   nsfx = "_max";   nslen = 4; break;
+                case OP_FIRST: nsfx = "_first"; nslen = 6; break;
+                case OP_LAST:  nsfx = "_last";  nslen = 5; break;
+            }
+            memcpy(nbuf + np, nsfx, nslen);
+            name_id = td_sym_intern(nbuf, (size_t)np + nslen);
         }
         result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
@@ -2282,6 +2369,8 @@ cleanup:
         }
         scratch_free(part_hts_hdr);
     }
+    for (uint8_t a = 0; a < n_aggs; a++)
+        if (agg_owned[a] && agg_vecs[a]) td_release(agg_vecs[a]);
 
     return result;
 }
@@ -2486,8 +2575,6 @@ join_cleanup:
  * Recursive executor
  * ============================================================================ */
 
-static td_t* exec_node(td_graph_t* g, td_op_t* op);
-
 static td_t* exec_node(td_graph_t* g, td_op_t* op) {
     if (!op) return TD_ERR_PTR(TD_ERR_NYI);
 
@@ -2620,12 +2707,105 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             return result;
         }
 
+        case OP_TAIL: {
+            td_op_ext_t* ext = find_ext(g, op->id);
+            td_t* input = exec_node(g, op->inputs[0]);
+            if (!input || TD_IS_ERR(input)) return input;
+            int64_t n = ext ? ext->sym : 10;
+            if (input->type == TD_TABLE) {
+                int64_t ncols = td_table_ncols(input);
+                int64_t nrows = td_table_nrows(input);
+                if (n > nrows) n = nrows;
+                int64_t skip = nrows - n;
+                td_t* result = td_table_new(ncols);
+                for (int64_t c = 0; c < ncols; c++) {
+                    td_t* col = td_table_get_col_idx(input, c);
+                    int64_t name_id = td_table_col_name(input, c);
+                    uint8_t esz = td_elem_size(col->type);
+                    td_t* tail_vec = td_vec_new(col->type, n);
+                    if (tail_vec && !TD_IS_ERR(tail_vec)) {
+                        tail_vec->len = n;
+                        memcpy(td_data(tail_vec),
+                               (char*)td_data(col) + (size_t)skip * esz,
+                               (size_t)n * esz);
+                    }
+                    result = td_table_add_col(result, name_id, tail_vec);
+                    td_release(tail_vec);
+                }
+                td_release(input);
+                return result;
+            }
+            if (n > input->len) n = input->len;
+            int64_t skip = input->len - n;
+            uint8_t esz = td_elem_size(input->type);
+            td_t* result = td_vec_new(input->type, n);
+            if (result && !TD_IS_ERR(result)) {
+                result->len = n;
+                memcpy(td_data(result),
+                       (char*)td_data(input) + (size_t)skip * esz,
+                       (size_t)n * esz);
+            }
+            td_release(input);
+            return result;
+        }
+
         case OP_ALIAS: {
             return exec_node(g, op->inputs[0]);
         }
 
         case OP_MATERIALIZE: {
             return exec_node(g, op->inputs[0]);
+        }
+
+        case OP_SELECT: {
+            /* Column projection: select/compute columns from input table */
+            td_t* input = exec_node(g, op->inputs[0]);
+            if (!input || TD_IS_ERR(input)) return input;
+            if (input->type != TD_TABLE) {
+                td_release(input);
+                return TD_ERR_PTR(TD_ERR_NYI);
+            }
+            td_op_ext_t* ext = find_ext(g, op->id);
+            if (!ext) { td_release(input); return TD_ERR_PTR(TD_ERR_NYI); }
+            uint8_t n_cols = ext->sort.n_cols;
+            td_op_t** columns = ext->sort.columns;
+            td_t* result = td_table_new(n_cols);
+
+            /* Set g->df so SCAN nodes inside expressions resolve correctly */
+            td_t* saved_df = g->df;
+            g->df = input;
+
+            for (uint8_t c = 0; c < n_cols; c++) {
+                if (columns[c]->opcode == OP_SCAN) {
+                    /* Direct column reference — copy from input table */
+                    td_op_ext_t* col_ext = find_ext(g, columns[c]->id);
+                    if (!col_ext) continue;
+                    int64_t name_id = col_ext->sym;
+                    td_t* src_col = td_table_get_col(input, name_id);
+                    if (src_col) {
+                        td_retain(src_col);
+                        result = td_table_add_col(result, name_id, src_col);
+                        td_release(src_col);
+                    }
+                } else {
+                    /* Expression column — evaluate against input table */
+                    td_t* vec = exec_node(g, columns[c]);
+                    if (vec && !TD_IS_ERR(vec)) {
+                        /* Synthetic name: _expr_0, _expr_1, ... */
+                        char name_buf[16];
+                        int n = 0;
+                        name_buf[n++] = '_'; name_buf[n++] = 'e';
+                        name_buf[n++] = '0' + c;
+                        int64_t name_id = td_sym_intern(name_buf, (size_t)n);
+                        result = td_table_add_col(result, name_id, vec);
+                        td_release(vec);
+                    }
+                }
+            }
+
+            g->df = saved_df;
+            td_release(input);
+            return result;
         }
 
         default:

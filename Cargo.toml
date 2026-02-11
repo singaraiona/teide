@@ -1,15 +1,9 @@
-[package]
-name = "teide"
-version = "0.1.0"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Fast columnar dataframe library powered by a zero-dependency C17 engine"
 repository = "https://github.com/singaraiona/teide"
-readme = "README.md"
-keywords = ["dataframe", "columnar", "analytics"]
-categories = ["database", "science"]
-
-include = ["bindings/rust/src/**", "LICENSE", "README.md", "Cargo.toml"]
-
-[lib]
-path = "bindings/rust/src/lib.rs"

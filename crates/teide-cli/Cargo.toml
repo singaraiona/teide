@@ -1,0 +1,16 @@
+[package]
+name = "teide-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQL REPL for the Teide dataframe engine"
+
+[[bin]]
+name = "teide"
+path = "src/main.rs"
+
+[dependencies]
+teide-sql = { path = "../teide-sql" }
+teide = { path = "../teide" }
+rustyline = "15"
+clap = { version = "4", features = ["derive"] }

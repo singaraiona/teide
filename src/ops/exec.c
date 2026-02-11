@@ -462,28 +462,13 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
  * Filter execution
  * ============================================================================ */
 
-static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
-    (void)g;
-    (void)op;
-    if (!input || TD_IS_ERR(input)) return input;
-    if (!pred || TD_IS_ERR(pred)) return pred;
+/* Filter a single vector by boolean predicate. */
+static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
     uint8_t esz = td_elem_size(input->type);
-
-    /* Count passing elements */
-    int64_t pass_count = 0;
-    td_morsel_t mp;
-    td_morsel_init(&mp, pred);
-    while (td_morsel_next(&mp)) {
-        uint8_t* bits = (uint8_t*)mp.morsel_ptr;
-        for (int64_t i = 0; i < mp.morsel_len; i++)
-            if (bits[i]) pass_count++;
-    }
-
     td_t* result = td_vec_new(input->type, pass_count);
     if (!result || TD_IS_ERR(result)) return result;
     result->len = pass_count;
 
-    /* Copy passing elements */
     td_morsel_t mi, mf;
     td_morsel_init(&mi, input);
     td_morsel_init(&mf, pred);
@@ -502,6 +487,44 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     }
 
     return result;
+}
+
+static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
+    (void)g;
+    (void)op;
+    if (!input || TD_IS_ERR(input)) return input;
+    if (!pred || TD_IS_ERR(pred)) return pred;
+
+    /* Count passing elements */
+    int64_t pass_count = 0;
+    td_morsel_t mp;
+    td_morsel_init(&mp, pred);
+    while (td_morsel_next(&mp)) {
+        uint8_t* bits = (uint8_t*)mp.morsel_ptr;
+        for (int64_t i = 0; i < mp.morsel_len; i++)
+            if (bits[i]) pass_count++;
+    }
+
+    /* DataFrame filter: filter each column, build new table */
+    if (input->type == TD_TABLE) {
+        int64_t ncols = td_table_ncols(input);
+        td_t* tbl = td_table_new(ncols);
+        if (!tbl || TD_IS_ERR(tbl)) return tbl;
+
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(input, c);
+            if (!col || TD_IS_ERR(col)) continue;
+            int64_t name_id = td_table_col_name(input, c);
+            td_t* filtered = exec_filter_vec(col, pred, pass_count);
+            if (!filtered || TD_IS_ERR(filtered)) { td_release(tbl); return filtered; }
+            td_table_add_col(tbl, name_id, filtered);
+            td_release(filtered);
+        }
+        return tbl;
+    }
+
+    /* Vector filter */
+    return exec_filter_vec(input, pred, pass_count);
 }
 
 /* ============================================================================
@@ -2571,15 +2594,28 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 for (int64_t c = 0; c < ncols; c++) {
                     td_t* col = td_table_get_col_idx(input, c);
                     int64_t name_id = td_table_col_name(input, c);
-                    td_t* sliced = td_vec_slice(col, 0, n);
-                    result = td_table_add_col(result, name_id, sliced);
-                    td_release(sliced);
+                    /* Materialized copy (td_vec_slice creates zero-copy views
+                       that the morsel iterator can't handle) */
+                    uint8_t esz = td_elem_size(col->type);
+                    td_t* head_vec = td_vec_new(col->type, n);
+                    if (head_vec && !TD_IS_ERR(head_vec)) {
+                        head_vec->len = n;
+                        memcpy(td_data(head_vec), td_data(col), (size_t)n * esz);
+                    }
+                    result = td_table_add_col(result, name_id, head_vec);
+                    td_release(head_vec);
                 }
                 td_release(input);
                 return result;
             }
             if (n > input->len) n = input->len;
-            td_t* result = td_vec_slice(input, 0, n);
+            /* Materialized copy for vector head */
+            uint8_t esz = td_elem_size(input->type);
+            td_t* result = td_vec_new(input->type, n);
+            if (result && !TD_IS_ERR(result)) {
+                result->len = n;
+                memcpy(td_data(result), td_data(input), (size_t)n * esz);
+            }
             td_release(input);
             return result;
         }

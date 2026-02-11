@@ -1,0 +1,13 @@
+[package]
+name = "teide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast columnar dataframe library powered by a zero-dependency C17 engine"
+readme = "../../README.md"
+keywords = ["dataframe", "columnar", "analytics"]
+categories = ["database", "science"]
+
+[dependencies]
+teide-sys = { path = "../teide-sys" }

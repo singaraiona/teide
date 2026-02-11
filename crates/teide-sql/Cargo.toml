@@ -1,0 +1,10 @@
+[package]
+name = "teide-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQL parser and planner for the Teide dataframe engine"
+
+[dependencies]
+teide = { path = "../teide" }
+sqlparser = { version = "0.53", features = ["visitor"] }

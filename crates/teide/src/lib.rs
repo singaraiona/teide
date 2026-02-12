@@ -56,6 +56,7 @@ mod ffi {
         pub ext_nodes: *mut *mut std::ffi::c_void,
         pub ext_count: u32,
         pub ext_cap: u32,
+        pub filter_mask: *mut td_t,
     }
 
     // ---- Type constants ---------------------------------------------------
@@ -1166,6 +1167,15 @@ impl Graph<'_> {
     pub fn const_vec(&self, vec: *mut ffi::td_t) -> Column {
         Column {
             raw: unsafe { ffi::td_const_vec(self.raw, vec) },
+        }
+    }
+
+    /// Set a boolean filter mask for group-by pushdown.
+    /// Rows where mask[r]==0 are skipped in scan loops.
+    pub unsafe fn set_filter_mask(&mut self, mask: *mut ffi::td_t) {
+        unsafe {
+            ffi::td_retain(mask);
+            (*self.raw).filter_mask = mask;
         }
     }
 }

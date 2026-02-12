@@ -1253,6 +1253,7 @@ typedef struct {
     uint32_t     n_workers;
     radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
     ght_layout_t layout;
+    const uint8_t* mask;
 } radix_phase1_ctx_t;
 
 static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -1263,11 +1264,13 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     uint8_t na = ly->n_aggs;
     uint8_t nv = ly->n_agg_vals;
     uint16_t estride = ly->entry_stride;
+    const uint8_t* mask = c->mask;
 
     int64_t keys[8];
     int64_t agg_vals[8];
 
     for (int64_t row = start; row < end; row++) {
+        if (mask && !mask[row]) continue;
         uint64_t h = 0;
         for (uint8_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
@@ -1494,22 +1497,26 @@ typedef struct {
     int64_t*    per_worker_min;  /* [n_workers] */
     int64_t*    per_worker_max;  /* [n_workers] */
     uint32_t    n_workers;
+    const uint8_t* mask;
 } minmax_ctx_t;
 
 static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     minmax_ctx_t* c = (minmax_ctx_t*)ctx;
     uint32_t wid = worker_id % c->n_workers;
+    const uint8_t* mask = c->mask;
     int64_t kmin = INT64_MAX, kmax = INT64_MIN;
     int8_t t = c->key_type;
     if (t == TD_I64 || t == TD_SYM) {
         const int64_t* kd = (const int64_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
+            if (mask && !mask[r]) continue;
             if (kd[r] < kmin) kmin = kd[r];
             if (kd[r] > kmax) kmax = kd[r];
         }
     } else if (t == TD_ENUM) {
         const uint32_t* kd = (const uint32_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
+            if (mask && !mask[r]) continue;
             int64_t v = (int64_t)kd[r];
             if (v < kmin) kmin = v;
             if (v > kmax) kmax = v;
@@ -1517,6 +1524,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     } else { /* TD_I32 */
         const int32_t* kd = (const int32_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
+            if (mask && !mask[r]) continue;
             int64_t v = (int64_t)kd[r];
             if (v < kmin) kmin = v;
             if (v > kmax) kmax = v;
@@ -1675,6 +1683,7 @@ typedef struct {
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
     uint32_t       n_slots;
+    const uint8_t* mask;
 } da_ctx_t;
 
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
@@ -1718,6 +1727,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
+    const uint8_t* mask = c->mask;
 
     /* Fast path: single key — avoid composite GID loop overhead */
     if (n_keys == 1) {
@@ -1725,6 +1735,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         int8_t kt = c->key_types[0];
         int64_t kmin = c->key_mins[0];
         for (int64_t r = start; r < end; r++) {
+            if (mask && !mask[r]) continue;
             int64_t kv;
             if (kt == TD_I64 || kt == TD_SYM)
                 kv = ((const int64_t*)kptr)[r];
@@ -1762,6 +1773,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
 
     /* Multi-key composite GID path */
     for (int64_t r = start; r < end; r++) {
+        if (mask && !mask[r]) continue;
         int32_t gid = da_composite_gid(c, r);
         acc->count[gid]++;
         size_t base = (size_t)gid * n_aggs;
@@ -1798,6 +1810,12 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     int64_t nrows = td_table_nrows(df);
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
+
+    /* Extract filter mask for pushdown (skip filtered rows in scan loops) */
+    const uint8_t* mask = NULL;
+    if (g->filter_mask && g->filter_mask->type == TD_BOOL
+        && g->filter_mask->len == nrows)
+        mask = (const uint8_t*)td_data(g->filter_mask);
 
     if (n_keys > 8 || n_aggs > 8) return TD_ERR_PTR(TD_ERR_NYI);
 
@@ -1900,6 +1918,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                     .per_worker_min = mm_mins,
                     .per_worker_max = mm_maxs,
                     .n_workers      = mm_n,
+                    .mask           = mask,
                 };
                 if (mm_n > 1) {
                     td_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, nrows);
@@ -2042,6 +2061,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 .n_aggs      = n_aggs,
                 .need_flags  = need_flags,
                 .n_slots     = n_slots,
+                .mask        = mask,
             };
 
             if (da_n_workers > 1)
@@ -2271,6 +2291,7 @@ ht_path:;
             .n_workers = n_total,
             .bufs      = radix_bufs,
             .layout    = ght_layout,
+            .mask      = mask,
         };
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
 

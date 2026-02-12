@@ -322,6 +322,7 @@ typedef struct td_graph {
     td_op_ext_t**  ext_nodes;   /* tracked extended nodes for cleanup */
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
+    td_t*          filter_mask; /* boolean mask for group-by: 0=skip */
 } td_graph_t;
 
 /* ===== Morsel Iterator ===== */

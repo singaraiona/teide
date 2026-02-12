@@ -347,24 +347,37 @@ fn plan_query(
     });
 
     // Stage 1: WHERE filter (resolve subqueries first)
-    let working_table = if let Some(ref where_expr) = select.selection {
-        let resolved = if has_subqueries(where_expr) {
-            resolve_subqueries(ctx, where_expr, effective_tables)?
+    // For GROUP BY queries, push predicate down as a mask instead of materializing.
+    let (working_table, filter_mask): (Table, Option<*mut teide::td_t>) =
+        if let Some(ref where_expr) = select.selection {
+            let resolved = if has_subqueries(where_expr) {
+                resolve_subqueries(ctx, where_expr, effective_tables)?
+            } else {
+                where_expr.clone()
+            };
+            if has_group_by || has_aggregates {
+                // Evaluate predicate only — pass as mask to GROUP BY
+                let mask_ptr = {
+                    let mut g = ctx.graph(&table);
+                    let pred = plan_expr(&mut g, &resolved, &schema)?;
+                    g.execute_raw(pred)?
+                };
+                (table, Some(mask_ptr))
+            } else {
+                // Non-GROUP BY: materialize as before
+                let mut g = ctx.graph(&table);
+                let df_node = g.const_df(&table);
+                let pred = plan_expr(&mut g, &resolved, &schema)?;
+                let filtered = g.filter(df_node, pred);
+                (g.execute(filtered)?, None)
+            }
         } else {
-            where_expr.clone()
+            (table, None)
         };
-        let mut g = ctx.graph(&table);
-        let df_node = g.const_df(&table);
-        let pred = plan_expr(&mut g, &resolved, &schema)?;
-        let filtered = g.filter(df_node, pred);
-        g.execute(filtered)?
-    } else {
-        table
-    };
 
     // Stage 2: GROUP BY / aggregation / DISTINCT
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
-        plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs)?
+        plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs, filter_mask)?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
         let aliases = extract_projection_aliases(select_items, &schema)?;
@@ -748,6 +761,7 @@ fn plan_group_select(
     group_by_cols: &[String],
     schema: &HashMap<String, usize>,
     alias_exprs: &HashMap<String, Expr>,
+    filter_mask: Option<*mut teide::td_t>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     let has_group_by = !group_by_cols.is_empty();
 
@@ -884,7 +898,16 @@ fn plan_group_select(
     }
 
     let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs);
+
+    // Push filter mask into the graph so exec_group skips filtered rows
+    if let Some(mask) = filter_mask {
+        unsafe { g.set_filter_mask(mask); }
+    }
     let group_result = g.execute(group_node)?;
+    // Release the mask reference (graph holds its own via set_filter_mask)
+    if let Some(mask) = filter_mask {
+        unsafe { teide::ffi_release(mask); }
+    }
 
     // Build result schema from NATIVE column names + our format_agg_name aliases.
     // The C engine names agg columns as "{col}_{suffix}" (e.g., "v1_sum").

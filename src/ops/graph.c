@@ -97,6 +97,7 @@ td_graph_t* td_graph_new(td_t* df) {
     g->ext_nodes = NULL;
     g->ext_count = 0;
     g->ext_cap = 0;
+    g->filter_mask = NULL;
 
     return g;
 }
@@ -112,6 +113,7 @@ void td_graph_free(td_graph_t* g) {
 
     free(g->nodes);
     if (g->df) td_release(g->df);
+    if (g->filter_mask) td_release(g->filter_mask);
     free(g);
 }
 

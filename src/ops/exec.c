@@ -930,6 +930,17 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
             }
             break;
         }
+        case TD_BOOL: {
+            const uint8_t* d = (const uint8_t*)c->data;
+            if (c->desc) {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = ~(uint64_t)d[i];
+            } else {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = (uint64_t)d[i];
+            }
+            break;
+        }
         }
     } else {
         /* Composite-key encoding */
@@ -944,8 +955,15 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
                 } else if (col->type == TD_I64 || col->type == TD_SYM ||
                            col->type == TD_TIMESTAMP) {
                     val = ((const int64_t*)td_data(col))[i];
+                } else if (col->type == TD_F64) {
+                    uint64_t bits;
+                    memcpy(&bits, &((const double*)td_data(col))[i], 8);
+                    uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
+                    val = (int64_t)(bits ^ mask);
                 } else if (col->type == TD_I32) {
                     val = (int64_t)((const int32_t*)td_data(col))[i];
+                } else if (col->type == TD_BOOL) {
+                    val = (int64_t)((const uint8_t*)td_data(col))[i];
                 } else {
                     val = 0;
                 }
@@ -1288,8 +1306,25 @@ static void mk_prescan_fn(void* arg, uint32_t wid,
                 if (d[i] < kmin) kmin = d[i];
                 if (d[i] > kmax) kmax = d[i];
             }
+        } else if (col->type == TD_F64) {
+            const double* d = (const double*)td_data(col);
+            for (int64_t i = start; i < end; i++) {
+                uint64_t bits;
+                memcpy(&bits, &d[i], 8);
+                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
+                int64_t v = (int64_t)(bits ^ mask);
+                if (v < kmin) kmin = v;
+                if (v > kmax) kmax = v;
+            }
         } else if (col->type == TD_I32) {
             const int32_t* d = (const int32_t*)td_data(col);
+            for (int64_t i = start; i < end; i++) {
+                int64_t v = (int64_t)d[i];
+                if (v < kmin) kmin = v;
+                if (v > kmax) kmax = v;
+            }
+        } else if (col->type == TD_BOOL) {
+            const uint8_t* d = (const uint8_t*)td_data(col);
             for (int64_t i = start; i < end; i++) {
                 int64_t v = (int64_t)d[i];
                 if (v < kmin) kmin = v;
@@ -1359,8 +1394,15 @@ static void fused_topn_fn(void* arg, uint32_t wid,
             } else if (col->type == TD_I64 || col->type == TD_SYM ||
                        col->type == TD_TIMESTAMP) {
                 val = ((const int64_t*)td_data(col))[i];
+            } else if (col->type == TD_F64) {
+                uint64_t bits;
+                memcpy(&bits, &((const double*)td_data(col))[i], 8);
+                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
+                val = (int64_t)(bits ^ mask);
             } else if (col->type == TD_I32) {
                 val = (int64_t)((const int32_t*)td_data(col))[i];
+            } else if (col->type == TD_BOOL) {
+                val = (int64_t)((const uint8_t*)td_data(col))[i];
             } else {
                 val = 0;
             }
@@ -1956,6 +1998,8 @@ static uint64_t hash_row_keys(td_t** key_vecs, uint8_t n_keys, int64_t row) {
             kh = td_hash_i64((int64_t)((int32_t*)td_data(col))[row]);
         else if (col->type == TD_ENUM)
             kh = td_hash_i64((int64_t)((uint32_t*)td_data(col))[row]);
+        else if (col->type == TD_BOOL)
+            kh = td_hash_i64((int64_t)((uint8_t*)td_data(col))[row]);
         else
             kh = 0;
         h = (k == 0) ? kh : td_hash_combine(h, kh);
@@ -2234,6 +2278,8 @@ static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                 kv = (int64_t)((int32_t*)key_data[k])[row];
             else if (t == TD_ENUM)
                 kv = (int64_t)((uint32_t*)key_data[k])[row];
+            else if (t == TD_BOOL)
+                kv = (int64_t)((uint8_t*)key_data[k])[row];
             else
                 kv = 0;
             ek[k] = kv;
@@ -2250,7 +2296,8 @@ static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             if (!ac) continue;
             if (ac->type == TD_F64)
                 memcpy(&ev[vi], &((double*)td_data(ac))[row], 8);
-            else if (ac->type == TD_I64 || ac->type == TD_SYM)
+            else if (ac->type == TD_I64 || ac->type == TD_SYM ||
+                     ac->type == TD_TIMESTAMP)
                 ev[vi] = ((int64_t*)td_data(ac))[row];
             else if (ac->type == TD_I32)
                 ev[vi] = (int64_t)((int32_t*)td_data(ac))[row];
@@ -2347,6 +2394,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 kv = (int64_t)((int32_t*)c->key_data[k])[row];
             else if (t == TD_ENUM)
                 kv = (int64_t)((uint32_t*)c->key_data[k])[row];
+            else if (t == TD_BOOL)
+                kv = (int64_t)((uint8_t*)c->key_data[k])[row];
             else
                 kv = 0;
             keys[k] = kv;
@@ -2361,7 +2410,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (!ac) continue;
             if (ac->type == TD_F64)
                 memcpy(&agg_vals[vi], &((double*)td_data(ac))[row], 8);
-            else if (ac->type == TD_I64 || ac->type == TD_SYM)
+            else if (ac->type == TD_I64 || ac->type == TD_SYM ||
+                     ac->type == TD_TIMESTAMP)
                 agg_vals[vi] = ((int64_t*)td_data(ac))[row];
             else if (ac->type == TD_I32)
                 agg_vals[vi] = (int64_t)((int32_t*)td_data(ac))[row];
@@ -2459,6 +2509,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                     *(uint32_t*)(dst + doff) = (uint32_t)kv;
                 else if (kt == TD_I32)
                     *(int32_t*)(dst + doff) = (int32_t)kv;
+                else if (kt == TD_BOOL)
+                    *(uint8_t*)(dst + doff) = (uint8_t)kv;
             }
 
             /* Scatter agg results to result columns */
@@ -2570,7 +2622,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     const uint8_t* mask = c->mask;
     int64_t kmin = INT64_MAX, kmax = INT64_MIN;
     int8_t t = c->key_type;
-    if (t == TD_I64 || t == TD_SYM) {
+    if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP) {
         const int64_t* kd = (const int64_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
             if (mask && !mask[r]) continue;
@@ -2755,7 +2807,7 @@ static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     for (uint8_t k = 0; k < c->n_keys; k++) {
         int64_t val;
         int8_t t = c->key_types[k];
-        if (t == TD_I64 || t == TD_SYM)
+        if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
             val = ((const int64_t*)c->key_ptrs[k])[r];
         else if (t == TD_ENUM)
             val = (int64_t)((const uint32_t*)c->key_ptrs[k])[r];
@@ -2771,7 +2823,7 @@ static inline void da_read_val(const void* ptr, int8_t type, int64_t r,
     if (type == TD_F64) {
         *out_f64 = ((const double*)ptr)[r];
         *out_i64 = (int64_t)*out_f64;
-    } else if (type == TD_I64 || type == TD_SYM) {
+    } else if (type == TD_I64 || type == TD_SYM || type == TD_TIMESTAMP) {
         *out_i64 = ((const int64_t*)ptr)[r];
         *out_f64 = (double)*out_i64;
     } else if (type == TD_ENUM) {
@@ -2801,11 +2853,11 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         for (int64_t r = start; r < end; r++) {
             if (mask && !mask[r]) continue;
             int64_t kv;
-            if (kt == TD_I64 || kt == TD_SYM)
+            if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
                 kv = ((const int64_t*)kptr)[r];
             else if (kt == TD_ENUM)
                 kv = (int64_t)((const uint32_t*)kptr)[r];
-            else
+            else /* TD_I32 */
                 kv = (int64_t)((const int32_t*)kptr)[r];
             int32_t gid = (int32_t)(kv - kmin);
             acc->count[gid]++;
@@ -2956,7 +3008,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
-            if (t != TD_I64 && t != TD_SYM && t != TD_I32 && t != TD_ENUM)
+            if (t != TD_I64 && t != TD_SYM && t != TD_I32 && t != TD_ENUM
+                && t != TD_TIMESTAMP)
                 da_eligible = false;
         }
 
@@ -3697,7 +3750,7 @@ static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
         td_t* lc = l_vecs[k];
         td_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        if (lc->type == TD_I64 || lc->type == TD_SYM) {
+        if (lc->type == TD_I64 || lc->type == TD_SYM || lc->type == TD_TIMESTAMP) {
             if (((int64_t*)td_data(lc))[l] != ((int64_t*)td_data(rc))[r]) return false;
         } else if (lc->type == TD_F64) {
             if (((double*)td_data(lc))[l] != ((double*)td_data(rc))[r]) return false;
@@ -3705,6 +3758,8 @@ static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
             if (((int32_t*)td_data(lc))[l] != ((int32_t*)td_data(rc))[r]) return false;
         } else if (lc->type == TD_ENUM) {
             if (((uint32_t*)td_data(lc))[l] != ((uint32_t*)td_data(rc))[r]) return false;
+        } else if (lc->type == TD_BOOL) {
+            if (((uint8_t*)td_data(lc))[l] != ((uint8_t*)td_data(rc))[r]) return false;
         }
     }
     return true;

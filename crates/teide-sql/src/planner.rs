@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    BinaryOperator, Distinct, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName,
     ObjectType, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::DuckDbDialect;
@@ -12,8 +12,9 @@ use sqlparser::parser::Parser;
 use teide::{Column, Context, Graph, Table};
 
 use crate::expr::{
-    agg_op_from_name, collect_aggregates, expr_default_name, format_agg_name, is_aggregate,
-    is_count_distinct, is_pure_aggregate, plan_agg_input, plan_expr, plan_having_expr,
+    agg_op_from_name, collect_aggregates, collect_window_functions, expr_default_name,
+    format_agg_name, has_window_functions, is_aggregate, is_count_distinct, is_pure_aggregate,
+    is_window_function, parse_window_frame, plan_agg_input, plan_expr, plan_having_expr,
     plan_post_agg_expr,
 };
 use crate::{ExecResult, Session, SqlError, SqlResult, StoredTable};
@@ -375,6 +376,17 @@ fn plan_query(
             (table, None)
         };
 
+    // Stage 1.5: Window functions (before GROUP BY)
+    let has_windows = has_window_functions(select_items);
+    let (working_table, schema, select_items) = if has_windows {
+        let (wt, ws, wi) =
+            plan_window_stage(ctx, &working_table, select_items, &schema)?;
+        (wt, ws, std::borrow::Cow::Owned(wi))
+    } else {
+        (working_table, schema, std::borrow::Cow::Borrowed(select_items))
+    };
+    let select_items: &[SelectItem] = &select_items;
+
     // Stage 2: GROUP BY / aggregation / DISTINCT
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
         plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs, filter_mask)?
@@ -385,7 +397,9 @@ fn plan_query(
     } else {
         let aliases = extract_projection_aliases(select_items, &schema)?;
         // Check if projection needs expression evaluation (CAST, arithmetic, etc.)
-        let needs_expr = select_items.iter().any(|item| match item {
+        // Force projection when window functions added extra columns,
+        // or when SELECT items contain expressions needing evaluation.
+        let needs_expr = has_windows || select_items.iter().any(|item| match item {
             SelectItem::Wildcard(_) => false,
             SelectItem::UnnamedExpr(Expr::Identifier(_)) => false,
             SelectItem::ExprWithAlias {
@@ -1278,6 +1292,132 @@ fn plan_expr_select(
     let proj = g.select(df_node, &proj_cols);
     let result = g.execute(proj)?;
     Ok((result, aliases))
+}
+
+// ---------------------------------------------------------------------------
+// Window function stage: execute window functions and append result columns
+// ---------------------------------------------------------------------------
+
+/// Execute window functions and return (updated_table, updated_schema, rewritten_select_items).
+/// Window function calls in SELECT are replaced with identifier references to the new columns.
+fn plan_window_stage(
+    ctx: &Context,
+    table: &Table,
+    select_items: &[SelectItem],
+    schema: &HashMap<String, usize>,
+) -> Result<(Table, HashMap<String, usize>, Vec<SelectItem>), SqlError> {
+    let win_funcs = collect_window_functions(select_items)?;
+    if win_funcs.is_empty() {
+        // No actual window functions found (shouldn't happen, caller checked)
+        let new_schema = schema.clone();
+        return Ok((table.clone_ref(), new_schema, select_items.to_vec()));
+    }
+
+    // Build a graph for the window operation
+    let mut g = ctx.graph(table);
+    let df_node = g.const_df(table);
+
+    // For each window function, we need partition keys, order keys, and func info.
+    // Group by identical WindowSpec for efficiency, but for simplicity we execute
+    // one OP_WINDOW per unique spec (most queries have one spec).
+
+    // Map: display_name -> column_name_in_result (e.g. "_w0", "_w1")
+    let mut win_col_names: Vec<String> = Vec::new();
+    let mut win_display_names: Vec<String> = Vec::new();
+
+    // Collect all window funcs and build arrays for td_window_op
+    let mut part_key_cols: Vec<Column> = Vec::new();
+    let mut order_key_cols: Vec<Column> = Vec::new();
+    let mut order_descs: Vec<bool> = Vec::new();
+    let mut funcs: Vec<teide::WindowFunc> = Vec::new();
+    let mut func_input_cols: Vec<Column> = Vec::new();
+
+    // Use the spec from the first window function (for now, all must share same spec)
+    let first_spec = &win_funcs[0].1.spec;
+    let (frame_type, frame_start, frame_end) = parse_window_frame(first_spec);
+
+    // Build partition key columns
+    for part_expr in &first_spec.partition_by {
+        let col = plan_expr(&mut g, part_expr, schema)?;
+        part_key_cols.push(col);
+    }
+
+    // Build order key columns
+    for ob in &first_spec.order_by {
+        let col = plan_expr(&mut g, &ob.expr, schema)?;
+        order_key_cols.push(col);
+        order_descs.push(ob.asc == Some(false));
+    }
+
+    // Build function list
+    for (_idx, info) in &win_funcs {
+        funcs.push(info.func);
+
+        // For functions that need an input column
+        let input_col = if let Some(ref input_expr) = info.input_expr {
+            plan_expr(&mut g, input_expr, schema)?
+        } else {
+            // ROW_NUMBER, RANK, etc. don't use input — pass first column as dummy
+            let first_col_name = schema
+                .iter()
+                .min_by_key(|(_, v)| **v)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            g.scan(&first_col_name)
+        };
+        func_input_cols.push(input_col);
+
+        let col_name = format!("_w{}", win_col_names.len());
+        win_display_names.push(info.display_name.clone());
+        win_col_names.push(col_name);
+    }
+
+    // Execute the window operation
+    let win_node = g.window_op(
+        df_node,
+        &part_key_cols,
+        &order_key_cols,
+        &order_descs,
+        &funcs,
+        &func_input_cols,
+        frame_type,
+        frame_start,
+        frame_end,
+    );
+
+    let result = g.execute(win_node)?;
+
+    // Build updated schema (original columns + window columns)
+    let mut new_schema = build_schema(&result);
+    // Also add display names as aliases (e.g. "row_number()" -> _w0 column index)
+    for (i, display) in win_display_names.iter().enumerate() {
+        let col_idx = new_schema.get(&win_col_names[i]).copied().unwrap_or(0);
+        new_schema.entry(display.clone()).or_insert(col_idx);
+    }
+
+    // Rewrite SELECT items: replace window function calls with identifier refs
+    let mut win_idx = 0;
+    let new_items: Vec<SelectItem> = select_items
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) if is_window_function(expr) => {
+                let col_name = win_col_names[win_idx].clone();
+                win_idx += 1;
+                SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(col_name)))
+            }
+            SelectItem::ExprWithAlias { expr, alias } if is_window_function(expr) => {
+                let col_name = win_col_names[win_idx].clone();
+                win_idx += 1;
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(Ident::new(col_name)),
+                    alias: alias.clone(),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect();
+
+    Ok((result, new_schema, new_items))
 }
 
 // ---------------------------------------------------------------------------

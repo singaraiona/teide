@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
 
-use teide::{AggOp, Context, Table};
+use teide::{AggOp, Context, FrameBound, FrameType, Table, WindowFunc};
 
 // The C engine uses global state — serialize all tests.
 static ENGINE_LOCK: Mutex<()> = Mutex::new(());
@@ -534,4 +534,147 @@ fn error_handling_bad_csv() {
         Err(other) => panic!("expected Io error, got: {other}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window function tests (Graph API)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_row_number() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    // ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 ASC)
+    let mut g = ctx.graph(&table);
+    let df = g.const_df(&table);
+    let part_key = g.scan("id1");
+    let order_key = g.scan("v1");
+    let dummy_input = g.scan("v1");
+
+    let win = g.window_op(
+        df,
+        &[part_key],
+        &[order_key],
+        &[false], // ASC
+        &[WindowFunc::RowNumber],
+        &[dummy_input],
+        FrameType::Rows,
+        FrameBound::UnboundedPreceding,
+        FrameBound::UnboundedFollowing,
+    );
+    let result = g.execute(win).unwrap();
+
+    // 20 rows, original 9 cols + 1 window col = 10
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 10);
+
+    // Each id1 partition has 4 rows → row_number should be 1-4 within each
+    // Collect window col values grouped by id1
+    let mut parts: HashMap<String, Vec<i64>> = HashMap::new();
+    for r in 0..result.nrows() as usize {
+        let key = result.get_str(0, r).unwrap().to_string();
+        let rn = result.get_i64(9, r).unwrap();
+        parts.entry(key).or_default().push(rn);
+    }
+    for (_key, vals) in &parts {
+        let mut sorted = vals.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2, 3, 4], "ROW_NUMBER should be 1..4 per partition");
+    }
+}
+
+#[test]
+fn window_rank_with_ties() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    // RANK() OVER (PARTITION BY id2 ORDER BY id4 ASC)
+    // id2 has 2 distinct values, id4 has values 1-3 (with ties)
+    let mut g = ctx.graph(&table);
+    let df = g.const_df(&table);
+    let part_key = g.scan("id2");
+    let order_key = g.scan("id4");
+    let dummy = g.scan("id4");
+
+    let win = g.window_op(
+        df,
+        &[part_key],
+        &[order_key],
+        &[false], // ASC
+        &[WindowFunc::Rank, WindowFunc::DenseRank],
+        &[dummy, dummy],
+        FrameType::Rows,
+        FrameBound::UnboundedPreceding,
+        FrameBound::UnboundedFollowing,
+    );
+    let result = g.execute(win).unwrap();
+
+    // 20 rows, 9 + 2 window cols = 11
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 11);
+
+    // Verify RANK values are >= 1 and DENSE_RANK values are >= 1
+    for r in 0..result.nrows() as usize {
+        let rank = result.get_i64(9, r).unwrap();
+        let dense_rank = result.get_i64(10, r).unwrap();
+        assert!(rank >= 1, "RANK should be >= 1, got {rank}");
+        assert!(dense_rank >= 1, "DENSE_RANK should be >= 1, got {dense_rank}");
+        assert!(dense_rank <= rank, "DENSE_RANK <= RANK");
+    }
+}
+
+#[test]
+fn window_running_sum() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    // SUM(v1) OVER (ORDER BY v1 ASC ROWS UNBOUNDED PRECEDING TO CURRENT ROW)
+    // No partition → entire table is one partition
+    let mut g = ctx.graph(&table);
+    let df = g.const_df(&table);
+    let order_key = g.scan("v1");
+    let sum_input = g.scan("v1");
+
+    let win = g.window_op(
+        df,
+        &[],     // no partition
+        &[order_key],
+        &[false], // ASC
+        &[WindowFunc::Sum],
+        &[sum_input],
+        FrameType::Rows,
+        FrameBound::UnboundedPreceding,
+        FrameBound::CurrentRow,
+    );
+    let result = g.execute(win).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 10);
+
+    // The running sum should be monotonically non-decreasing
+    // since v1 values sorted ASC are all positive
+    // SUM(I64) → I64 result
+    let mut sums: Vec<i64> = Vec::new();
+    for r in 0..result.nrows() as usize {
+        let s = result.get_i64(9, r).unwrap();
+        sums.push(s);
+    }
+    sums.sort();
+    let mut prev = 0i64;
+    for s in &sums {
+        assert!(*s >= prev, "running sum should be non-decreasing");
+        prev = *s;
+    }
+
+    // Total sum of v1 = 1+2+3+4+5+6+7+8+9+10 + 1+2+3+4+5+6+7+8+9+10 = 110
+    // The maximum running sum should equal the total
+    let max_sum = *sums.last().unwrap();
+    assert_eq!(max_sum, 110, "total running sum should be 110, got {max_sum}");
 }

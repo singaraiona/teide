@@ -264,9 +264,39 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_HEAD         67
 #define OP_TAIL         68
 
+/* Opcodes — Window */
+#define OP_WINDOW       72
+
 /* Opcodes — Misc */
 #define OP_ALIAS        70
 #define OP_MATERIALIZE  71
+
+/* Window function kinds (stored in func_kinds[]) */
+#define TD_WIN_ROW_NUMBER    0
+#define TD_WIN_RANK          1
+#define TD_WIN_DENSE_RANK    2
+#define TD_WIN_NTILE         3
+#define TD_WIN_SUM           4
+#define TD_WIN_AVG           5
+#define TD_WIN_MIN           6
+#define TD_WIN_MAX           7
+#define TD_WIN_COUNT         8
+#define TD_WIN_LAG           9
+#define TD_WIN_LEAD         10
+#define TD_WIN_FIRST_VALUE  11
+#define TD_WIN_LAST_VALUE   12
+#define TD_WIN_NTH_VALUE    13
+
+/* Frame types */
+#define TD_FRAME_ROWS    0
+#define TD_FRAME_RANGE   1
+
+/* Frame bounds */
+#define TD_BOUND_UNBOUNDED_PRECEDING  0
+#define TD_BOUND_N_PRECEDING          1
+#define TD_BOUND_CURRENT_ROW          2
+#define TD_BOUND_N_FOLLOWING          3
+#define TD_BOUND_UNBOUNDED_FOLLOWING  4
 
 /* Op flags */
 #define OP_FLAG_FUSED        0x01
@@ -285,7 +315,7 @@ typedef struct td_op {
     struct td_op*  inputs[2];  /* NULL if unused */
 } td_op_t;
 
-/* Extended operation node (64 bytes) for N-ary ops */
+/* Extended operation node for N-ary ops (heap-allocated, variable size) */
 typedef struct td_op_ext {
     td_op_t base;              /* 32 bytes standard node */
     union {
@@ -310,6 +340,22 @@ typedef struct td_op_ext {
             uint8_t    n_join_keys;
             uint8_t    join_type;  /* 0=inner, 1=left */
         } join;
+        struct {               /* OP_WINDOW: window functions */
+            td_op_t**  part_keys;
+            td_op_t**  order_keys;
+            uint8_t*   order_descs;
+            td_op_t**  func_inputs;
+            uint8_t*   func_kinds;    /* TD_WIN_ROW_NUMBER etc. */
+            int64_t*   func_params;   /* NTILE(n), LAG offset, etc. */
+            uint8_t    n_part_keys;
+            uint8_t    n_order_keys;
+            uint8_t    n_funcs;
+            uint8_t    frame_type;    /* TD_FRAME_ROWS / TD_FRAME_RANGE */
+            uint8_t    frame_start;   /* TD_BOUND_* */
+            uint8_t    frame_end;     /* TD_BOUND_* */
+            int64_t    frame_start_n;
+            int64_t    frame_end_n;
+        } window;
     };
 } td_op_ext_t;
 
@@ -569,6 +615,13 @@ td_op_t* td_window_join(td_graph_t* g,
                          int64_t window_lo, int64_t window_hi,
                          uint16_t* agg_ops, td_op_t** agg_ins,
                          uint8_t n_aggs);
+td_op_t* td_window_op(td_graph_t* g, td_op_t* df_node,
+                       td_op_t** part_keys, uint8_t n_part,
+                       td_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
+                       uint8_t* func_kinds, td_op_t** func_inputs,
+                       int64_t* func_params, uint8_t n_funcs,
+                       uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
+                       int64_t frame_start_n, int64_t frame_end_n);
 td_op_t* td_project(td_graph_t* g, td_op_t* input,
                      td_op_t** cols, uint8_t n_cols);
 td_op_t* td_select(td_graph_t* g, td_op_t* input,

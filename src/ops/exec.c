@@ -4660,6 +4660,945 @@ static td_t* exec_date_trunc(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
+ * Window function execution
+ * ============================================================================ */
+
+/* Compare rows ra and rb on the given key columns. Returns true if any differ. */
+static inline bool win_keys_differ(td_t** vecs, uint8_t n_keys,
+                                    int64_t ra, int64_t rb) {
+    for (uint8_t k = 0; k < n_keys; k++) {
+        td_t* col = vecs[k];
+        if (!col) continue;
+        switch (col->type) {
+        case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+            if (((const int64_t*)td_data(col))[ra] !=
+                ((const int64_t*)td_data(col))[rb]) return true;
+            break;
+        case TD_F64: {
+            double a = ((const double*)td_data(col))[ra];
+            double b = ((const double*)td_data(col))[rb];
+            if (a != b) return true;
+            break;
+        }
+        case TD_I32:
+            if (((const int32_t*)td_data(col))[ra] !=
+                ((const int32_t*)td_data(col))[rb]) return true;
+            break;
+        case TD_ENUM:
+            if (((const uint32_t*)td_data(col))[ra] !=
+                ((const uint32_t*)td_data(col))[rb]) return true;
+            break;
+        default: break;
+        }
+    }
+    return false;
+}
+
+static inline double win_read_f64(td_t* col, int64_t row) {
+    switch (col->type) {
+    case TD_F64: return ((const double*)td_data(col))[row];
+    case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+        return (double)((const int64_t*)td_data(col))[row];
+    case TD_I32: return (double)((const int32_t*)td_data(col))[row];
+    case TD_ENUM: return (double)((const uint32_t*)td_data(col))[row];
+    default: return 0.0;
+    }
+}
+
+static inline int64_t win_read_i64(td_t* col, int64_t row) {
+    switch (col->type) {
+    case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+        return ((const int64_t*)td_data(col))[row];
+    case TD_I32: return (int64_t)((const int32_t*)td_data(col))[row];
+    case TD_ENUM: return (int64_t)((const uint32_t*)td_data(col))[row];
+    case TD_F64: return (int64_t)((const double*)td_data(col))[row];
+    default: return 0;
+    }
+}
+
+/* Resolve a graph op node to a column vector from df */
+static td_t* win_resolve_vec(td_graph_t* g, td_op_t* key_op, td_t* df,
+                              uint8_t* owned) {
+    td_op_ext_t* key_ext = find_ext(g, key_op->id);
+    if (key_ext && key_ext->base.opcode == OP_SCAN) {
+        *owned = 0;
+        return td_table_get_col(df, key_ext->sym);
+    }
+    *owned = 1;
+    td_t* saved = g->df;
+    g->df = df;
+    td_t* v = exec_node(g, key_op);
+    g->df = saved;
+    return v;
+}
+
+/* Compute window functions for one partition [ps, pe) in sorted_idx */
+static void win_compute_partition(
+    td_t** order_vecs, uint8_t n_order,
+    td_t** func_vecs, const uint8_t* func_kinds, const int64_t* func_params,
+    uint8_t n_funcs,
+    uint8_t frame_start, uint8_t frame_end,
+    const int64_t* sorted_idx, int64_t ps, int64_t pe,
+    td_t** result_vecs, const bool* is_f64)
+{
+    int64_t part_len = pe - ps;
+
+    for (uint8_t f = 0; f < n_funcs; f++) {
+        uint8_t kind = func_kinds[f];
+        td_t* fvec = func_vecs[f];
+        td_t* rvec = result_vecs[f];
+        bool whole = (frame_start == TD_BOUND_UNBOUNDED_PRECEDING &&
+                      frame_end == TD_BOUND_UNBOUNDED_FOLLOWING);
+
+        switch (kind) {
+        case TD_WIN_ROW_NUMBER: {
+            int64_t* out = (int64_t*)td_data(rvec);
+            for (int64_t i = ps; i < pe; i++)
+                out[sorted_idx[i]] = i - ps + 1;
+            break;
+        }
+        case TD_WIN_RANK: {
+            int64_t* out = (int64_t*)td_data(rvec);
+            int64_t rank = 1;
+            out[sorted_idx[ps]] = 1;
+            for (int64_t i = ps + 1; i < pe; i++) {
+                if (n_order > 0 && win_keys_differ(order_vecs, n_order,
+                        sorted_idx[i-1], sorted_idx[i]))
+                    rank = i - ps + 1;
+                out[sorted_idx[i]] = rank;
+            }
+            break;
+        }
+        case TD_WIN_DENSE_RANK: {
+            int64_t* out = (int64_t*)td_data(rvec);
+            int64_t rank = 1;
+            out[sorted_idx[ps]] = 1;
+            for (int64_t i = ps + 1; i < pe; i++) {
+                if (n_order > 0 && win_keys_differ(order_vecs, n_order,
+                        sorted_idx[i-1], sorted_idx[i]))
+                    rank++;
+                out[sorted_idx[i]] = rank;
+            }
+            break;
+        }
+        case TD_WIN_NTILE: {
+            int64_t n = func_params[f];
+            if (n <= 0) n = 1;
+            int64_t* out = (int64_t*)td_data(rvec);
+            for (int64_t i = ps; i < pe; i++)
+                out[sorted_idx[i]] = ((i - ps) * n) / part_len + 1;
+            break;
+        }
+        case TD_WIN_COUNT: {
+            int64_t* out = (int64_t*)td_data(rvec);
+            if (whole) {
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = part_len;
+            } else {
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = i - ps + 1;
+            }
+            break;
+        }
+        case TD_WIN_SUM: {
+            if (!fvec) break;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                if (whole) {
+                    double t = 0.0;
+                    for (int64_t i = ps; i < pe; i++)
+                        t += win_read_f64(fvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = t;
+                } else {
+                    double acc = 0.0;
+                    for (int64_t i = ps; i < pe; i++) {
+                        acc += win_read_f64(fvec, sorted_idx[i]);
+                        out[sorted_idx[i]] = acc;
+                    }
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                if (whole) {
+                    int64_t t = 0;
+                    for (int64_t i = ps; i < pe; i++)
+                        t += win_read_i64(fvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = t;
+                } else {
+                    int64_t acc = 0;
+                    for (int64_t i = ps; i < pe; i++) {
+                        acc += win_read_i64(fvec, sorted_idx[i]);
+                        out[sorted_idx[i]] = acc;
+                    }
+                }
+            }
+            break;
+        }
+        case TD_WIN_AVG: {
+            if (!fvec) break;
+            double* out = (double*)td_data(rvec);
+            if (whole) {
+                double t = 0.0;
+                for (int64_t i = ps; i < pe; i++)
+                    t += win_read_f64(fvec, sorted_idx[i]);
+                double avg = t / (double)part_len;
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = avg;
+            } else {
+                double acc = 0.0;
+                for (int64_t i = ps; i < pe; i++) {
+                    acc += win_read_f64(fvec, sorted_idx[i]);
+                    out[sorted_idx[i]] = acc / (double)(i - ps + 1);
+                }
+            }
+            break;
+        }
+        case TD_WIN_MIN: {
+            if (!fvec) break;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                if (whole) {
+                    double mn = DBL_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        double v = win_read_f64(fvec, sorted_idx[i]);
+                        if (v < mn) mn = v;
+                    }
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = mn;
+                } else {
+                    double mn = DBL_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        double v = win_read_f64(fvec, sorted_idx[i]);
+                        if (v < mn) mn = v;
+                        out[sorted_idx[i]] = mn;
+                    }
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                if (whole) {
+                    int64_t mn = INT64_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
+                        if (v < mn) mn = v;
+                    }
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = mn;
+                } else {
+                    int64_t mn = INT64_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
+                        if (v < mn) mn = v;
+                        out[sorted_idx[i]] = mn;
+                    }
+                }
+            }
+            break;
+        }
+        case TD_WIN_MAX: {
+            if (!fvec) break;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                if (whole) {
+                    double mx = -DBL_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        double v = win_read_f64(fvec, sorted_idx[i]);
+                        if (v > mx) mx = v;
+                    }
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = mx;
+                } else {
+                    double mx = -DBL_MAX;
+                    for (int64_t i = ps; i < pe; i++) {
+                        double v = win_read_f64(fvec, sorted_idx[i]);
+                        if (v > mx) mx = v;
+                        out[sorted_idx[i]] = mx;
+                    }
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                if (whole) {
+                    int64_t mx = INT64_MIN;
+                    for (int64_t i = ps; i < pe; i++) {
+                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
+                        if (v > mx) mx = v;
+                    }
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = mx;
+                } else {
+                    int64_t mx = INT64_MIN;
+                    for (int64_t i = ps; i < pe; i++) {
+                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
+                        if (v > mx) mx = v;
+                        out[sorted_idx[i]] = mx;
+                    }
+                }
+            }
+            break;
+        }
+        case TD_WIN_LAG: {
+            if (!fvec) break;
+            int64_t offset = func_params[f];
+            if (offset <= 0) offset = 1;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t src = i - offset;
+                    out[sorted_idx[i]] = (src >= ps)
+                        ? win_read_f64(fvec, sorted_idx[src]) : NAN;
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t src = i - offset;
+                    out[sorted_idx[i]] = (src >= ps)
+                        ? win_read_i64(fvec, sorted_idx[src]) : 0;
+                }
+            }
+            break;
+        }
+        case TD_WIN_LEAD: {
+            if (!fvec) break;
+            int64_t offset = func_params[f];
+            if (offset <= 0) offset = 1;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t src = i + offset;
+                    out[sorted_idx[i]] = (src < pe)
+                        ? win_read_f64(fvec, sorted_idx[src]) : NAN;
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t src = i + offset;
+                    out[sorted_idx[i]] = (src < pe)
+                        ? win_read_i64(fvec, sorted_idx[src]) : 0;
+                }
+            }
+            break;
+        }
+        case TD_WIN_FIRST_VALUE: {
+            if (!fvec) break;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                double first = win_read_f64(fvec, sorted_idx[ps]);
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = first;
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                int64_t first = win_read_i64(fvec, sorted_idx[ps]);
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = first;
+            }
+            break;
+        }
+        case TD_WIN_LAST_VALUE: {
+            if (!fvec) break;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                if (whole) {
+                    double last = win_read_f64(fvec, sorted_idx[pe - 1]);
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = last;
+                } else {
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = win_read_f64(fvec, sorted_idx[i]);
+                }
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                if (whole) {
+                    int64_t last = win_read_i64(fvec, sorted_idx[pe - 1]);
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = last;
+                } else {
+                    for (int64_t i = ps; i < pe; i++)
+                        out[sorted_idx[i]] = win_read_i64(fvec, sorted_idx[i]);
+                }
+            }
+            break;
+        }
+        case TD_WIN_NTH_VALUE: {
+            if (!fvec) break;
+            int64_t nth = func_params[f];
+            if (nth < 1) nth = 1;
+            if (is_f64[f]) {
+                double* out = (double*)td_data(rvec);
+                double val = (nth <= part_len)
+                    ? win_read_f64(fvec, sorted_idx[ps + nth - 1]) : NAN;
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = val;
+            } else {
+                int64_t* out = (int64_t*)td_data(rvec);
+                int64_t val = (nth <= part_len)
+                    ? win_read_i64(fvec, sorted_idx[ps + nth - 1]) : 0;
+                for (int64_t i = ps; i < pe; i++)
+                    out[sorted_idx[i]] = val;
+            }
+            break;
+        }
+        } /* switch */
+    } /* for each func */
+}
+
+/* Parallel per-partition window compute context */
+typedef struct {
+    td_t** order_vecs;
+    uint8_t n_order;
+    td_t** func_vecs;
+    uint8_t* func_kinds;
+    int64_t* func_params;
+    uint8_t n_funcs;
+    uint8_t frame_start;
+    uint8_t frame_end;
+    int64_t* sorted_idx;
+    int64_t* part_offsets;
+    td_t** result_vecs;
+    bool* is_f64;
+} win_par_ctx_t;
+
+static void win_par_fn(void* arg, uint32_t worker_id,
+                       int64_t start, int64_t end) {
+    (void)worker_id;
+    win_par_ctx_t* ctx = (win_par_ctx_t*)arg;
+    for (int64_t p = start; p < end; p++) {
+        win_compute_partition(
+            ctx->order_vecs, ctx->n_order,
+            ctx->func_vecs, ctx->func_kinds, ctx->func_params,
+            ctx->n_funcs, ctx->frame_start, ctx->frame_end,
+            ctx->sorted_idx, ctx->part_offsets[p], ctx->part_offsets[p + 1],
+            ctx->result_vecs, ctx->is_f64);
+    }
+}
+
+/* Parallel gather of partition key values into contiguous array.
+ * Eliminates random-access reads during Phase 2 boundary detection. */
+typedef struct {
+    const int64_t* sorted_idx;
+    uint64_t*      pkey_sorted;
+    td_t**         sort_vecs;
+    uint8_t        n_part;
+} pkey_gather_ctx_t;
+
+static void pkey_gather_fn(void* arg, uint32_t wid,
+                            int64_t start, int64_t end) {
+    (void)wid;
+    pkey_gather_ctx_t* ctx = (pkey_gather_ctx_t*)arg;
+    const int64_t* sidx = ctx->sorted_idx;
+    uint64_t* out = ctx->pkey_sorted;
+
+    if (ctx->n_part == 1) {
+        td_t* pk = ctx->sort_vecs[0];
+        const void* pkd = td_data(pk);
+        if (pk->type == TD_ENUM) {
+            const uint32_t* src = (const uint32_t*)pkd;
+            for (int64_t i = start; i < end; i++)
+                out[i] = src[sidx[i]];
+        } else if (pk->type == TD_I32) {
+            const int32_t* src = (const int32_t*)pkd;
+            for (int64_t i = start; i < end; i++)
+                out[i] = (uint64_t)(uint32_t)src[sidx[i]];
+        } else {
+            const uint64_t* src = (const uint64_t*)pkd;
+            for (int64_t i = start; i < end; i++)
+                out[i] = src[sidx[i]];
+        }
+    } else {
+        for (int64_t i = start; i < end; i++) {
+            int64_t r = sidx[i];
+            uint64_t key = 0;
+            for (uint8_t k = 0; k < ctx->n_part; k++) {
+                td_t* col = ctx->sort_vecs[k];
+                const void* d = td_data(col);
+                if (col->type == TD_ENUM)
+                    key = (key << 32) | ((const uint32_t*)d)[r];
+                else if (col->type == TD_I32)
+                    key = (key << 32) | (uint32_t)((const int32_t*)d)[r];
+                else
+                    key = (key << 32) | (uint32_t)((const uint64_t*)d)[r];
+            }
+            out[i] = key;
+        }
+    }
+}
+
+static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* df) {
+    if (!df || TD_IS_ERR(df)) return df;
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    int64_t nrows = td_table_nrows(df);
+    int64_t ncols = td_table_ncols(df);
+    uint8_t n_part  = ext->window.n_part_keys;
+    uint8_t n_order = ext->window.n_order_keys;
+    uint8_t n_funcs = ext->window.n_funcs;
+    uint8_t n_sort  = n_part + n_order;
+
+    if (nrows == 0 || n_funcs == 0) {
+        td_retain(df);
+        return df;
+    }
+
+    /* --- Phase 0: Resolve key and func_input vectors --- */
+    td_t* sort_vecs[n_sort > 0 ? n_sort : 1];
+    uint8_t sort_owned[n_sort > 0 ? n_sort : 1];
+    uint8_t sort_descs[n_sort > 0 ? n_sort : 1];
+    memset(sort_owned, 0, sizeof(sort_owned));
+    memset(sort_descs, 0, sizeof(sort_descs));
+
+    for (uint8_t k = 0; k < n_part; k++) {
+        sort_vecs[k] = win_resolve_vec(g, ext->window.part_keys[k], df,
+                                        &sort_owned[k]);
+        sort_descs[k] = 0;  /* partition keys always ASC */
+    }
+    for (uint8_t k = 0; k < n_order; k++) {
+        sort_vecs[n_part + k] = win_resolve_vec(g, ext->window.order_keys[k],
+                                                 df, &sort_owned[n_part + k]);
+        sort_descs[n_part + k] = ext->window.order_descs[k];
+    }
+
+    td_t* func_vecs[n_funcs];
+    uint8_t func_owned[n_funcs];
+    td_t* result_vecs[n_funcs];
+    bool is_f64[n_funcs];
+    memset(func_owned, 0, sizeof(func_owned));
+    memset(result_vecs, 0, sizeof(result_vecs));
+    for (uint8_t f = 0; f < n_funcs; f++) {
+        td_op_t* fi = ext->window.func_inputs[f];
+        if (fi)
+            func_vecs[f] = win_resolve_vec(g, fi, df, &func_owned[f]);
+        else
+            func_vecs[f] = NULL;
+    }
+
+    /* --- Phase 1: Sort by (partition_keys ++ order_keys) --- */
+    td_t* radix_itmp_hdr = NULL;
+    td_t* win_enum_rank_hdrs[n_sort > 0 ? n_sort : 1];
+    memset(win_enum_rank_hdrs, 0, sizeof(win_enum_rank_hdrs));
+
+    td_t* indices_hdr = NULL;
+    int64_t* indices = (int64_t*)scratch_alloc(&indices_hdr,
+                                (size_t)nrows * sizeof(int64_t));
+    if (!indices) goto oom;
+    for (int64_t i = 0; i < nrows; i++) indices[i] = i;
+
+    int64_t* sorted_idx = indices;
+
+    if (n_sort > 0 && nrows <= 64) {
+        sort_cmp_ctx_t cmp_ctx = {
+            .vecs = sort_vecs, .desc = sort_descs,
+            .nulls_first = NULL, .n_sort = n_sort,
+        };
+        sort_insertion(&cmp_ctx, indices, nrows);
+    } else if (n_sort > 0) {
+        /* --- Radix sort fast path --- */
+        bool can_radix = true;
+        for (uint8_t k = 0; k < n_sort; k++) {
+            if (!sort_vecs[k]) { can_radix = false; break; }
+            int8_t t = sort_vecs[k]->type;
+            if (t != TD_I64 && t != TD_F64 && t != TD_I32 &&
+                t != TD_ENUM && t != TD_TIMESTAMP) {
+                can_radix = false; break;
+            }
+        }
+        bool radix_done = false;
+
+        if (can_radix) {
+            td_pool_t* pool = td_pool_get();
+
+            /* Build ENUM rank mappings */
+            uint32_t* enum_ranks[n_sort];
+            memset(enum_ranks, 0, n_sort * sizeof(uint32_t*));
+            for (uint8_t k = 0; k < n_sort; k++) {
+                if (sort_vecs[k]->type == TD_ENUM) {
+                    enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
+                                                     &win_enum_rank_hdrs[k]);
+                    if (!enum_ranks[k]) { can_radix = false; break; }
+                }
+            }
+
+            if (can_radix && n_sort == 1) {
+                /* Single-key radix sort */
+                td_t *keys_hdr;
+                uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,
+                                    (size_t)nrows * sizeof(uint64_t));
+                if (keys) {
+                    radix_encode_ctx_t enc = {
+                        .keys = keys, .data = td_data(sort_vecs[0]),
+                        .type = sort_vecs[0]->type, .desc = sort_descs[0],
+                        .enum_rank = enum_ranks[0], .n_keys = 1,
+                    };
+                    if (pool)
+                        td_pool_dispatch(pool, radix_encode_fn, &enc, nrows);
+                    else
+                        radix_encode_fn(&enc, 0, 0, nrows);
+
+                    td_t *ktmp_hdr, *itmp_hdr;
+                    uint64_t* ktmp = (uint64_t*)scratch_alloc(&ktmp_hdr,
+                                        (size_t)nrows * sizeof(uint64_t));
+                    int64_t*  itmp = (int64_t*)scratch_alloc(&itmp_hdr,
+                                        (size_t)nrows * sizeof(int64_t));
+                    if (ktmp && itmp) {
+                        sorted_idx = radix_sort_run(pool, keys, indices,
+                                                     ktmp, itmp, nrows);
+                        radix_done = (sorted_idx != NULL);
+                    }
+                    scratch_free(ktmp_hdr);
+                    if (sorted_idx != itmp) scratch_free(itmp_hdr);
+                    else radix_itmp_hdr = itmp_hdr;
+                }
+                scratch_free(keys_hdr);
+            } else if (can_radix && n_sort > 1) {
+                /* Multi-key composite radix sort */
+                td_pool_t* pool2 = pool;
+                int64_t mins[n_sort], maxs[n_sort];
+                uint8_t total_bits = 0;
+                bool fits = true;
+
+                if (n_sort <= MK_PRESCAN_MAX_KEYS && pool2) {
+                    uint32_t nw = td_pool_total_workers(pool2);
+                    int64_t pw_mins[nw * n_sort];
+                    int64_t pw_maxs[nw * n_sort];
+                    for (uint32_t i = 0; i < nw * (uint32_t)n_sort; i++) {
+                        pw_mins[i] = INT64_MAX;
+                        pw_maxs[i] = INT64_MIN;
+                    }
+                    mk_prescan_ctx_t pctx = {
+                        .vecs = sort_vecs, .enum_ranks = enum_ranks,
+                        .n_keys = n_sort, .nrows = nrows, .n_workers = nw,
+                        .pw_mins = pw_mins, .pw_maxs = pw_maxs,
+                    };
+                    td_pool_dispatch(pool2, mk_prescan_fn, &pctx, nrows);
+
+                    for (uint8_t k = 0; k < n_sort; k++) {
+                        int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+                        for (uint32_t w = 0; w < nw; w++) {
+                            int64_t wmin = pw_mins[w * n_sort + k];
+                            int64_t wmax = pw_maxs[w * n_sort + k];
+                            if (wmin < kmin) kmin = wmin;
+                            if (wmax > kmax) kmax = wmax;
+                        }
+                        mins[k] = kmin;
+                        maxs[k] = kmax;
+                        uint64_t range = (uint64_t)(kmax - kmin);
+                        uint8_t bits = 1;
+                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                            bits++;
+                        total_bits += bits;
+                    }
+                } else {
+                    for (uint8_t k = 0; k < n_sort; k++) {
+                        td_t* col = sort_vecs[k];
+                        int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+                        if (enum_ranks[k]) {
+                            const uint32_t* d = (const uint32_t*)td_data(col);
+                            for (int64_t i = 0; i < nrows; i++) {
+                                int64_t v = (int64_t)enum_ranks[k][d[i]];
+                                if (v < kmin) kmin = v;
+                                if (v > kmax) kmax = v;
+                            }
+                        } else if (col->type == TD_I64 || col->type == TD_SYM ||
+                                   col->type == TD_TIMESTAMP) {
+                            const int64_t* d = (const int64_t*)td_data(col);
+                            for (int64_t i = 0; i < nrows; i++) {
+                                if (d[i] < kmin) kmin = d[i];
+                                if (d[i] > kmax) kmax = d[i];
+                            }
+                        } else if (col->type == TD_I32) {
+                            const int32_t* d = (const int32_t*)td_data(col);
+                            for (int64_t i = 0; i < nrows; i++) {
+                                if (d[i] < kmin) kmin = (int64_t)d[i];
+                                if (d[i] > kmax) kmax = (int64_t)d[i];
+                            }
+                        }
+                        mins[k] = kmin;
+                        maxs[k] = kmax;
+                        uint64_t range = (uint64_t)(kmax - kmin);
+                        uint8_t bits = 1;
+                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                            bits++;
+                        total_bits += bits;
+                    }
+                }
+
+                if (total_bits > 64) fits = false;
+
+                if (fits) {
+                    uint8_t bit_shifts[n_sort];
+                    uint8_t accum = 0;
+                    for (int k = n_sort - 1; k >= 0; k--) {
+                        bit_shifts[k] = accum;
+                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint8_t bits = 1;
+                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                            bits++;
+                        accum += bits;
+                    }
+
+                    td_t *keys_hdr;
+                    uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,
+                                        (size_t)nrows * sizeof(uint64_t));
+                    if (keys) {
+                        radix_encode_ctx_t enc = {
+                            .keys = keys, .n_keys = n_sort, .vecs = sort_vecs,
+                        };
+                        for (uint8_t k = 0; k < n_sort; k++) {
+                            enc.mins[k] = mins[k];
+                            enc.ranges[k] = maxs[k] - mins[k];
+                            enc.bit_shifts[k] = bit_shifts[k];
+                            enc.descs[k] = sort_descs[k];
+                            enc.enum_ranks[k] = enum_ranks[k];
+                        }
+                        if (pool2)
+                            td_pool_dispatch(pool2, radix_encode_fn, &enc, nrows);
+                        else
+                            radix_encode_fn(&enc, 0, 0, nrows);
+
+                        td_t *ktmp_hdr, *itmp_hdr;
+                        uint64_t* ktmp = (uint64_t*)scratch_alloc(&ktmp_hdr,
+                                            (size_t)nrows * sizeof(uint64_t));
+                        int64_t*  itmp = (int64_t*)scratch_alloc(&itmp_hdr,
+                                            (size_t)nrows * sizeof(int64_t));
+                        if (ktmp && itmp) {
+                            sorted_idx = radix_sort_run(pool2, keys, indices,
+                                                         ktmp, itmp, nrows);
+                            radix_done = (sorted_idx != NULL);
+                        }
+                        scratch_free(ktmp_hdr);
+                        if (sorted_idx != itmp) scratch_free(itmp_hdr);
+                        else radix_itmp_hdr = itmp_hdr;
+                    }
+                    scratch_free(keys_hdr);
+                }
+            }
+        }
+
+        /* --- Merge sort fallback --- */
+        if (!radix_done) {
+            sort_cmp_ctx_t cmp_ctx = {
+                .vecs = sort_vecs, .desc = sort_descs,
+                .nulls_first = NULL, .n_sort = n_sort,
+            };
+            td_t* tmp_hdr;
+            int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr,
+                                (size_t)nrows * sizeof(int64_t));
+            if (!tmp) { scratch_free(indices_hdr); indices_hdr = NULL; goto oom; }
+
+            td_pool_t* pool = td_pool_get();
+            uint32_t nw = pool ? td_pool_total_workers(pool) : 1;
+            if (pool && nw > 1 && nrows > 1024) {
+                sort_phase1_ctx_t p1ctx = {
+                    .cmp_ctx = &cmp_ctx, .indices = indices, .tmp = tmp,
+                    .nrows = nrows, .n_chunks = nw,
+                };
+                td_pool_dispatch_n(pool, sort_phase1_fn, &p1ctx, nw);
+
+                int64_t chunk_size = (nrows + nw - 1) / nw;
+                int64_t run_size = chunk_size;
+                int64_t* src = indices;
+                int64_t* dst = tmp;
+                while (run_size < nrows) {
+                    int64_t n_pairs = (nrows + 2 * run_size - 1) / (2 * run_size);
+                    sort_merge_ctx_t mctx = {
+                        .cmp_ctx = &cmp_ctx, .src = src, .dst = dst,
+                        .nrows = nrows, .run_size = run_size,
+                    };
+                    if (n_pairs > 1)
+                        td_pool_dispatch_n(pool, sort_merge_fn, &mctx,
+                                            (uint32_t)n_pairs);
+                    else
+                        sort_merge_fn(&mctx, 0, 0, n_pairs);
+                    int64_t* t = src; src = dst; dst = t;
+                    run_size *= 2;
+                }
+                if (src != indices)
+                    memcpy(indices, src, (size_t)nrows * sizeof(int64_t));
+            } else {
+                sort_merge_recursive(&cmp_ctx, indices, tmp, nrows);
+            }
+            scratch_free(tmp_hdr);
+            sorted_idx = indices;
+        }
+    }
+
+    /* --- Phase 2: Find partition boundaries --- */
+    /* Overallocate part_offsets to worst case (single-pass, no counting pass) */
+    td_t* poff_hdr = NULL;
+    int64_t* part_offsets = (int64_t*)scratch_alloc(&poff_hdr,
+                                (size_t)(nrows + 1) * sizeof(int64_t));
+    if (!part_offsets) { scratch_free(indices_hdr); goto oom; }
+
+    part_offsets[0] = 0;
+    int64_t n_parts = 0;
+
+    if (n_part > 0) {
+        /* Check if we can pack partition keys into uint64 for fast gather */
+        uint8_t pk_bits = 0;
+        bool can_pack = true;
+        for (uint8_t k = 0; k < n_part; k++) {
+            int8_t t = sort_vecs[k]->type;
+            if (t == TD_ENUM || t == TD_I32) pk_bits += 32;
+            else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP ||
+                     t == TD_F64) pk_bits += 64;
+            else { can_pack = false; break; }
+            if (pk_bits > 64) { can_pack = false; break; }
+        }
+
+        td_t* pkey_hdr = NULL;
+        uint64_t* pkey_sorted = can_pack ?
+            (uint64_t*)scratch_alloc(&pkey_hdr, (size_t)nrows * sizeof(uint64_t))
+            : NULL;
+
+        if (pkey_sorted) {
+            /* Parallel gather partition keys into contiguous array */
+            pkey_gather_ctx_t gctx = {
+                .sorted_idx = sorted_idx, .pkey_sorted = pkey_sorted,
+                .sort_vecs = sort_vecs, .n_part = n_part,
+            };
+            td_pool_t* gpool = td_pool_get();
+            if (gpool)
+                td_pool_dispatch(gpool, pkey_gather_fn, &gctx, nrows);
+            else
+                pkey_gather_fn(&gctx, 0, 0, nrows);
+
+            /* Sequential scan on contiguous data (no random access) */
+            for (int64_t i = 1; i < nrows; i++)
+                if (pkey_sorted[i] != pkey_sorted[i - 1])
+                    part_offsets[++n_parts] = i;
+
+            scratch_free(pkey_hdr);
+        } else {
+            /* Fallback: single-pass random-access comparison */
+            for (int64_t i = 1; i < nrows; i++)
+                if (win_keys_differ(sort_vecs, n_part,
+                                    sorted_idx[i - 1], sorted_idx[i]))
+                    part_offsets[++n_parts] = i;
+        }
+        part_offsets[++n_parts] = nrows;
+    } else {
+        part_offsets[1] = nrows;
+        n_parts = 1;
+    }
+
+    /* --- Phase 3: Allocate result vectors and compute per-partition --- */
+    for (uint8_t f = 0; f < n_funcs; f++) {
+        uint8_t kind = ext->window.func_kinds[f];
+        td_t* fvec = func_vecs[f];
+
+        bool out_f64 = false;
+        if (kind == TD_WIN_AVG) {
+            out_f64 = true;
+        } else if (kind == TD_WIN_SUM || kind == TD_WIN_MIN ||
+                   kind == TD_WIN_MAX || kind == TD_WIN_LAG ||
+                   kind == TD_WIN_LEAD || kind == TD_WIN_FIRST_VALUE ||
+                   kind == TD_WIN_LAST_VALUE || kind == TD_WIN_NTH_VALUE) {
+            out_f64 = fvec && fvec->type == TD_F64;
+        }
+
+        is_f64[f] = out_f64;
+        result_vecs[f] = td_vec_new(out_f64 ? TD_F64 : TD_I64, nrows);
+        if (!result_vecs[f] || TD_IS_ERR(result_vecs[f])) {
+            for (uint8_t j = 0; j < f; j++) td_release(result_vecs[j]);
+            scratch_free(poff_hdr);
+            scratch_free(indices_hdr);
+            goto oom;
+        }
+        result_vecs[f]->len = nrows;
+        memset(td_data(result_vecs[f]), 0, (size_t)nrows * 8);
+    }
+
+    /* Order key vectors start at sort_vecs[n_part] */
+    td_t** order_vecs = n_order > 0 ? &sort_vecs[n_part] : NULL;
+
+    {
+        td_pool_t* p3pool = td_pool_get();
+        if (p3pool && n_parts > 1) {
+            win_par_ctx_t pctx = {
+                .order_vecs = order_vecs, .n_order = n_order,
+                .func_vecs = func_vecs, .func_kinds = ext->window.func_kinds,
+                .func_params = ext->window.func_params, .n_funcs = n_funcs,
+                .frame_start = ext->window.frame_start,
+                .frame_end = ext->window.frame_end,
+                .sorted_idx = sorted_idx, .part_offsets = part_offsets,
+                .result_vecs = result_vecs, .is_f64 = is_f64,
+            };
+            td_pool_dispatch_n(p3pool, win_par_fn, &pctx, (uint32_t)n_parts);
+        } else {
+            for (int64_t p = 0; p < n_parts; p++) {
+                win_compute_partition(
+                    order_vecs, n_order,
+                    func_vecs, ext->window.func_kinds, ext->window.func_params,
+                    n_funcs, ext->window.frame_start, ext->window.frame_end,
+                    sorted_idx, part_offsets[p], part_offsets[p + 1],
+                    result_vecs, is_f64);
+            }
+        }
+    }
+
+    /* --- Phase 4: Build result table --- */
+    td_t* result = td_table_new(ncols + n_funcs);
+    if (!result || TD_IS_ERR(result)) {
+        for (uint8_t f = 0; f < n_funcs; f++) td_release(result_vecs[f]);
+        scratch_free(poff_hdr);
+        scratch_free(indices_hdr);
+        goto oom;
+    }
+
+    /* Pass-through original columns */
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(df, c);
+        int64_t name_id = td_table_col_name(df, c);
+        td_retain(col);
+        result = td_table_add_col(result, name_id, col);
+        td_release(col);
+    }
+
+    /* Add window result columns with auto-generated names */
+    for (uint8_t f = 0; f < n_funcs; f++) {
+        char buf[16] = "_w";
+        int pos = 2;
+        if (f >= 10) buf[pos++] = '0' + (f / 10);
+        buf[pos++] = '0' + (f % 10);
+        buf[pos] = '\0';
+        int64_t name_id = td_sym_intern(buf, (size_t)pos);
+        result = td_table_add_col(result, name_id, result_vecs[f]);
+        td_release(result_vecs[f]);
+    }
+
+    scratch_free(poff_hdr);
+    if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
+    scratch_free(indices_hdr);
+    for (uint8_t k = 0; k < n_sort; k++)
+        if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
+
+    /* Free owned key/func vectors */
+    for (uint8_t k = 0; k < n_sort; k++)
+        if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+            td_release(sort_vecs[k]);
+    for (uint8_t f = 0; f < n_funcs; f++)
+        if (func_owned[f] && func_vecs[f] && !TD_IS_ERR(func_vecs[f]))
+            td_release(func_vecs[f]);
+
+    return result;
+
+oom:
+    if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
+    for (uint8_t k = 0; k < n_sort; k++)
+        if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
+    for (uint8_t k = 0; k < n_sort; k++)
+        if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+            td_release(sort_vecs[k]);
+    for (uint8_t f = 0; f < n_funcs; f++) {
+        if (func_owned[f] && func_vecs[f] && !TD_IS_ERR(func_vecs[f]))
+            td_release(func_vecs[f]);
+        if (result_vecs[f] && !TD_IS_ERR(result_vecs[f]))
+            td_release(result_vecs[f]);
+    }
+    return TD_ERR_PTR(TD_ERR_OOM);
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -4753,6 +5692,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* result = exec_join(g, op, left, right);
             td_release(left);
             td_release(right);
+            return result;
+        }
+
+        case OP_WINDOW: {
+            td_t* input = exec_node(g, op->inputs[0]);
+            if (!input || TD_IS_ERR(input)) return input;
+            td_t* wdf = (input->type == TD_TABLE) ? input : g->df;
+            td_t* result = exec_window(g, op, wdf);
+            if (input != g->df) td_release(input);
             return result;
         }
 

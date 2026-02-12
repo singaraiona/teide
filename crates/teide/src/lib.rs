@@ -81,6 +81,32 @@ mod ffi {
     pub const OP_LAST: u16 = 57;
     pub const OP_COUNT_DISTINCT: u16 = 58;
 
+    // ---- Window function constants ----------------------------------------
+
+    pub const TD_WIN_ROW_NUMBER: u8 = 0;
+    pub const TD_WIN_RANK: u8 = 1;
+    pub const TD_WIN_DENSE_RANK: u8 = 2;
+    pub const TD_WIN_NTILE: u8 = 3;
+    pub const TD_WIN_SUM: u8 = 4;
+    pub const TD_WIN_AVG: u8 = 5;
+    pub const TD_WIN_MIN: u8 = 6;
+    pub const TD_WIN_MAX: u8 = 7;
+    pub const TD_WIN_COUNT: u8 = 8;
+    pub const TD_WIN_LAG: u8 = 9;
+    pub const TD_WIN_LEAD: u8 = 10;
+    pub const TD_WIN_FIRST_VALUE: u8 = 11;
+    pub const TD_WIN_LAST_VALUE: u8 = 12;
+    pub const TD_WIN_NTH_VALUE: u8 = 13;
+
+    pub const TD_FRAME_ROWS: u8 = 0;
+    pub const TD_FRAME_RANGE: u8 = 1;
+
+    pub const TD_BOUND_UNBOUNDED_PRECEDING: u8 = 0;
+    pub const TD_BOUND_N_PRECEDING: u8 = 1;
+    pub const TD_BOUND_CURRENT_ROW: u8 = 2;
+    pub const TD_BOUND_N_FOLLOWING: u8 = 3;
+    pub const TD_BOUND_UNBOUNDED_FOLLOWING: u8 = 4;
+
     // ---- EXTRACT field constants ------------------------------------------
 
     pub const TD_EXTRACT_YEAR: i64 = 0;
@@ -282,6 +308,26 @@ mod ffi {
             join_type: u8,
         ) -> *mut td_op_t;
 
+        // Window functions
+        pub fn td_window_op(
+            g: *mut td_graph_t,
+            df_node: *mut td_op_t,
+            part_keys: *mut *mut td_op_t,
+            n_part: u8,
+            order_keys: *mut *mut td_op_t,
+            order_descs: *mut u8,
+            n_order: u8,
+            func_kinds: *mut u8,
+            func_inputs: *mut *mut td_op_t,
+            func_params: *mut i64,
+            n_funcs: u8,
+            frame_type: u8,
+            frame_start: u8,
+            frame_end: u8,
+            frame_start_n: i64,
+            frame_end_n: i64,
+        ) -> *mut td_op_t;
+
         // Ternary conditional (IF)
         pub fn td_if(
             g: *mut td_graph_t,
@@ -413,6 +459,100 @@ impl AggOp {
             AggOp::First => ffi::OP_FIRST,
             AggOp::Last => ffi::OP_LAST,
             AggOp::CountDistinct => ffi::OP_COUNT_DISTINCT,
+        }
+    }
+}
+
+/// Window function variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile(i64),
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
+    Lag(i64),
+    Lead(i64),
+    FirstValue,
+    LastValue,
+    NthValue(i64),
+}
+
+impl WindowFunc {
+    /// Returns the TD_WIN_* kind code for the C API.
+    pub fn kind_code(&self) -> u8 {
+        match self {
+            WindowFunc::RowNumber => ffi::TD_WIN_ROW_NUMBER,
+            WindowFunc::Rank => ffi::TD_WIN_RANK,
+            WindowFunc::DenseRank => ffi::TD_WIN_DENSE_RANK,
+            WindowFunc::Ntile(_) => ffi::TD_WIN_NTILE,
+            WindowFunc::Sum => ffi::TD_WIN_SUM,
+            WindowFunc::Avg => ffi::TD_WIN_AVG,
+            WindowFunc::Min => ffi::TD_WIN_MIN,
+            WindowFunc::Max => ffi::TD_WIN_MAX,
+            WindowFunc::Count => ffi::TD_WIN_COUNT,
+            WindowFunc::Lag(_) => ffi::TD_WIN_LAG,
+            WindowFunc::Lead(_) => ffi::TD_WIN_LEAD,
+            WindowFunc::FirstValue => ffi::TD_WIN_FIRST_VALUE,
+            WindowFunc::LastValue => ffi::TD_WIN_LAST_VALUE,
+            WindowFunc::NthValue(_) => ffi::TD_WIN_NTH_VALUE,
+        }
+    }
+
+    /// Returns the parameter value (offset, ntile count, etc.), or 0 if none.
+    pub fn param(&self) -> i64 {
+        match self {
+            WindowFunc::Ntile(n) | WindowFunc::Lag(n) | WindowFunc::Lead(n) | WindowFunc::NthValue(n) => *n,
+            _ => 0,
+        }
+    }
+}
+
+/// Window frame type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameType {
+    Rows,
+    Range,
+}
+
+impl FrameType {
+    fn to_code(self) -> u8 {
+        match self {
+            FrameType::Rows => ffi::TD_FRAME_ROWS,
+            FrameType::Range => ffi::TD_FRAME_RANGE,
+        }
+    }
+}
+
+/// Window frame bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
+}
+
+impl FrameBound {
+    fn to_code(&self) -> u8 {
+        match self {
+            FrameBound::UnboundedPreceding => ffi::TD_BOUND_UNBOUNDED_PRECEDING,
+            FrameBound::Preceding(_) => ffi::TD_BOUND_N_PRECEDING,
+            FrameBound::CurrentRow => ffi::TD_BOUND_CURRENT_ROW,
+            FrameBound::Following(_) => ffi::TD_BOUND_N_FOLLOWING,
+            FrameBound::UnboundedFollowing => ffi::TD_BOUND_UNBOUNDED_FOLLOWING,
+        }
+    }
+
+    fn to_n(&self) -> i64 {
+        match self {
+            FrameBound::Preceding(n) | FrameBound::Following(n) => *n,
+            _ => 0,
         }
     }
 }
@@ -1092,6 +1232,72 @@ impl Graph<'_> {
         Column { raw }
     }
 
+    /// Window function computation.
+    ///
+    /// Produces a table with all original columns plus one new column per
+    /// window function. Partitions by `part_keys`, orders within each
+    /// partition by `order_keys` (with `order_descs` flags), and computes
+    /// each function described by `funcs` and `func_inputs`.
+    pub fn window_op(
+        &mut self,
+        df_node: Column,
+        part_keys: &[Column],
+        order_keys: &[Column],
+        order_descs: &[bool],
+        funcs: &[WindowFunc],
+        func_inputs: &[Column],
+        frame_type: FrameType,
+        frame_start: FrameBound,
+        frame_end: FrameBound,
+    ) -> Column {
+        assert_eq!(
+            order_keys.len(),
+            order_descs.len(),
+            "order_keys and order_descs must have the same length"
+        );
+        assert_eq!(
+            funcs.len(),
+            func_inputs.len(),
+            "funcs and func_inputs must have the same length"
+        );
+
+        let mut pk_ptrs: Vec<*mut ffi::td_op_t> = part_keys.iter().map(|c| c.raw).collect();
+        let mut ok_ptrs: Vec<*mut ffi::td_op_t> = order_keys.iter().map(|c| c.raw).collect();
+        let mut od_u8: Vec<u8> = order_descs.iter().map(|&d| d as u8).collect();
+        let mut kinds: Vec<u8> = funcs.iter().map(|f| f.kind_code()).collect();
+        let mut fi_ptrs: Vec<*mut ffi::td_op_t> = func_inputs.iter().map(|c| c.raw).collect();
+        let mut params: Vec<i64> = funcs.iter().map(|f| f.param()).collect();
+
+        let raw = unsafe {
+            ffi::td_window_op(
+                self.raw,
+                df_node.raw,
+                pk_ptrs.as_mut_ptr(),
+                part_keys.len() as u8,
+                ok_ptrs.as_mut_ptr(),
+                od_u8.as_mut_ptr(),
+                order_keys.len() as u8,
+                kinds.as_mut_ptr(),
+                fi_ptrs.as_mut_ptr(),
+                params.as_mut_ptr(),
+                funcs.len() as u8,
+                frame_type.to_code(),
+                frame_start.to_code(),
+                frame_end.to_code(),
+                frame_start.to_n(),
+                frame_end.to_n(),
+            )
+        };
+        // Pin all arrays — td_window_op stores pointers to them
+        self._pinned.push(Box::new(pk_ptrs));
+        self._pinned.push(Box::new(ok_ptrs));
+        self._pinned.push(Box::new(od_u8));
+        self._pinned.push(Box::new(kinds));
+        self._pinned.push(Box::new(fi_ptrs));
+        self._pinned.push(Box::new(params));
+        Column { raw }
+    }
+
     /// Project (select) specific columns from a DataFrame node.
     pub fn project(&self, input: Column, cols: &[Column]) -> Column {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
@@ -1250,6 +1456,33 @@ pub mod extract_field {
     pub const DOW: i64 = super::ffi::TD_EXTRACT_DOW;
     pub const DOY: i64 = super::ffi::TD_EXTRACT_DOY;
     pub const EPOCH: i64 = super::ffi::TD_EXTRACT_EPOCH;
+}
+
+// Re-export window function constants
+pub mod window_func {
+    pub const ROW_NUMBER: u8 = super::ffi::TD_WIN_ROW_NUMBER;
+    pub const RANK: u8 = super::ffi::TD_WIN_RANK;
+    pub const DENSE_RANK: u8 = super::ffi::TD_WIN_DENSE_RANK;
+    pub const NTILE: u8 = super::ffi::TD_WIN_NTILE;
+    pub const SUM: u8 = super::ffi::TD_WIN_SUM;
+    pub const AVG: u8 = super::ffi::TD_WIN_AVG;
+    pub const MIN: u8 = super::ffi::TD_WIN_MIN;
+    pub const MAX: u8 = super::ffi::TD_WIN_MAX;
+    pub const COUNT: u8 = super::ffi::TD_WIN_COUNT;
+    pub const LAG: u8 = super::ffi::TD_WIN_LAG;
+    pub const LEAD: u8 = super::ffi::TD_WIN_LEAD;
+    pub const FIRST_VALUE: u8 = super::ffi::TD_WIN_FIRST_VALUE;
+    pub const LAST_VALUE: u8 = super::ffi::TD_WIN_LAST_VALUE;
+    pub const NTH_VALUE: u8 = super::ffi::TD_WIN_NTH_VALUE;
+
+    pub const FRAME_ROWS: u8 = super::ffi::TD_FRAME_ROWS;
+    pub const FRAME_RANGE: u8 = super::ffi::TD_FRAME_RANGE;
+
+    pub const BOUND_UNBOUNDED_PRECEDING: u8 = super::ffi::TD_BOUND_UNBOUNDED_PRECEDING;
+    pub const BOUND_PRECEDING: u8 = super::ffi::TD_BOUND_N_PRECEDING;
+    pub const BOUND_CURRENT_ROW: u8 = super::ffi::TD_BOUND_CURRENT_ROW;
+    pub const BOUND_FOLLOWING: u8 = super::ffi::TD_BOUND_N_FOLLOWING;
+    pub const BOUND_UNBOUNDED_FOLLOWING: u8 = super::ffi::TD_BOUND_UNBOUNDED_FOLLOWING;
 }
 
 // Re-export type constants

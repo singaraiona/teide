@@ -769,3 +769,254 @@ fn bench_j2() {
     // All 10M+ left rows preserved
     assert!(r.table.nrows() >= 10_000_000);
 }
+
+// ---------------------------------------------------------------------------
+// Window function benchmarks (10M rows)
+// ---------------------------------------------------------------------------
+
+fn run_window_bench(label: &str, sql: &str) {
+    let mut session = setup_bench_groupby().expect("10M CSV not found");
+    // Warmup
+    let _ = session.execute(sql).unwrap();
+    let n_iter = 5;
+    let mut times = Vec::with_capacity(n_iter);
+    for _ in 0..n_iter {
+        let t0 = std::time::Instant::now();
+        let _ = session.execute(sql).unwrap();
+        times.push(t0.elapsed().as_secs_f64());
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[n_iter / 2];
+    eprintln!("  {label:12}  {:.1} ms", median * 1000.0);
+}
+
+#[test]
+#[ignore]
+fn bench_w1() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w1", "SELECT id1, v1, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1) as rn FROM t");
+}
+
+#[test]
+#[ignore]
+fn bench_w2() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w2", "SELECT id1, id4, RANK() OVER (PARTITION BY id1 ORDER BY id4) as rnk FROM t");
+}
+
+#[test]
+#[ignore]
+fn bench_w3() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w3", "SELECT id3, v1, SUM(v1) OVER (PARTITION BY id3 ORDER BY v1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_sum FROM t");
+}
+
+#[test]
+#[ignore]
+fn bench_w4() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w4", "SELECT id1, v1, LAG(v1, 1) OVER (PARTITION BY id1 ORDER BY v1) as lag_v1 FROM t");
+}
+
+#[test]
+#[ignore]
+fn bench_w5() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w5", "SELECT id1, v1, AVG(v1) OVER (PARTITION BY id1) as avg_v1 FROM t");
+}
+
+#[test]
+#[ignore]
+fn bench_w6() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    run_window_bench("w6", "SELECT id1, id2, v1, ROW_NUMBER() OVER (PARTITION BY id1, id2 ORDER BY v1) as rn FROM t");
+}
+
+// ---------------------------------------------------------------------------
+// Window function SQL tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_row_number_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, v1, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1) as rn FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns.len(), 3);
+    assert_eq!(r.columns[2], "rn");
+
+    // Each id1 partition (5 groups × 4 rows) → rn ∈ {1,2,3,4}
+    for row in 0..r.table.nrows() as usize {
+        let rn = r.table.get_i64(2, row).unwrap();
+        assert!(rn >= 1 && rn <= 4, "ROW_NUMBER should be 1..4, got {rn}");
+    }
+}
+
+#[test]
+fn window_rank_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, id4, RANK() OVER (PARTITION BY id1 ORDER BY id4) as rnk FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns[2], "rnk");
+    for row in 0..r.table.nrows() as usize {
+        let rnk = r.table.get_i64(2, row).unwrap();
+        assert!(rnk >= 1, "RANK should be >= 1, got {rnk}");
+    }
+}
+
+#[test]
+fn window_dense_rank_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, id4, DENSE_RANK() OVER (PARTITION BY id1 ORDER BY id4) as dr FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns[2], "dr");
+    for row in 0..r.table.nrows() as usize {
+        let dr = r.table.get_i64(2, row).unwrap();
+        assert!(dr >= 1 && dr <= 3, "DENSE_RANK should be 1..3 (3 distinct id4 values), got {dr}");
+    }
+}
+
+#[test]
+fn window_running_sum_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1, v1, SUM(v1) OVER (PARTITION BY id1 ORDER BY v1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_sum FROM csv",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns[2], "running_sum");
+}
+
+#[test]
+fn window_lag_lead_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT v1, LAG(v1) OVER (ORDER BY v1) as lag_v1, LEAD(v1) OVER (ORDER BY v1) as lead_v1 FROM csv",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns.len(), 3);
+    assert_eq!(r.columns[1], "lag_v1");
+    assert_eq!(r.columns[2], "lead_v1");
+}
+
+#[test]
+fn window_no_partition_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // Entire table is one partition
+    let r = unwrap_query(
+        session
+            .execute("SELECT v1, ROW_NUMBER() OVER (ORDER BY v1) as rn FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    // rn should range from 1 to 20
+    let mut rns: Vec<i64> = (0..20).map(|i| r.table.get_i64(1, i).unwrap()).collect();
+    rns.sort();
+    assert_eq!(rns, (1..=20).collect::<Vec<_>>());
+}
+
+#[test]
+fn window_full_partition_avg_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // No ORDER BY → whole partition frame, AVG over entire partition
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, v1, AVG(v1) OVER (PARTITION BY id1) as avg_v1 FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns[2], "avg_v1");
+
+    // All rows in same partition should have same avg
+    // id001: v1 = 1,2,3,4 → avg = 2.5
+    for row in 0..r.table.nrows() as usize {
+        let id1 = r.table.get_str(0, row).unwrap().to_string();
+        let avg = r.table.get_f64(2, row).unwrap();
+        if id1 == "id001" {
+            assert!((avg - 2.5).abs() < 1e-10, "id001 avg should be 2.5, got {avg}");
+        }
+    }
+}
+
+#[test]
+fn window_count_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, COUNT(v1) OVER (PARTITION BY id1) as cnt FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns.len(), 2);
+    // Each id1 partition has 4 rows → count should be 4
+    for row in 0..r.table.nrows() as usize {
+        let cnt = r.table.get_i64(1, row).unwrap();
+        assert_eq!(cnt, 4, "COUNT per partition should be 4, got {cnt}");
+    }
+}
+
+#[test]
+fn window_ntile_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT v1, NTILE(4) OVER (ORDER BY v1) as tile FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    // NTILE(4) over 20 rows → 5 per tile, tiles 1-4
+    for row in 0..r.table.nrows() as usize {
+        let tile = r.table.get_i64(1, row).unwrap();
+        assert!(tile >= 1 && tile <= 4, "NTILE(4) should be 1..4, got {tile}");
+    }
+}
+
+#[test]
+fn window_first_last_value_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1, v1, FIRST_VALUE(v1) OVER (PARTITION BY id1 ORDER BY v1) as fv FROM csv",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    // FIRST_VALUE within each partition ordered by v1 → the min v1 in partition
+    // id001: v1={1,2,3,4} → first_value = 1
+    for row in 0..r.table.nrows() as usize {
+        let id1 = r.table.get_str(0, row).unwrap().to_string();
+        let fv = r.table.get_i64(2, row).unwrap();
+        if id1 == "id001" {
+            assert_eq!(fv, 1, "id001 FIRST_VALUE should be 1, got {fv}");
+        }
+    }
+}

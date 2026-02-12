@@ -600,6 +600,84 @@ td_op_t* td_window_join(td_graph_t* g,
     return &g->nodes[ext->base.id];
 }
 
+td_op_t* td_window_op(td_graph_t* g, td_op_t* df_node,
+                       td_op_t** part_keys, uint8_t n_part,
+                       td_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
+                       uint8_t* func_kinds, td_op_t** func_inputs,
+                       int64_t* func_params, uint8_t n_funcs,
+                       uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
+                       int64_t frame_start_n, int64_t frame_end_n) {
+    /* Trailing layout:
+     *   [part_keys:   n_part * ptr]
+     *   [order_keys:  n_order * ptr]
+     *   [order_descs: n_order * 1B]
+     *   [padding to ptr alignment]
+     *   [func_inputs: n_funcs * ptr]
+     *   [func_kinds:  n_funcs * 1B]
+     *   [padding to 8B alignment]
+     *   [func_params: n_funcs * 8B]
+     */
+    size_t pk_sz    = (size_t)n_part  * sizeof(td_op_t*);
+    size_t ok_sz    = (size_t)n_order * sizeof(td_op_t*);
+    size_t od_sz    = (size_t)n_order;
+    size_t od_end   = pk_sz + ok_sz + od_sz;
+    size_t fi_off   = (od_end + sizeof(td_op_t*) - 1) & ~(sizeof(td_op_t*) - 1);
+    size_t fi_sz    = (size_t)n_funcs * sizeof(td_op_t*);
+    size_t fk_off   = fi_off + fi_sz;
+    size_t fk_sz    = (size_t)n_funcs;
+    size_t fp_off   = (fk_off + fk_sz + 7) & ~(size_t)7;
+    size_t fp_sz    = (size_t)n_funcs * sizeof(int64_t);
+    size_t total    = fp_off + fp_sz;
+
+    /* Save IDs before alloc — realloc may invalidate pointers */
+    uint32_t df_id = df_node->id;
+    uint32_t est   = df_node->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node_ex(g, total);
+    if (!ext) return NULL;
+
+    /* Re-resolve df_node after potential realloc */
+    df_node = &g->nodes[df_id];
+
+    ext->base.opcode   = OP_WINDOW;
+    ext->base.arity    = 1;
+    ext->base.inputs[0] = df_node;
+    ext->base.out_type = TD_TABLE;
+    ext->base.est_rows = est;  /* window preserves row count */
+
+    /* Fill trailing arrays */
+    char* trail = EXT_TRAIL(ext);
+    ext->window.part_keys = (td_op_t**)trail;
+    if (n_part)  memcpy(ext->window.part_keys, part_keys, pk_sz);
+
+    ext->window.order_keys = (td_op_t**)(trail + pk_sz);
+    if (n_order) memcpy(ext->window.order_keys, order_keys, ok_sz);
+
+    ext->window.order_descs = (uint8_t*)(trail + pk_sz + ok_sz);
+    if (n_order) memcpy(ext->window.order_descs, order_descs, od_sz);
+
+    ext->window.func_inputs = (td_op_t**)(trail + fi_off);
+    if (n_funcs) memcpy(ext->window.func_inputs, func_inputs, fi_sz);
+
+    ext->window.func_kinds = (uint8_t*)(trail + fk_off);
+    if (n_funcs) memcpy(ext->window.func_kinds, func_kinds, fk_sz);
+
+    ext->window.func_params = (int64_t*)(trail + fp_off);
+    if (n_funcs) memcpy(ext->window.func_params, func_params, fp_sz);
+
+    ext->window.n_part_keys   = n_part;
+    ext->window.n_order_keys  = n_order;
+    ext->window.n_funcs       = n_funcs;
+    ext->window.frame_type    = frame_type;
+    ext->window.frame_start   = frame_start;
+    ext->window.frame_end     = frame_end;
+    ext->window.frame_start_n = frame_start_n;
+    ext->window.frame_end_n   = frame_end_n;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 td_op_t* td_project(td_graph_t* g, td_op_t* input,
                      td_op_t** cols, uint8_t n_cols) {
     size_t cols_sz = (size_t)n_cols * sizeof(td_op_t*);

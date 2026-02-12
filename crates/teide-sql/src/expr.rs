@@ -4,10 +4,11 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, DuplicateTreatment, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
+    FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, UnaryOperator, Value,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
-use teide::{AggOp, Column, Graph};
+use teide::{AggOp, Column, FrameBound, FrameType, Graph, WindowFunc};
 
 use crate::SqlError;
 
@@ -247,10 +248,14 @@ pub fn plan_expr(
             ))
         }
 
-        // Scalar functions and aggregate detection
+        // Scalar functions, aggregate detection, and window function detection
         Expr::Function(f) => {
             let name = f.name.to_string().to_lowercase();
-            if is_aggregate_name(&name) {
+            if f.over.is_some() {
+                Err(SqlError::Plan(format!(
+                    "Window function '{name}' not allowed in this context (should be pre-resolved)"
+                )))
+            } else if is_aggregate_name(&name) {
                 Err(SqlError::Plan(format!(
                     "Aggregate function '{name}' not allowed in this context"
                 )))
@@ -728,9 +733,13 @@ pub fn is_count_distinct(func: &Function) -> bool {
 }
 
 /// Check if a sqlparser Expr contains any aggregate function call.
+/// Window functions (with OVER clause) are NOT counted as aggregates.
 pub fn is_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(f) => {
+            if f.over.is_some() {
+                return false; // Window function, not a plain aggregate
+            }
             let name = f.name.to_string().to_lowercase();
             is_aggregate_name(&name)
         }
@@ -754,8 +763,9 @@ pub fn is_aggregate(expr: &Expr) -> bool {
 }
 
 /// Check if an expression is a pure aggregate call (not wrapped in arithmetic).
+/// Window functions (with OVER) are excluded.
 pub fn is_pure_aggregate(expr: &Expr) -> bool {
-    matches!(expr, Expr::Function(f) if is_aggregate_name(&f.name.to_string().to_lowercase()))
+    matches!(expr, Expr::Function(f) if f.over.is_none() && is_aggregate_name(&f.name.to_string().to_lowercase()))
 }
 
 /// Collect all aggregate sub-expressions from an expression tree.
@@ -769,6 +779,10 @@ pub fn collect_aggregates(expr: &Expr) -> Vec<(&Expr, String)> {
 fn collect_aggregates_inner<'a>(expr: &'a Expr, aggs: &mut Vec<(&'a Expr, String)>) {
     match expr {
         Expr::Function(f) => {
+            // Skip window functions (they have OVER clause)
+            if f.over.is_some() {
+                return;
+            }
             let name = f.name.to_string().to_lowercase();
             if is_aggregate_name(&name) {
                 let alias = format_agg_name(f);
@@ -1099,5 +1113,242 @@ pub fn expr_default_name(expr: &Expr) -> String {
             parts.last().map(|p| p.value.to_lowercase()).unwrap_or_default()
         }
         _ => format!("{expr}").to_lowercase(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window function helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a SQL expression is a window function call (has OVER clause).
+pub fn is_window_function(expr: &Expr) -> bool {
+    matches!(expr, Expr::Function(f) if f.over.is_some())
+}
+
+/// Check if any SELECT item contains a window function.
+pub fn has_window_functions(items: &[SelectItem]) -> bool {
+    items.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            contains_window_function(e)
+        }
+        _ => false,
+    })
+}
+
+fn contains_window_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(f) if f.over.is_some() => true,
+        Expr::BinaryOp { left, right, .. } => {
+            contains_window_function(left) || contains_window_function(right)
+        }
+        Expr::UnaryOp { expr, .. } => contains_window_function(expr),
+        Expr::Nested(inner) => contains_window_function(inner),
+        Expr::Cast { expr, .. } => contains_window_function(expr),
+        _ => false,
+    }
+}
+
+/// Info about a single window function call extracted from a SELECT item.
+pub struct WindowFuncInfo {
+    pub func_name: String,
+    pub func: WindowFunc,
+    pub input_expr: Option<Expr>,
+    pub spec: WindowSpec,
+    pub display_name: String,
+}
+
+/// Map a SQL function name + args to a Teide WindowFunc.
+pub fn window_func_from_name(name: &str, args: &[Expr]) -> Result<WindowFunc, SqlError> {
+    match name {
+        "row_number" => Ok(WindowFunc::RowNumber),
+        "rank" => Ok(WindowFunc::Rank),
+        "dense_rank" => Ok(WindowFunc::DenseRank),
+        "ntile" => {
+            if args.len() != 1 {
+                return Err(SqlError::Plan("NTILE requires exactly 1 argument".into()));
+            }
+            let n = parse_i64_literal(&args[0])?;
+            Ok(WindowFunc::Ntile(n))
+        }
+        "sum" => Ok(WindowFunc::Sum),
+        "avg" => Ok(WindowFunc::Avg),
+        "min" => Ok(WindowFunc::Min),
+        "max" => Ok(WindowFunc::Max),
+        "count" => Ok(WindowFunc::Count),
+        "lag" => {
+            let offset = if args.len() >= 2 {
+                parse_i64_literal(&args[1])?
+            } else {
+                1
+            };
+            Ok(WindowFunc::Lag(offset))
+        }
+        "lead" => {
+            let offset = if args.len() >= 2 {
+                parse_i64_literal(&args[1])?
+            } else {
+                1
+            };
+            Ok(WindowFunc::Lead(offset))
+        }
+        "first_value" => Ok(WindowFunc::FirstValue),
+        "last_value" => Ok(WindowFunc::LastValue),
+        "nth_value" => {
+            if args.len() != 2 {
+                return Err(SqlError::Plan("NTH_VALUE requires exactly 2 arguments".into()));
+            }
+            let n = parse_i64_literal(&args[1])?;
+            Ok(WindowFunc::NthValue(n))
+        }
+        _ => Err(SqlError::Plan(format!("Unknown window function: {name}"))),
+    }
+}
+
+fn parse_i64_literal(expr: &Expr) -> Result<i64, SqlError> {
+    match expr {
+        Expr::Value(Value::Number(n, _)) => n
+            .parse::<i64>()
+            .map_err(|_| SqlError::Plan(format!("Expected integer literal, got: {n}"))),
+        _ => Err(SqlError::Plan(format!("Expected integer literal, got: {expr}"))),
+    }
+}
+
+/// Convert sqlparser WindowSpec to Teide FrameType + FrameBound pair.
+pub fn parse_window_frame(spec: &WindowSpec) -> (FrameType, FrameBound, FrameBound) {
+    match &spec.window_frame {
+        Some(frame) => {
+            let ft = match frame.units {
+                WindowFrameUnits::Rows => FrameType::Rows,
+                _ => FrameType::Range,
+            };
+            let start = convert_frame_bound(&frame.start_bound);
+            let end = match &frame.end_bound {
+                Some(b) => convert_frame_bound(b),
+                None => FrameBound::CurrentRow,
+            };
+            (ft, start, end)
+        }
+        None => {
+            // SQL default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // But with no ORDER BY, it's the whole partition
+            if spec.order_by.is_empty() {
+                (
+                    FrameType::Range,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::UnboundedFollowing,
+                )
+            } else {
+                (
+                    FrameType::Range,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::CurrentRow,
+                )
+            }
+        }
+    }
+}
+
+fn convert_frame_bound(b: &WindowFrameBound) -> FrameBound {
+    match b {
+        WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+        WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+        WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+        WindowFrameBound::Preceding(Some(expr)) => {
+            let n = parse_i64_literal(expr).unwrap_or(1);
+            FrameBound::Preceding(n)
+        }
+        WindowFrameBound::Following(Some(expr)) => {
+            let n = parse_i64_literal(expr).unwrap_or(1);
+            FrameBound::Following(n)
+        }
+    }
+}
+
+/// Generate display name for a window function expression.
+pub fn format_window_name(func: &Function) -> String {
+    let fname = func.name.to_string().to_lowercase();
+    let arg_str = match &func.args {
+        FunctionArguments::List(args) => {
+            if args.args.is_empty() {
+                String::new()
+            } else {
+                args.args
+                    .iter()
+                    .map(|a| format!("{a}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        _ => String::new(),
+    };
+    format!("{fname}({arg_str})")
+}
+
+/// Collect all window function calls from SELECT items.
+/// Returns (select_item_index, WindowFuncInfo) pairs.
+pub fn collect_window_functions(items: &[SelectItem]) -> Result<Vec<(usize, WindowFuncInfo)>, SqlError> {
+    let mut result = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        collect_win_funcs_inner(expr, i, &mut result)?;
+    }
+    Ok(result)
+}
+
+fn collect_win_funcs_inner(
+    expr: &Expr,
+    item_idx: usize,
+    out: &mut Vec<(usize, WindowFuncInfo)>,
+) -> Result<(), SqlError> {
+    match expr {
+        Expr::Function(f) if f.over.is_some() => {
+            let name = f.name.to_string().to_lowercase();
+            let args = extract_func_args(f)?;
+
+            // Determine the WindowFunc variant
+            let wf = window_func_from_name(&name, &args)?;
+
+            // Extract window spec
+            let spec = match f.over.as_ref().unwrap() {
+                WindowType::WindowSpec(s) => s.clone(),
+                WindowType::NamedWindow(_) => {
+                    return Err(SqlError::Plan("Named windows not supported".into()));
+                }
+            };
+
+            // Input expression (first arg for agg/value funcs, None for rank funcs)
+            let input_expr = match &wf {
+                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+                WindowFunc::Ntile(_) => None,
+                WindowFunc::Lag(_) | WindowFunc::Lead(_) => args.first().cloned(),
+                _ => args.first().cloned(),
+            };
+
+            let display = format_window_name(f);
+
+            out.push((
+                item_idx,
+                WindowFuncInfo {
+                    func_name: name,
+                    func: wf,
+                    input_expr,
+                    spec,
+                    display_name: display,
+                },
+            ));
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_win_funcs_inner(left, item_idx, out)?;
+            collect_win_funcs_inner(right, item_idx, out)
+        }
+        Expr::UnaryOp { expr, .. } => collect_win_funcs_inner(expr, item_idx, out),
+        Expr::Nested(inner) => collect_win_funcs_inner(inner, item_idx, out),
+        Expr::Cast { expr, .. } => collect_win_funcs_inner(expr, item_idx, out),
+        _ => Ok(()),
     }
 }

@@ -423,42 +423,59 @@ fn plan_query(
         result_table
     };
 
-    // Stage 3: ORDER BY
+    // Stage 3+4: ORDER BY (optionally fused with LIMIT)
     let order_by_exprs = extract_order_by(query)?;
-    let result_table = if !order_by_exprs.is_empty() {
+    let offset_val = extract_offset(query)?;
+    let limit_val = extract_limit(query)?;
+
+    let (result_table, limit_fused) = if !order_by_exprs.is_empty() {
         let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table);
         let df_node = g.const_df(&result_table);
-        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
-        g.execute(root)?
+        let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+
+        // Fuse LIMIT into HEAD(SORT) so the engine only gathers N rows
+        let total_limit = match (offset_val, limit_val) {
+            (Some(off), Some(lim)) => Some(off + lim),
+            (None, Some(lim)) => Some(lim),
+            _ => None,
+        };
+        let root = match total_limit {
+            Some(n) => g.head(sort_node, n),
+            None => sort_node,
+        };
+        (g.execute(root)?, total_limit.is_some())
     } else {
-        result_table
+        (result_table, false)
     };
 
-    // Stage 4: OFFSET + LIMIT
-    let offset_val = extract_offset(query)?;
-    let limit_val = extract_limit(query)?;
-
-    let result_table = match (offset_val, limit_val) {
-        (Some(off), Some(lim)) => {
-            // Skip first `off` rows, then take `lim`
-            let total = off + lim;
-            let g = ctx.graph(&result_table);
-            let df_node = g.const_df(&result_table);
-            let head_node = g.head(df_node, total);
-            let trimmed = g.execute(head_node)?;
-            skip_rows(ctx, &trimmed, off)?
+    // Stage 4: OFFSET + LIMIT (only parts not already fused)
+    let result_table = if limit_fused {
+        match offset_val {
+            Some(off) => skip_rows(ctx, &result_table, off)?,
+            None => result_table,
         }
-        (Some(off), None) => skip_rows(ctx, &result_table, off)?,
-        (None, Some(lim)) => {
-            let g = ctx.graph(&result_table);
-            let df_node = g.const_df(&result_table);
-            let root = g.head(df_node, lim);
-            g.execute(root)?
+    } else {
+        match (offset_val, limit_val) {
+            (Some(off), Some(lim)) => {
+                let total = off + lim;
+                let g = ctx.graph(&result_table);
+                let df_node = g.const_df(&result_table);
+                let head_node = g.head(df_node, total);
+                let trimmed = g.execute(head_node)?;
+                skip_rows(ctx, &trimmed, off)?
+            }
+            (Some(off), None) => skip_rows(ctx, &result_table, off)?,
+            (None, Some(lim)) => {
+                let g = ctx.graph(&result_table);
+                let df_node = g.const_df(&result_table);
+                let root = g.head(df_node, lim);
+                g.execute(root)?
+            }
+            (None, None) => result_table,
         }
-        (None, None) => result_table,
     };
 
     Ok(SqlResult {
@@ -485,9 +502,17 @@ fn resolve_table(
         }
     }
 
-    // Fall back to CSV file
+    // Fall back to CSV file (only if it looks like a path)
     let path = normalize_path(name);
-    ctx.read_csv(&path).map_err(SqlError::from)
+    ctx.read_csv(&path).map_err(|e| {
+        // If the name looks like a bare identifier (no path separators, no extension),
+        // report it as a missing table rather than an I/O error.
+        if !name.contains('/') && !name.contains('\\') && !name.contains('.') {
+            SqlError::Plan(format!("Table '{}' not found", name))
+        } else {
+            SqlError::from(e)
+        }
+    })
 }
 
 /// Extract equi-join keys from an ON condition.
@@ -1525,40 +1550,58 @@ fn apply_post_processing(
     result_aliases: Vec<String>,
     _tables: Option<&HashMap<String, StoredTable>>,
 ) -> Result<SqlResult, SqlError> {
-    // ORDER BY
+    // ORDER BY (optionally fused with LIMIT)
     let order_by_exprs = extract_order_by(query)?;
-    let result_table = if !order_by_exprs.is_empty() {
+    let offset_val = extract_offset(query)?;
+    let limit_val = extract_limit(query)?;
+
+    let (result_table, limit_fused) = if !order_by_exprs.is_empty() {
         let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table);
         let df_node = g.const_df(&result_table);
-        let root = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
-        g.execute(root)?
+        let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+
+        let total_limit = match (offset_val, limit_val) {
+            (Some(off), Some(lim)) => Some(off + lim),
+            (None, Some(lim)) => Some(lim),
+            _ => None,
+        };
+        let root = match total_limit {
+            Some(n) => g.head(sort_node, n),
+            None => sort_node,
+        };
+        (g.execute(root)?, total_limit.is_some())
     } else {
-        result_table
+        (result_table, false)
     };
 
-    // OFFSET + LIMIT
-    let offset_val = extract_offset(query)?;
-    let limit_val = extract_limit(query)?;
-    let result_table = match (offset_val, limit_val) {
-        (Some(off), Some(lim)) => {
-            let total = off + lim;
-            let g = ctx.graph(&result_table);
-            let df_node = g.const_df(&result_table);
-            let head_node = g.head(df_node, total);
-            let trimmed = g.execute(head_node)?;
-            skip_rows(ctx, &trimmed, off)?
+    // OFFSET + LIMIT (only parts not already fused)
+    let result_table = if limit_fused {
+        match offset_val {
+            Some(off) => skip_rows(ctx, &result_table, off)?,
+            None => result_table,
         }
-        (Some(off), None) => skip_rows(ctx, &result_table, off)?,
-        (None, Some(lim)) => {
-            let g = ctx.graph(&result_table);
-            let df_node = g.const_df(&result_table);
-            let root = g.head(df_node, lim);
-            g.execute(root)?
+    } else {
+        match (offset_val, limit_val) {
+            (Some(off), Some(lim)) => {
+                let total = off + lim;
+                let g = ctx.graph(&result_table);
+                let df_node = g.const_df(&result_table);
+                let head_node = g.head(df_node, total);
+                let trimmed = g.execute(head_node)?;
+                skip_rows(ctx, &trimmed, off)?
+            }
+            (Some(off), None) => skip_rows(ctx, &result_table, off)?,
+            (None, Some(lim)) => {
+                let g = ctx.graph(&result_table);
+                let df_node = g.const_df(&result_table);
+                let root = g.head(df_node, lim);
+                g.execute(root)?
+            }
+            (None, None) => result_table,
         }
-        (None, None) => result_table,
     };
 
     Ok(SqlResult {

@@ -1,0 +1,537 @@
+//! Integration tests for the Teide Graph API.
+//!
+//! Uses a small inline CSV (~20 rows) to exercise all major graph operations:
+//! scan, filter, arithmetic, group-by, sort, join, head/tail, project, alias,
+//! string ops, cast, and error handling.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Mutex;
+
+use teide::{AggOp, Context, Table};
+
+// The C engine uses global state — serialize all tests.
+static ENGINE_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// Test data helpers
+// ---------------------------------------------------------------------------
+
+const CSV_HEADER: &str = "id1,id2,id3,id4,id5,id6,v1,v2,v3";
+const CSV_ROWS: &[&str] = &[
+    "id001,id001,id0000000001,1,10,100,1,2,1.5",
+    "id001,id001,id0000000002,2,20,200,2,3,2.5",
+    "id001,id002,id0000000003,3,30,300,3,4,3.5",
+    "id001,id002,id0000000004,1,10,100,4,5,4.5",
+    "id002,id001,id0000000005,2,20,200,5,6,5.5",
+    "id002,id001,id0000000006,3,30,300,6,7,6.5",
+    "id002,id002,id0000000007,1,10,100,7,8,7.5",
+    "id002,id002,id0000000008,2,20,200,8,9,8.5",
+    "id003,id001,id0000000009,3,30,300,9,10,9.5",
+    "id003,id001,id0000000010,1,10,100,10,11,10.5",
+    "id003,id002,id0000000011,2,20,200,1,2,11.5",
+    "id003,id002,id0000000012,3,30,300,2,3,12.5",
+    "id004,id001,id0000000013,1,10,100,3,4,1.5",
+    "id004,id001,id0000000014,2,20,200,4,5,2.5",
+    "id004,id002,id0000000015,3,30,300,5,6,3.5",
+    "id004,id002,id0000000016,1,10,100,6,7,4.5",
+    "id005,id001,id0000000017,2,20,200,7,8,5.5",
+    "id005,id001,id0000000018,3,30,300,8,9,6.5",
+    "id005,id002,id0000000019,1,10,100,9,10,7.5",
+    "id005,id002,id0000000020,2,20,200,10,11,8.5",
+];
+
+fn create_test_csv() -> (tempfile::NamedTempFile, String) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .unwrap();
+    writeln!(f, "{CSV_HEADER}").unwrap();
+    for row in CSV_ROWS {
+        writeln!(f, "{row}").unwrap();
+    }
+    f.flush().unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    (f, path)
+}
+
+fn create_join_right_csv() -> (tempfile::NamedTempFile, String) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .unwrap();
+    writeln!(f, "id1,x1").unwrap();
+    writeln!(f, "id001,100").unwrap();
+    writeln!(f, "id002,200").unwrap();
+    writeln!(f, "id003,300").unwrap();
+    writeln!(f, "id006,400").unwrap();
+    f.flush().unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    (f, path)
+}
+
+/// Collect column 0 (string) → column 1 (i64) into a map.
+fn collect_str_i64(table: &Table) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    for row in 0..table.nrows() as usize {
+        let key = table.get_str(0, row).unwrap().to_string();
+        let val = table.get_i64(1, row).unwrap();
+        map.insert(key, val);
+    }
+    map
+}
+
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn csv_read() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    assert_eq!(table.nrows(), 20);
+    assert_eq!(table.ncols(), 9);
+
+    // Column names
+    assert_eq!(table.col_name_str(0), "id1");
+    assert_eq!(table.col_name_str(1), "id2");
+    assert_eq!(table.col_name_str(2), "id3");
+    assert_eq!(table.col_name_str(3), "id4");
+    assert_eq!(table.col_name_str(6), "v1");
+    assert_eq!(table.col_name_str(8), "v3");
+
+    // Column types: id1-id3 are ENUM, id4-id6/v1-v2 are I64, v3 is F64
+    assert_eq!(table.col_type(0), teide::types::ENUM);
+    assert_eq!(table.col_type(3), teide::types::I64);
+    assert_eq!(table.col_type(6), teide::types::I64);
+    assert_eq!(table.col_type(8), teide::types::F64);
+}
+
+#[test]
+fn scan_and_filter() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let v1 = g.scan("v1");
+    let three = g.const_i64(3);
+    let pred = g.gt(v1, three);
+    let filtered = g.filter(df, pred);
+    let result = g.execute(filtered).unwrap();
+
+    // v1 values > 3: 4,5,6,7,8,9,10 appear twice each = 14 rows
+    assert_eq!(result.nrows(), 14);
+    assert_eq!(result.ncols(), 9);
+}
+
+#[test]
+fn arithmetic() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let v1 = g.scan("v1");
+    let v2 = g.scan("v2");
+    let sum_col = g.add(v1, v2);
+    let aliased = g.alias(sum_col, "v1_plus_v2");
+    let result_df = g.select(df, &[aliased]);
+    let result = g.execute(result_df).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 1);
+
+    // Row 0: v1=1, v2=2 → 3
+    assert_eq!(result.get_i64(0, 0).unwrap(), 3);
+    // Row 4: v1=5, v2=6 → 11
+    assert_eq!(result.get_i64(0, 4).unwrap(), 11);
+    // Row 19: v1=10, v2=11 → 21
+    assert_eq!(result.get_i64(0, 19).unwrap(), 21);
+}
+
+#[test]
+fn group_by_sum() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let id1 = g.scan("id1");
+    let v1 = g.scan("v1");
+    let grp = g.group_by(&[id1], &[AggOp::Sum], &[v1]);
+    let result = g.execute(grp).unwrap();
+
+    assert_eq!(result.nrows(), 5);
+    assert_eq!(result.ncols(), 2);
+
+    let sums = collect_str_i64(&result);
+    assert_eq!(sums["id001"], 10);
+    assert_eq!(sums["id002"], 26);
+    assert_eq!(sums["id003"], 22);
+    assert_eq!(sums["id004"], 18);
+    assert_eq!(sums["id005"], 34);
+}
+
+#[test]
+fn group_by_multi_agg() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let id1 = g.scan("id1");
+    let v1a = g.scan("v1");
+    let v3a = g.scan("v3");
+    let v1b = g.scan("v1");
+    let grp = g.group_by(
+        &[id1],
+        &[AggOp::Sum, AggOp::Avg, AggOp::Count],
+        &[v1a, v3a, v1b],
+    );
+    let result = g.execute(grp).unwrap();
+
+    // 5 groups, 4 columns (id1 + 3 aggs)
+    assert_eq!(result.nrows(), 5);
+    assert_eq!(result.ncols(), 4);
+
+    // Verify SUM(v1) via column 1
+    let mut sum_map = HashMap::new();
+    for row in 0..5 {
+        let key = result.get_str(0, row).unwrap().to_string();
+        let sum_val = result.get_i64(1, row).unwrap();
+        sum_map.insert(key, sum_val);
+    }
+    assert_eq!(sum_map["id001"], 10);
+    assert_eq!(sum_map["id005"], 34);
+
+    // Verify AVG(v3) via column 2 — each group has 4 rows
+    let mut avg_map = HashMap::new();
+    for row in 0..5 {
+        let key = result.get_str(0, row).unwrap().to_string();
+        let avg_val = result.get_f64(2, row).unwrap();
+        avg_map.insert(key, avg_val);
+    }
+    assert!((avg_map["id001"] - 3.0).abs() < 1e-10);
+    assert!((avg_map["id002"] - 7.0).abs() < 1e-10);
+    assert!((avg_map["id003"] - 11.0).abs() < 1e-10);
+
+    // Verify COUNT(v1) via column 3 — all groups have 4 rows
+    for row in 0..5 {
+        assert_eq!(result.get_i64(3, row).unwrap(), 4);
+    }
+}
+
+#[test]
+fn group_by_multi_key() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let id1 = g.scan("id1");
+    let id4 = g.scan("id4");
+    let v1 = g.scan("v1");
+    let grp = g.group_by(&[id1, id4], &[AggOp::Sum], &[v1]);
+    let result = g.execute(grp).unwrap();
+
+    // 15 distinct (id1, id4) groups
+    assert_eq!(result.nrows(), 15);
+    assert_eq!(result.ncols(), 3);
+}
+
+#[test]
+fn sort_single_asc() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let id4 = g.scan("id4");
+    let sorted = g.sort(df, &[id4], &[false], None);
+    let result = g.execute(sorted).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    // Verify ascending: id4 col is index 3
+    let mut prev = i64::MIN;
+    for row in 0..20 {
+        let val = result.get_i64(3, row).unwrap();
+        assert!(val >= prev, "row {row}: {val} < {prev}");
+        prev = val;
+    }
+}
+
+#[test]
+fn sort_single_desc() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let v3 = g.scan("v3");
+    let sorted = g.sort(df, &[v3], &[true], None);
+    let result = g.execute(sorted).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    // Verify descending: v3 col is index 8
+    let mut prev = f64::MAX;
+    for row in 0..20 {
+        let val = result.get_f64(8, row).unwrap();
+        assert!(val <= prev, "row {row}: {val} > {prev}");
+        prev = val;
+    }
+}
+
+#[test]
+fn sort_multi_key() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let id1 = g.scan("id1");
+    let id4 = g.scan("id4");
+    let sorted = g.sort(df, &[id1, id4], &[false, false], None);
+    let result = g.execute(sorted).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    // Verify: id1 (col 0) is non-decreasing; within same id1, id4 (col 3) is non-decreasing
+    for row in 1..20 {
+        let prev_id1 = result.get_str(0, row - 1).unwrap();
+        let cur_id1 = result.get_str(0, row).unwrap();
+        assert!(cur_id1 >= prev_id1, "id1 not sorted at row {row}");
+        if cur_id1 == prev_id1 {
+            let prev_id4 = result.get_i64(3, row - 1).unwrap();
+            let cur_id4 = result.get_i64(3, row).unwrap();
+            assert!(
+                cur_id4 >= prev_id4,
+                "id4 not sorted within same id1 at row {row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_with_limit() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let mut g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let id4 = g.scan("id4");
+    let sorted = g.sort(df, &[id4], &[false], None);
+    let limited = g.head(sorted, 3);
+    let result = g.execute(limited).unwrap();
+
+    assert_eq!(result.nrows(), 3);
+    // First 3 rows should all have id4=1 (smallest value)
+    for row in 0..3 {
+        assert_eq!(result.get_i64(3, row).unwrap(), 1);
+    }
+}
+
+#[test]
+fn join_inner() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_left_file, left_path) = create_test_csv();
+    let (_right_file, right_path) = create_join_right_csv();
+    let ctx = Context::new().unwrap();
+    let left = ctx.read_csv(&left_path).unwrap();
+    let right = ctx.read_csv(&right_path).unwrap();
+
+    assert_eq!(right.col_name_str(0), "id1");
+
+    let mut g = ctx.graph(&left);
+    let left_df = g.const_df(&left);
+    let right_df = g.const_df(&right);
+    let left_id1 = g.scan("id1");
+    let right_id1_vec = right.get_col_idx(0).unwrap();
+    let right_id1 = g.const_vec(right_id1_vec);
+
+    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 0);
+    let result = g.execute(joined).unwrap();
+
+    // id001(4) + id002(4) + id003(4) = 12 matched rows
+    assert_eq!(result.nrows(), 12);
+    // 9 left cols + 2 right cols = 11
+    assert_eq!(result.ncols(), 11);
+}
+
+#[test]
+fn join_left() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_left_file, left_path) = create_test_csv();
+    let (_right_file, right_path) = create_join_right_csv();
+    let ctx = Context::new().unwrap();
+    let left = ctx.read_csv(&left_path).unwrap();
+    let right = ctx.read_csv(&right_path).unwrap();
+
+    let mut g = ctx.graph(&left);
+    let left_df = g.const_df(&left);
+    let right_df = g.const_df(&right);
+    let left_id1 = g.scan("id1");
+    let right_id1_vec = right.get_col_idx(0).unwrap();
+    let right_id1 = g.const_vec(right_id1_vec);
+
+    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 1);
+    let result = g.execute(joined).unwrap();
+
+    // All 20 left rows preserved
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 11);
+}
+
+#[test]
+fn head_tail() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    // head(5)
+    let df = g.const_df(&table);
+    let h = g.head(df, 5);
+    let result = g.execute(h).unwrap();
+    assert_eq!(result.nrows(), 5);
+    assert_eq!(result.ncols(), 9);
+    // First row should have v1=1
+    assert_eq!(result.get_i64(6, 0).unwrap(), 1);
+
+    // tail(5) — need a fresh graph
+    drop(result);
+    let g2 = ctx.graph(&table);
+    let df2 = g2.const_df(&table);
+    let t = g2.tail(df2, 5);
+    let result2 = g2.execute(t).unwrap();
+    assert_eq!(result2.nrows(), 5);
+    // Last row of original has v1=10
+    assert_eq!(result2.get_i64(6, 4).unwrap(), 10);
+}
+
+#[test]
+fn project() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let id1 = g.scan("id1");
+    let v1 = g.scan("v1");
+    let projected = g.select(df, &[id1, v1]);
+    let result = g.execute(projected).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 2);
+    assert_eq!(result.col_name_str(0), "id1");
+    assert_eq!(result.col_name_str(1), "v1");
+}
+
+#[test]
+fn alias_column() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let v1 = g.scan("v1");
+    let aliased = g.alias(v1, "my_v1");
+    let projected = g.select(df, &[aliased]);
+    let result = g.execute(projected).unwrap();
+
+    assert_eq!(result.ncols(), 1);
+    // The alias passes through the value correctly
+    assert_eq!(result.get_i64(0, 0).unwrap(), 1);
+    assert_eq!(result.get_i64(0, 4).unwrap(), 5);
+}
+
+#[test]
+fn string_ops() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let id1 = g.scan("id1");
+    let upper_col = g.upper(id1);
+    let upper_aliased = g.alias(upper_col, "upper_id1");
+
+    let id1b = g.scan("id1");
+    let len_col = g.strlen(id1b);
+    let len_aliased = g.alias(len_col, "len_id1");
+
+    let id1c = g.scan("id1");
+    let lower_col = g.lower(id1c);
+    let lower_aliased = g.alias(lower_col, "lower_id1");
+
+    let projected = g.select(df, &[upper_aliased, len_aliased, lower_aliased]);
+    let result = g.execute(projected).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 3);
+
+    // UPPER("id001") = "ID001"
+    assert_eq!(result.get_str(0, 0).unwrap(), "ID001");
+    // LENGTH("id001") = 5
+    assert_eq!(result.get_i64(1, 0).unwrap(), 5);
+    // LOWER("id001") = "id001" (already lowercase)
+    assert_eq!(result.get_str(2, 0).unwrap(), "id001");
+}
+
+#[test]
+fn cast_i64_to_f64() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let v1 = g.scan("v1");
+    let casted = g.cast(v1, teide::types::F64);
+    let aliased = g.alias(casted, "v1_f64");
+    let projected = g.select(df, &[aliased]);
+    let result = g.execute(projected).unwrap();
+
+    assert_eq!(result.ncols(), 1);
+    assert_eq!(result.col_type(0), teide::types::F64);
+    assert!((result.get_f64(0, 0).unwrap() - 1.0).abs() < 1e-10);
+    assert!((result.get_f64(0, 4).unwrap() - 5.0).abs() < 1e-10);
+}
+
+#[test]
+fn error_handling_bad_csv() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let ctx = Context::new().unwrap();
+    let result = ctx.read_csv("/nonexistent/path/to/file.csv");
+    match result {
+        Err(teide::Error::Io) => {} // expected
+        Err(other) => panic!("expected Io error, got: {other}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}

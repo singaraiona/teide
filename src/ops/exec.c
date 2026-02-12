@@ -623,6 +623,411 @@ static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
     return 0;
 }
 
+/* Fused multi-column gather — single pass over index array for all columns.
+ * Much faster than per-column gather because: (1) indices read once not N times,
+ * (2) prefetch covers all columns at once. */
+#define MGATHER_MAX_COLS 16
+typedef struct {
+    const int64_t* idx;
+    char*          srcs[MGATHER_MAX_COLS];
+    char*          dsts[MGATHER_MAX_COLS];
+    uint8_t        esz[MGATHER_MAX_COLS];
+    int64_t        ncols;
+} multi_gather_ctx_t;
+
+static void multi_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    multi_gather_ctx_t* c = (multi_gather_ctx_t*)raw;
+    const int64_t* idx = c->idx;
+    int64_t nc = c->ncols;
+
+    /* Process one column at a time per batch of rows.
+     * This focuses random reads on a single source array, giving the
+     * hardware prefetcher only 1 stream to track (instead of ncols
+     * concurrent streams, which overflows the L2 miss queue). */
+#define MG_BATCH 512
+#define MG_PF    16
+    for (int64_t base = start; base < end; base += MG_BATCH) {
+        int64_t bstart = base;
+        int64_t bend = base + MG_BATCH;
+        if (bend > end) bend = end;
+        for (int64_t col = 0; col < nc; col++) {
+            uint8_t e = c->esz[col];
+            char* src = c->srcs[col];
+            char* dst = c->dsts[col];
+            for (int64_t i = bstart; i < bend; i++) {
+                if (i + MG_PF < bend)
+                    __builtin_prefetch(src + idx[i + MG_PF] * e, 0, 0);
+                memcpy(dst + i * e, src + idx[i] * e, e);
+            }
+        }
+    }
+#undef MG_PF
+#undef MG_BATCH
+}
+
+/* Parallel index gather — used by sort and join for column materialization */
+typedef struct {
+    int64_t*     idx;
+    td_t*        src_col;
+    td_t*        dst_col;
+    uint8_t      esz;
+    bool         nullable;  /* true = idx may contain -1 (LEFT JOIN nulls) */
+} gather_ctx_t;
+
+static void gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gather_ctx_t* c = (gather_ctx_t*)raw;
+    char* src = (char*)td_data(c->src_col);
+    char* dst = (char*)td_data(c->dst_col);
+    uint8_t esz = c->esz;
+    const int64_t* idx = c->idx;
+#define GATHER_PF 16
+
+    if (c->nullable) {
+        for (int64_t i = start; i < end; i++) {
+            if (i + GATHER_PF < end) {
+                int64_t pf = idx[i + GATHER_PF];
+                if (pf >= 0) __builtin_prefetch(src + pf * esz, 0, 0);
+            }
+            int64_t r = idx[i];
+            if (r >= 0)
+                memcpy(dst + i * esz, src + r * esz, esz);
+            else
+                memset(dst + i * esz, 0, esz);
+        }
+    } else {
+        for (int64_t i = start; i < end; i++) {
+            if (i + GATHER_PF < end)
+                __builtin_prefetch(src + idx[i + GATHER_PF] * esz, 0, 0);
+            memcpy(dst + i * esz, src + idx[i] * esz, esz);
+        }
+    }
+#undef GATHER_PF
+}
+
+/* --------------------------------------------------------------------------
+ * Parallel LSB radix sort (8-bit digits, 256 buckets)
+ *
+ * Used for single-key sorts on I64/F64/I32/ENUM/TIMESTAMP columns,
+ * and composite-key sorts where all keys are integer types with total
+ * bit width <= 64.
+ *
+ * Three phases per byte:
+ *   1. Parallel histogram — each task counts byte occurrences in its range
+ *   2. Sequential prefix-sum — compute per-task scatter offsets
+ *   3. Parallel scatter — write elements to sorted positions
+ *
+ * Byte-skip: after histogram, if all elements share the same byte value,
+ * skip that pass entirely.  Critical for small-range integers where most
+ * upper bytes are identical.
+ * -------------------------------------------------------------------------- */
+
+/* Radix pass context (shared across histogram + scatter phases) */
+typedef struct {
+    const uint64_t*  keys;
+    const int64_t*   idx;
+    uint64_t*        keys_out;
+    int64_t*         idx_out;
+    int64_t          n;
+    uint8_t          shift;
+    uint32_t         n_tasks;
+    uint32_t*        hist;       /* flat [n_tasks * 256] */
+    int64_t*         offsets;    /* flat [n_tasks * 256] */
+} radix_pass_ctx_t;
+
+/* Phase 1: histogram — each task counts byte values in its fixed range */
+static void radix_hist_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    radix_pass_ctx_t* c = (radix_pass_ctx_t*)arg;
+    int64_t task = start; /* dispatch_n: [task, task+1) */
+
+    int64_t chunk = (c->n + c->n_tasks - 1) / c->n_tasks;
+    int64_t lo = task * chunk;
+    int64_t hi = lo + chunk;
+    if (hi > c->n) hi = c->n;
+    if (lo >= hi) return;
+
+    uint32_t* h = c->hist + task * 256;
+    memset(h, 0, 256 * sizeof(uint32_t));
+
+    const uint64_t* keys = c->keys;
+    uint8_t shift = c->shift;
+    for (int64_t i = lo; i < hi; i++)
+        h[(keys[i] >> shift) & 0xFF]++;
+}
+
+/* Phase 3: scatter — each task writes its range to the correct output positions */
+static void radix_scatter_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    radix_pass_ctx_t* c = (radix_pass_ctx_t*)arg;
+    int64_t task = start;
+
+    int64_t chunk = (c->n + c->n_tasks - 1) / c->n_tasks;
+    int64_t lo = task * chunk;
+    int64_t hi = lo + chunk;
+    if (hi > c->n) hi = c->n;
+    if (lo >= hi) return;
+
+    int64_t* off = c->offsets + task * 256;
+    const uint64_t* k_in = c->keys;
+    const int64_t*  i_in = c->idx;
+    uint64_t* k_out = c->keys_out;
+    int64_t*  i_out = c->idx_out;
+    uint8_t shift = c->shift;
+
+    for (int64_t i = lo; i < hi; i++) {
+        uint8_t byte = (k_in[i] >> shift) & 0xFF;
+        int64_t pos = off[byte]++;
+        k_out[pos] = k_in[i];
+        i_out[pos] = i_in[i];
+    }
+}
+
+/* Run radix sort on pre-encoded uint64_t keys + int64_t indices.
+ * Returns pointer to the final sorted index array (either `indices` or
+ * `idx_tmp`).  Caller must keep both alive until done reading indices.
+ * Returns NULL on failure. */
+static int64_t* radix_sort_run(td_pool_t* pool,
+                                uint64_t* keys, int64_t* indices,
+                                uint64_t* keys_tmp, int64_t* idx_tmp,
+                                int64_t n) {
+    uint32_t n_tasks = pool ? td_pool_total_workers(pool) : 1;
+    if (n_tasks < 1) n_tasks = 1;
+
+    td_t *hist_hdr = NULL, *off_hdr = NULL;
+    uint32_t* hist = (uint32_t*)scratch_alloc(&hist_hdr,
+                        (size_t)n_tasks * 256 * sizeof(uint32_t));
+    int64_t* offsets = (int64_t*)scratch_alloc(&off_hdr,
+                        (size_t)n_tasks * 256 * sizeof(int64_t));
+    if (!hist || !offsets) {
+        scratch_free(hist_hdr); scratch_free(off_hdr);
+        return NULL;
+    }
+
+    uint64_t* src_k = keys,     *dst_k = keys_tmp;
+    int64_t*  src_i = indices,   *dst_i = idx_tmp;
+
+    for (uint8_t bp = 0; bp < 8; bp++) {
+        uint8_t shift = bp * 8;
+
+        radix_pass_ctx_t ctx = {
+            .keys = src_k, .idx = src_i,
+            .keys_out = dst_k, .idx_out = dst_i,
+            .n = n, .shift = shift, .n_tasks = n_tasks,
+            .hist = hist, .offsets = offsets,
+        };
+
+        /* Phase 1: parallel histogram */
+        if (pool && n_tasks > 1)
+            td_pool_dispatch_n(pool, radix_hist_fn, &ctx, n_tasks);
+        else
+            radix_hist_fn(&ctx, 0, 0, 1);
+
+        /* Check uniformity via global histogram */
+        bool uniform = false;
+        for (int b = 0; b < 256; b++) {
+            uint32_t total = 0;
+            for (uint32_t t = 0; t < n_tasks; t++)
+                total += hist[t * 256 + b];
+            if (total == (uint32_t)n) { uniform = true; break; }
+        }
+        if (uniform) continue; /* all same byte — skip this pass */
+
+        /* Phase 2: prefix sum → per-task scatter offsets */
+        int64_t running = 0;
+        for (int b = 0; b < 256; b++) {
+            for (uint32_t t = 0; t < n_tasks; t++) {
+                offsets[t * 256 + b] = running;
+                running += hist[t * 256 + b];
+            }
+        }
+
+        /* Phase 3: parallel scatter */
+        if (pool && n_tasks > 1)
+            td_pool_dispatch_n(pool, radix_scatter_fn, &ctx, n_tasks);
+        else
+            radix_scatter_fn(&ctx, 0, 0, 1);
+
+        /* Swap double-buffer pointers */
+        uint64_t* tk = src_k; src_k = dst_k; dst_k = tk;
+        int64_t*  ti = src_i; src_i = dst_i; dst_i = ti;
+    }
+
+    scratch_free(hist_hdr);
+    scratch_free(off_hdr);
+    return src_i;  /* pointer to final sorted indices */
+}
+
+/* Key-encoding context for parallel encode phase */
+typedef struct {
+    uint64_t*       keys;      /* output */
+    /* Single-key fields: */
+    const void*     data;      /* raw column data */
+    int8_t          type;      /* column type */
+    bool            desc;
+    /* ENUM rank mapping (NULL if not ENUM): */
+    const uint32_t* enum_rank; /* intern_id → sort rank */
+    /* Composite-key fields (n_keys > 1): */
+    uint8_t         n_keys;
+    td_t**          vecs;
+    int64_t         mins[16];
+    int64_t         ranges[16];
+    uint8_t         bit_shifts[16]; /* bit offset for key k in composite */
+    uint8_t         descs[16];
+    const uint32_t* enum_ranks[16]; /* per-key rank mappings */
+} radix_encode_ctx_t;
+
+static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    radix_encode_ctx_t* c = (radix_encode_ctx_t*)arg;
+
+    if (c->n_keys <= 1) {
+        /* Single-key fast path */
+        switch (c->type) {
+        case TD_I64: case TD_SYM: case TD_TIMESTAMP: {
+            const int64_t* d = (const int64_t*)c->data;
+            if (c->desc) {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = ~((uint64_t)d[i] ^ ((uint64_t)1 << 63));
+            } else {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = (uint64_t)d[i] ^ ((uint64_t)1 << 63);
+            }
+            break;
+        }
+        case TD_F64: {
+            const double* d = (const double*)c->data;
+            for (int64_t i = start; i < end; i++) {
+                uint64_t bits;
+                memcpy(&bits, &d[i], 8);
+                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
+                uint64_t e = bits ^ mask;
+                c->keys[i] = c->desc ? ~e : e;
+            }
+            break;
+        }
+        case TD_I32: {
+            const int32_t* d = (const int32_t*)c->data;
+            if (c->desc) {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = ~((uint64_t)((uint32_t)d[i] ^ ((uint32_t)1 << 31)));
+            } else {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = (uint64_t)((uint32_t)d[i] ^ ((uint32_t)1 << 31));
+            }
+            break;
+        }
+        case TD_ENUM: {
+            const uint32_t* d = (const uint32_t*)c->data;
+            const uint32_t* rank = c->enum_rank;
+            if (c->desc) {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = ~(uint64_t)rank[d[i]];
+            } else {
+                for (int64_t i = start; i < end; i++)
+                    c->keys[i] = (uint64_t)rank[d[i]];
+            }
+            break;
+        }
+        }
+    } else {
+        /* Composite-key encoding */
+        for (int64_t i = start; i < end; i++) {
+            uint64_t composite = 0;
+            for (uint8_t k = 0; k < c->n_keys; k++) {
+                td_t* col = c->vecs[k];
+                int64_t val;
+                if (c->enum_ranks[k]) {
+                    uint32_t raw = ((const uint32_t*)td_data(col))[i];
+                    val = (int64_t)c->enum_ranks[k][raw];
+                } else if (col->type == TD_I64 || col->type == TD_SYM ||
+                           col->type == TD_TIMESTAMP) {
+                    val = ((const int64_t*)td_data(col))[i];
+                } else if (col->type == TD_I32) {
+                    val = (int64_t)((const int32_t*)td_data(col))[i];
+                } else {
+                    val = 0;
+                }
+                uint64_t part = (uint64_t)(val - c->mins[k]);
+                if (c->descs[k]) part = (uint64_t)c->ranges[k] - part;
+                composite |= part << c->bit_shifts[k];
+            }
+            c->keys[i] = composite;
+        }
+    }
+}
+
+/* Build ENUM rank mapping: intern_id → sorted rank by string value.
+ * Caller must scratch_free(*hdr_out) when done.
+ * Returns pointer to rank array of size (max_id + 1), or NULL on error. */
+static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
+    const uint32_t* data = (const uint32_t*)td_data(col);
+
+    /* Find max intern ID */
+    uint32_t max_id = 0;
+    for (int64_t i = 0; i < nrows; i++)
+        if (data[i] > max_id) max_id = data[i];
+
+    uint32_t n_ids = max_id + 1;
+
+    /* Allocate array of intern IDs to sort */
+    td_t* ids_hdr;
+    uint32_t* ids = (uint32_t*)scratch_alloc(&ids_hdr,
+                        (size_t)n_ids * sizeof(uint32_t));
+    if (!ids) { *hdr_out = NULL; return NULL; }
+    for (uint32_t i = 0; i < n_ids; i++) ids[i] = i;
+
+    /* Sort IDs by their string values (merge sort — O(n log n) for large D) */
+    {
+        td_t* tmp_hdr;
+        uint32_t* tmp = (uint32_t*)scratch_alloc(&tmp_hdr,
+                            (size_t)n_ids * sizeof(uint32_t));
+        if (!tmp) { scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
+
+        /* Bottom-up merge sort on uint32_t IDs, comparing by string value */
+        for (uint32_t width = 1; width < n_ids; width *= 2) {
+            for (uint32_t lo = 0; lo < n_ids; lo += 2 * width) {
+                uint32_t mid = lo + width;
+                uint32_t hi  = lo + 2 * width;
+                if (mid > n_ids) mid = n_ids;
+                if (hi  > n_ids) hi  = n_ids;
+                uint32_t i = lo, j = mid, k = lo;
+                while (i < mid && j < hi) {
+                    td_t* si = td_sym_str((int64_t)ids[i]);
+                    td_t* sj = td_sym_str((int64_t)ids[j]);
+                    int cmp;
+                    if (!si && !sj) cmp = 0;
+                    else if (!si) cmp = -1;
+                    else if (!sj) cmp = 1;
+                    else cmp = td_str_cmp(si, sj);
+                    if (cmp <= 0) tmp[k++] = ids[i++];
+                    else          tmp[k++] = ids[j++];
+                }
+                while (i < mid) tmp[k++] = ids[i++];
+                while (j < hi)  tmp[k++] = ids[j++];
+            }
+            /* Swap ids and tmp for next pass */
+            uint32_t* sw = ids; ids = tmp; tmp = sw;
+            td_t* sh = ids_hdr; ids_hdr = tmp_hdr; tmp_hdr = sh;
+        }
+        scratch_free(tmp_hdr);
+    }
+
+    /* Build rank[intern_id] = sorted position */
+    td_t* rank_hdr;
+    uint32_t* rank = (uint32_t*)scratch_calloc(&rank_hdr,
+                        (size_t)n_ids * sizeof(uint32_t));
+    if (!rank) { scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
+
+    for (uint32_t i = 0; i < n_ids; i++)
+        rank[ids[i]] = i;
+
+    scratch_free(ids_hdr);
+    *hdr_out = rank_hdr;
+    return rank;
+}
+
 /* Insertion sort for small arrays — used as base case for merge sort */
 static void sort_insertion(const sort_cmp_ctx_t* ctx, int64_t* arr, int64_t n) {
     for (int64_t i = 1; i < n; i++) {
@@ -761,114 +1166,302 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         }
     }
 
-    /* Build comparator context */
-    sort_cmp_ctx_t cmp_ctx = {
-        .vecs = sort_vecs,
-        .desc = ext->sort.desc,
-        .nulls_first = ext->sort.nulls_first,
-        .n_sort = n_sort,
-    };
+    /* --- Radix sort fast path ------------------------------------------------
+     * Try radix sort for integer/float/enum keys.  Falls back to merge sort
+     * for unsupported types (SYM with arbitrary strings, mixed types, etc.). */
+    bool radix_done = false;
+    int64_t* sorted_idx = indices;  /* may point to itmp after radix sort */
+    td_t* radix_itmp_hdr = NULL;   /* kept alive until after gather */
+    td_t* enum_rank_hdrs[n_sort];
+    memset(enum_rank_hdrs, 0, n_sort * sizeof(td_t*));
 
-    /* Sort using parallel merge sort for large arrays, insertion sort for small */
-    if (nrows <= 64) {
-        sort_insertion(&cmp_ctx, indices, nrows);
-    } else {
-        td_pool_t* pool = td_pool_get();
-        uint32_t n_workers = pool ? td_pool_total_workers(pool) : 1;
-
-        /* Allocate temporary buffer for merge operations */
-        td_t* tmp_hdr;
-        int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr, (size_t)nrows * sizeof(int64_t));
-        if (!tmp) {
-            scratch_free(indices_hdr);
-            return TD_ERR_PTR(TD_ERR_OOM);
+    if (nrows > 64) {
+        /* Check if all sort keys are radix-sortable types */
+        bool can_radix = true;
+        for (uint8_t k = 0; k < n_sort; k++) {
+            if (!sort_vecs[k]) { can_radix = false; break; }
+            int8_t t = sort_vecs[k]->type;
+            if (t != TD_I64 && t != TD_F64 && t != TD_I32 &&
+                t != TD_ENUM && t != TD_TIMESTAMP) {
+                can_radix = false; break;
+            }
         }
 
-        /* Phase 1: parallel local sort of chunks */
-        uint32_t n_chunks = n_workers;
-        if (pool && n_chunks > 1 && nrows > 1024) {
-            sort_phase1_ctx_t p1ctx = {
-                .cmp_ctx = &cmp_ctx,
-                .indices = indices,
-                .tmp = tmp,
-                .nrows = nrows,
-                .n_chunks = n_chunks,
-            };
-            td_pool_dispatch_n(pool, sort_phase1_fn, &p1ctx, n_chunks);
-        } else {
-            /* Single-threaded: sort the entire array */
-            n_chunks = 1;
-            sort_merge_recursive(&cmp_ctx, indices, tmp, nrows);
-        }
+        if (can_radix) {
+            td_pool_t* pool = td_pool_get();
 
-        /* Phase 2: iterative merge passes (log2(n_chunks) levels) */
-        if (n_chunks > 1) {
-            int64_t chunk_size = (nrows + n_chunks - 1) / n_chunks;
-            int64_t run_size = chunk_size;
-            int64_t* src = indices;
-            int64_t* dst = tmp;
-
-            while (run_size < nrows) {
-                int64_t n_pairs = (nrows + 2 * run_size - 1) / (2 * run_size);
-                sort_merge_ctx_t mctx = {
-                    .cmp_ctx = &cmp_ctx,
-                    .src = src,
-                    .dst = dst,
-                    .nrows = nrows,
-                    .run_size = run_size,
-                };
-                if (pool && n_pairs > 1) {
-                    td_pool_dispatch_n(pool, sort_merge_fn, &mctx, (uint32_t)n_pairs);
-                } else {
-                    /* Single merge pair */
-                    sort_merge_fn(&mctx, 0, 0, n_pairs);
+            /* Build ENUM rank mappings (intern_id → sorted rank by string) */
+            uint32_t* enum_ranks[n_sort];
+            memset(enum_ranks, 0, n_sort * sizeof(uint32_t*));
+            for (uint8_t k = 0; k < n_sort; k++) {
+                if (sort_vecs[k]->type == TD_ENUM) {
+                    enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
+                                                     &enum_rank_hdrs[k]);
+                    if (!enum_ranks[k]) { can_radix = false; break; }
                 }
-                /* Swap src and dst */
-                int64_t* t = src; src = dst; dst = t;
-                run_size *= 2;
             }
 
-            /* If final result is in tmp (not indices), copy back */
-            if (src != indices) {
-                memcpy(indices, src, (size_t)nrows * sizeof(int64_t));
+            if (can_radix && n_sort == 1) {
+                /* --- Single-key radix sort --- */
+                td_t *keys_hdr, *ktmp_hdr, *itmp_hdr;
+                uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,
+                                    (size_t)nrows * sizeof(uint64_t));
+                uint64_t* ktmp = (uint64_t*)scratch_alloc(&ktmp_hdr,
+                                    (size_t)nrows * sizeof(uint64_t));
+                int64_t*  itmp = (int64_t*)scratch_alloc(&itmp_hdr,
+                                    (size_t)nrows * sizeof(int64_t));
+
+                if (keys && ktmp && itmp) {
+                    bool desc = ext->sort.desc ? ext->sort.desc[0] : 0;
+                    radix_encode_ctx_t enc = {
+                        .keys = keys, .data = td_data(sort_vecs[0]),
+                        .type = sort_vecs[0]->type, .desc = desc,
+                        .enum_rank = enum_ranks[0], .n_keys = 1,
+                    };
+                    if (pool)
+                        td_pool_dispatch(pool, radix_encode_fn, &enc, nrows);
+                    else
+                        radix_encode_fn(&enc, 0, 0, nrows);
+
+                    sorted_idx = radix_sort_run(pool, keys, indices,
+                                                 ktmp, itmp, nrows);
+                    radix_done = (sorted_idx != NULL);
+                }
+                scratch_free(keys_hdr);
+                scratch_free(ktmp_hdr);
+                /* Keep itmp alive — sorted_idx may point there */
+                if (sorted_idx != itmp) scratch_free(itmp_hdr);
+                else radix_itmp_hdr = itmp_hdr;
+
+            } else if (can_radix && n_sort > 1) {
+                /* --- Multi-key composite radix sort --- */
+                /* Prescan min/max per key to determine if they pack in 64 bits */
+                int64_t mins[n_sort], maxs[n_sort];
+                uint8_t total_bits = 0;
+                bool fits = true;
+
+                for (uint8_t k = 0; k < n_sort; k++) {
+                    td_t* col = sort_vecs[k];
+                    int64_t kmin = INT64_MAX, kmax = INT64_MIN;
+
+                    if (enum_ranks[k]) {
+                        /* For ENUM: scan rank values, not raw intern IDs */
+                        const uint32_t* d = (const uint32_t*)td_data(col);
+                        for (int64_t i = 0; i < nrows; i++) {
+                            int64_t v = (int64_t)enum_ranks[k][d[i]];
+                            if (v < kmin) kmin = v;
+                            if (v > kmax) kmax = v;
+                        }
+                    } else if (col->type == TD_I64 || col->type == TD_SYM ||
+                               col->type == TD_TIMESTAMP) {
+                        const int64_t* d = (const int64_t*)td_data(col);
+                        for (int64_t i = 0; i < nrows; i++) {
+                            if (d[i] < kmin) kmin = d[i];
+                            if (d[i] > kmax) kmax = d[i];
+                        }
+                    } else if (col->type == TD_I32) {
+                        const int32_t* d = (const int32_t*)td_data(col);
+                        for (int64_t i = 0; i < nrows; i++) {
+                            if (d[i] < kmin) kmin = (int64_t)d[i];
+                            if (d[i] > kmax) kmax = (int64_t)d[i];
+                        }
+                    }
+
+                    mins[k] = kmin;
+                    maxs[k] = kmax;
+                    uint64_t range = (uint64_t)(kmax - kmin);
+                    uint8_t bits = (range == 0) ? 1 : 1;
+                    while (((uint64_t)1 << bits) <= range && bits < 64) bits++;
+                    total_bits += bits;
+                }
+
+                if (total_bits > 64) fits = false;
+
+                if (fits) {
+                    /* Compute bit-shift for each key: primary key in MSBs */
+                    uint8_t bit_shifts[n_sort];
+                    uint8_t accum = 0;
+                    for (int k = n_sort - 1; k >= 0; k--) {
+                        bit_shifts[k] = accum;
+                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint8_t bits = (range == 0) ? 1 : 1;
+                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                            bits++;
+                        accum += bits;
+                    }
+
+                    td_t *keys_hdr, *ktmp_hdr, *itmp_hdr;
+                    uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,
+                                        (size_t)nrows * sizeof(uint64_t));
+                    uint64_t* ktmp = (uint64_t*)scratch_alloc(&ktmp_hdr,
+                                        (size_t)nrows * sizeof(uint64_t));
+                    int64_t*  itmp = (int64_t*)scratch_alloc(&itmp_hdr,
+                                        (size_t)nrows * sizeof(int64_t));
+
+                    if (keys && ktmp && itmp) {
+                        radix_encode_ctx_t enc = {
+                            .keys = keys, .n_keys = n_sort, .vecs = sort_vecs,
+                        };
+                        for (uint8_t k = 0; k < n_sort; k++) {
+                            enc.mins[k] = mins[k];
+                            enc.ranges[k] = maxs[k] - mins[k];
+                            enc.bit_shifts[k] = bit_shifts[k];
+                            enc.descs[k] = ext->sort.desc ? ext->sort.desc[k] : 0;
+                            enc.enum_ranks[k] = enum_ranks[k];
+                        }
+                        if (pool)
+                            td_pool_dispatch(pool, radix_encode_fn, &enc, nrows);
+                        else
+                            radix_encode_fn(&enc, 0, 0, nrows);
+
+                        sorted_idx = radix_sort_run(pool, keys, indices,
+                                                     ktmp, itmp, nrows);
+                        radix_done = (sorted_idx != NULL);
+                    }
+                    scratch_free(keys_hdr);
+                    scratch_free(ktmp_hdr);
+                    if (sorted_idx != itmp) scratch_free(itmp_hdr);
+                    else radix_itmp_hdr = itmp_hdr;
+                }
             }
         }
-
-        scratch_free(tmp_hdr);
     }
 
-    /* Materialize sorted result */
+    /* --- Merge sort fallback ------------------------------------------------ */
+    if (!radix_done) {
+        sort_cmp_ctx_t cmp_ctx = {
+            .vecs = sort_vecs,
+            .desc = ext->sort.desc,
+            .nulls_first = ext->sort.nulls_first,
+            .n_sort = n_sort,
+        };
+
+        if (nrows <= 64) {
+            sort_insertion(&cmp_ctx, indices, nrows);
+        } else {
+            td_pool_t* pool = td_pool_get();
+            uint32_t n_workers = pool ? td_pool_total_workers(pool) : 1;
+
+            td_t* tmp_hdr;
+            int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr,
+                                (size_t)nrows * sizeof(int64_t));
+            if (!tmp) {
+                scratch_free(indices_hdr);
+                return TD_ERR_PTR(TD_ERR_OOM);
+            }
+
+            uint32_t n_chunks = n_workers;
+            if (pool && n_chunks > 1 && nrows > 1024) {
+                sort_phase1_ctx_t p1ctx = {
+                    .cmp_ctx = &cmp_ctx, .indices = indices, .tmp = tmp,
+                    .nrows = nrows, .n_chunks = n_chunks,
+                };
+                td_pool_dispatch_n(pool, sort_phase1_fn, &p1ctx, n_chunks);
+            } else {
+                n_chunks = 1;
+                sort_merge_recursive(&cmp_ctx, indices, tmp, nrows);
+            }
+
+            if (n_chunks > 1) {
+                int64_t chunk_size = (nrows + n_chunks - 1) / n_chunks;
+                int64_t run_size = chunk_size;
+                int64_t* src = indices;
+                int64_t* dst = tmp;
+
+                while (run_size < nrows) {
+                    int64_t n_pairs = (nrows + 2 * run_size - 1) / (2 * run_size);
+                    sort_merge_ctx_t mctx = {
+                        .cmp_ctx = &cmp_ctx, .src = src, .dst = dst,
+                        .nrows = nrows, .run_size = run_size,
+                    };
+                    if (pool && n_pairs > 1)
+                        td_pool_dispatch_n(pool, sort_merge_fn, &mctx,
+                                            (uint32_t)n_pairs);
+                    else
+                        sort_merge_fn(&mctx, 0, 0, n_pairs);
+                    int64_t* t = src; src = dst; dst = t;
+                    run_size *= 2;
+                }
+
+                if (src != indices)
+                    memcpy(indices, src, (size_t)nrows * sizeof(int64_t));
+            }
+
+            scratch_free(tmp_hdr);
+        }
+    }
+
+    /* Materialize sorted result — fused multi-column gather */
     td_t* result = td_table_new(ncols);
     if (!result || TD_IS_ERR(result)) {
         scratch_free(indices_hdr); return result;
     }
 
+    /* Pre-allocate all output columns, then do a single fused gather pass */
+    td_pool_t* gather_pool = (nrows > TD_PARALLEL_THRESHOLD) ? td_pool_get() : NULL;
+    td_t* new_cols[ncols];
+    int64_t col_names[ncols];
+    int64_t valid_ncols = 0;
+
     for (int64_t c = 0; c < ncols; c++) {
         td_t* col = td_table_get_col_idx(df, c);
-        int64_t name_id = td_table_col_name(df, c);
-        if (!col) continue;
-
-        uint8_t esz = td_elem_size(col->type);
-        td_t* new_col = td_vec_new(col->type, nrows);
-        if (!new_col || TD_IS_ERR(new_col)) continue;
-        new_col->len = nrows;
-
-        char* src = (char*)td_data(col);
-        char* dst = (char*)td_data(new_col);
-        for (int64_t i = 0; i < nrows; i++) {
-            memcpy(dst + i * esz, src + indices[i] * esz, esz);
-        }
-
-        result = td_table_add_col(result, name_id, new_col);
-        td_release(new_col);
+        col_names[c] = td_table_col_name(df, c);
+        if (!col) { new_cols[c] = NULL; continue; }
+        td_t* nc = td_vec_new(col->type, nrows);
+        if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
+        nc->len = nrows;
+        new_cols[c] = nc;
+        valid_ncols++;
     }
 
-    /* Free expression-evaluated sort keys */
+    if (gather_pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
+        /* Fused multi-column gather: one pass over indices for all columns */
+        multi_gather_ctx_t mgctx = { .idx = sorted_idx, .ncols = 0 };
+        for (int64_t c = 0; c < ncols; c++) {
+            if (!new_cols[c]) continue;
+            td_t* col = td_table_get_col_idx(df, c);
+            int64_t ci = mgctx.ncols;
+            mgctx.srcs[ci] = (char*)td_data(col);
+            mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
+            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.ncols++;
+        }
+        td_pool_dispatch(gather_pool, multi_gather_fn, &mgctx, nrows);
+    } else {
+        /* Fallback: per-column gather */
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(df, c);
+            if (!col || !new_cols[c]) continue;
+            if (gather_pool) {
+                gather_ctx_t gctx = {
+                    .idx = sorted_idx, .src_col = col, .dst_col = new_cols[c],
+                    .esz = td_elem_size(col->type), .nullable = false,
+                };
+                td_pool_dispatch(gather_pool, gather_fn, &gctx, nrows);
+            } else {
+                uint8_t esz = td_elem_size(col->type);
+                char* src_p = (char*)td_data(col);
+                char* dst_p = (char*)td_data(new_cols[c]);
+                for (int64_t i = 0; i < nrows; i++)
+                    memcpy(dst_p + i * esz, src_p + sorted_idx[i] * esz, esz);
+            }
+        }
+    }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        if (!new_cols[c]) continue;
+        result = td_table_add_col(result, col_names[c], new_cols[c]);
+        td_release(new_cols[c]);
+    }
+
+    /* Free expression-evaluated sort keys and ENUM rank mappings */
     for (uint8_t k = 0; k < n_sort; k++) {
         if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
             td_release(sort_vecs[k]);
+        scratch_free(enum_rank_hdrs[k]);
     }
 
+    scratch_free(radix_itmp_hdr);
     scratch_free(indices_hdr);
     return result;
 }
@@ -2618,8 +3211,143 @@ cleanup:
 }
 
 /* ============================================================================
- * Join execution (hash join)
+ * Join execution (parallel hash join)
+ *
+ * Three-phase pipeline:
+ *   Phase 1 (sequential): Build chained hash table on right side
+ *   Phase 2 (parallel):   Two-pass probe — count matches, prefix-sum, fill
+ *   Phase 3 (parallel):   Column gather — assemble result columns
  * ============================================================================ */
+
+/* Key equality helper — shared by count + fill phases */
+static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
+                                 int64_t l, int64_t r) {
+    for (uint8_t k = 0; k < n_keys; k++) {
+        td_t* lc = l_vecs[k];
+        td_t* rc = r_vecs[k];
+        if (!lc || !rc) return false;
+        if (lc->type == TD_I64 || lc->type == TD_SYM) {
+            if (((int64_t*)td_data(lc))[l] != ((int64_t*)td_data(rc))[r]) return false;
+        } else if (lc->type == TD_F64) {
+            if (((double*)td_data(lc))[l] != ((double*)td_data(rc))[r]) return false;
+        } else if (lc->type == TD_I32) {
+            if (((int32_t*)td_data(lc))[l] != ((int32_t*)td_data(rc))[r]) return false;
+        } else if (lc->type == TD_ENUM) {
+            if (((uint32_t*)td_data(lc))[l] != ((uint32_t*)td_data(rc))[r]) return false;
+        }
+    }
+    return true;
+}
+
+/* ── Parallel join HT build ─────────────────────────────────────────────
+ * Workers hash right-side rows in parallel and insert into the shared
+ * chain-linked hash table using atomic CAS on ht_heads[slot].
+ * ht_next[r] is per-row (no contention). Load factor ~0.3 → negligible
+ * CAS contention.
+ * ──────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    int64_t* ht_heads;     /* shared, protected by atomic CAS */
+    int64_t* ht_next;      /* per-row, no contention */
+    uint32_t ht_mask;      /* ht_cap - 1 */
+    td_t**   r_key_vecs;
+    uint8_t  n_keys;
+} join_build_ctx_t;
+
+static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    join_build_ctx_t* c = (join_build_ctx_t*)raw;
+    int64_t* heads = c->ht_heads;
+    int64_t* next  = c->ht_next;
+    uint32_t mask  = c->ht_mask;
+
+    for (int64_t r = start; r < end; r++) {
+        uint64_t h = hash_row_keys(c->r_key_vecs, c->n_keys, r);
+        uint32_t slot = (uint32_t)(h & mask);
+        int64_t old = __atomic_load_n(&heads[slot], __ATOMIC_RELAXED);
+        do {
+            next[r] = old;
+        } while (!__atomic_compare_exchange_n(&heads[slot], &old, r,
+                    1 /* weak */, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    }
+}
+
+#define JOIN_MORSEL 8192
+
+typedef struct {
+    int64_t*     ht_heads;
+    int64_t*     ht_next;
+    uint32_t     ht_cap;
+    td_t**       l_key_vecs;
+    td_t**       r_key_vecs;
+    uint8_t      n_keys;
+    uint8_t      join_type;
+    int64_t      left_rows;
+    /* Per-morsel counts/offsets (allocated by main thread) */
+    int64_t*     morsel_counts;
+    int64_t*     morsel_offsets;
+    /* Shared output arrays (phase 2 fill) */
+    int64_t*     l_idx;
+    int64_t*     r_idx;
+} join_probe_ctx_t;
+
+/* Phase 2a: count matches per morsel */
+static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+    (void)wid; (void)task_end;
+    join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
+    uint32_t tid = (uint32_t)task_start;
+    int64_t row_start = (int64_t)tid * JOIN_MORSEL;
+    int64_t row_end = row_start + JOIN_MORSEL;
+    if (row_end > c->left_rows) row_end = c->left_rows;
+
+    int64_t count = 0;
+    for (int64_t l = row_start; l < row_end; l++) {
+        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l);
+        uint32_t slot = (uint32_t)(h & (c->ht_cap - 1));
+        bool matched = false;
+        for (int64_t r = c->ht_heads[slot]; r >= 0; r = c->ht_next[r]) {
+            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, r)) {
+                count++;
+                matched = true;
+            }
+        }
+        if (!matched && c->join_type == 1) count++;
+    }
+    c->morsel_counts[tid] = count;
+}
+
+/* Phase 2b: fill match pairs using pre-computed offsets */
+static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+    (void)wid; (void)task_end;
+    join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
+    uint32_t tid = (uint32_t)task_start;
+    int64_t row_start = (int64_t)tid * JOIN_MORSEL;
+    int64_t row_end = row_start + JOIN_MORSEL;
+    if (row_end > c->left_rows) row_end = c->left_rows;
+
+    int64_t off = c->morsel_offsets[tid];
+    int64_t* li = c->l_idx;
+    int64_t* ri = c->r_idx;
+
+    for (int64_t l = row_start; l < row_end; l++) {
+        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l);
+        uint32_t slot = (uint32_t)(h & (c->ht_cap - 1));
+        bool matched = false;
+        for (int64_t r = c->ht_heads[slot]; r >= 0; r = c->ht_next[r]) {
+            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, r)) {
+                li[off] = l;
+                ri[off] = r;
+                off++;
+                matched = true;
+            }
+        }
+        if (!matched && c->join_type == 1) {
+            li[off] = l;
+            ri[off] = -1;
+            off++;
+        }
+    }
+}
 
 static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df) {
     if (!left_df || TD_IS_ERR(left_df)) return left_df;
@@ -2649,13 +3377,15 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
             r_key_vecs[k] = rk->literal;
     }
 
-    /* Build hash table on right side (sequential) */
+    /* Phase 1: Build hash table on right side (parallel with atomic CAS) */
+    td_pool_t* pool = td_pool_get();
+
     uint32_t ht_cap = 256;
     uint64_t target = (uint64_t)right_rows * 2;
     while (ht_cap < target && ht_cap != 0) ht_cap *= 2;
-    if (ht_cap == 0) ht_cap = (uint32_t)(target | (target >> 1)); /* saturate */
+    if (ht_cap == 0) ht_cap = (uint32_t)(target | (target >> 1));
 
-    td_t* result = NULL;  /* declared before goto targets for Clang -Wsometimes-uninitialized */
+    td_t* result = NULL;
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     int64_t* ht_next = (int64_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(int64_t));
@@ -2666,87 +3396,85 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     }
     memset(ht_heads, -1, ht_cap * sizeof(int64_t));
 
-    for (int64_t r = 0; r < right_rows; r++) {
-        uint64_t h = hash_row_keys(r_key_vecs, n_keys, r);
-        uint32_t slot = (uint32_t)(h & (ht_cap - 1));
-        ht_next[r] = ht_heads[slot];
-        ht_heads[slot] = r;
+    {
+        join_build_ctx_t bctx = {
+            .ht_heads   = ht_heads,
+            .ht_next    = ht_next,
+            .ht_mask    = ht_cap - 1,
+            .r_key_vecs = r_key_vecs,
+            .n_keys     = n_keys,
+        };
+        if (pool && right_rows > TD_PARALLEL_THRESHOLD)
+            td_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
+        else
+            join_build_fn(&bctx, 0, 0, right_rows);
     }
 
-    /* Probe: collect (left_idx, right_idx) pairs */
-    int64_t pair_cap = left_rows;
-    int64_t pair_count = 0;
-    td_t* l_idx_hdr;
-    td_t* r_idx_hdr;
-    int64_t* l_idx = (int64_t*)scratch_alloc(&l_idx_hdr, (size_t)pair_cap * sizeof(int64_t));
-    int64_t* r_idx = (int64_t*)scratch_alloc(&r_idx_hdr, (size_t)pair_cap * sizeof(int64_t));
-    if (!l_idx || !r_idx) {
+    /* Phase 2: Parallel probe (two-pass: count → prefix-sum → fill) */
+    uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
+    if (n_tasks == 0) n_tasks = 1;
+
+    td_t* counts_hdr;
+    int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
+                              (size_t)(n_tasks + 1) * sizeof(int64_t));
+    if (!morsel_counts) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
-        scratch_free(l_idx_hdr); scratch_free(r_idx_hdr);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
-    for (int64_t l = 0; l < left_rows; l++) {
-        uint64_t h = hash_row_keys(l_key_vecs, n_keys, l);
-        uint32_t slot = (uint32_t)(h & (ht_cap - 1));
-        bool matched = false;
+    join_probe_ctx_t probe_ctx = {
+        .ht_heads    = ht_heads,
+        .ht_next     = ht_next,
+        .ht_cap      = ht_cap,
+        .l_key_vecs  = l_key_vecs,
+        .r_key_vecs  = r_key_vecs,
+        .n_keys      = n_keys,
+        .join_type   = join_type,
+        .left_rows   = left_rows,
+        .morsel_counts = morsel_counts,
+    };
 
-        for (int64_t r = ht_heads[slot]; r >= 0; r = ht_next[r]) {
-            bool eq = true;
-            for (uint8_t k = 0; k < n_keys && eq; k++) {
-                td_t* lc = l_key_vecs[k];
-                td_t* rc = r_key_vecs[k];
-                if (!lc || !rc) { eq = false; continue; }
+    /* 2a: Count matches per morsel */
+    if (pool && n_tasks > 1)
+        td_pool_dispatch_n(pool, join_count_fn, &probe_ctx, n_tasks);
+    else
+        for (uint32_t t = 0; t < n_tasks; t++)
+            join_count_fn(&probe_ctx, 0, t, t + 1);
 
-                if (lc->type == TD_I64 || lc->type == TD_SYM) {
-                    eq = ((int64_t*)td_data(lc))[l] == ((int64_t*)td_data(rc))[r];
-                } else if (lc->type == TD_F64) {
-                    eq = ((double*)td_data(lc))[l] == ((double*)td_data(rc))[r];
-                } else if (lc->type == TD_I32) {
-                    eq = ((int32_t*)td_data(lc))[l] == ((int32_t*)td_data(rc))[r];
-                } else if (lc->type == TD_ENUM) {
-                    eq = ((uint32_t*)td_data(lc))[l] == ((uint32_t*)td_data(rc))[r];
-                }
-            }
-
-            if (eq) {
-                if (pair_count >= pair_cap) {
-                    int64_t old_cap = pair_cap;
-                    pair_cap *= 2;
-                    int64_t* new_l = (int64_t*)scratch_realloc(&l_idx_hdr,
-                        (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                    int64_t* new_r = (int64_t*)scratch_realloc(&r_idx_hdr,
-                        (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                    if (!new_l || !new_r) goto join_cleanup;
-                    l_idx = new_l;
-                    r_idx = new_r;
-                }
-                l_idx[pair_count] = l;
-                r_idx[pair_count] = r;
-                pair_count++;
-                matched = true;
-            }
-        }
-
-        if (!matched && join_type == 1) {
-            if (pair_count >= pair_cap) {
-                int64_t old_cap = pair_cap;
-                pair_cap *= 2;
-                int64_t* new_l = (int64_t*)scratch_realloc(&l_idx_hdr,
-                    (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                int64_t* new_r = (int64_t*)scratch_realloc(&r_idx_hdr,
-                    (size_t)old_cap * sizeof(int64_t), (size_t)pair_cap * sizeof(int64_t));
-                if (!new_l || !new_r) goto join_cleanup;
-                l_idx = new_l;
-                r_idx = new_r;
-            }
-            l_idx[pair_count] = l;
-            r_idx[pair_count] = -1;
-            pair_count++;
-        }
+    /* Prefix sum → morsel_offsets (reuse counts array as offsets) */
+    int64_t pair_count = 0;
+    for (uint32_t t = 0; t < n_tasks; t++) {
+        int64_t cnt = morsel_counts[t];
+        morsel_counts[t] = pair_count;
+        pair_count += cnt;
     }
 
-    /* Build result DataFrame */
+    /* Allocate output pair arrays */
+    td_t* l_idx_hdr = NULL;
+    td_t* r_idx_hdr = NULL;
+    int64_t* l_idx = NULL;
+    int64_t* r_idx = NULL;
+
+    if (pair_count > 0) {
+        l_idx = (int64_t*)scratch_alloc(&l_idx_hdr, (size_t)pair_count * sizeof(int64_t));
+        r_idx = (int64_t*)scratch_alloc(&r_idx_hdr, (size_t)pair_count * sizeof(int64_t));
+        if (!l_idx || !r_idx) goto join_cleanup;
+    }
+
+    /* 2b: Fill match pairs */
+    probe_ctx.morsel_offsets = morsel_counts;  /* now holds prefix sums */
+    probe_ctx.l_idx = l_idx;
+    probe_ctx.r_idx = r_idx;
+
+    if (pair_count > 0) {
+        if (pool && n_tasks > 1)
+            td_pool_dispatch_n(pool, join_fill_fn, &probe_ctx, n_tasks);
+        else
+            for (uint32_t t = 0; t < n_tasks; t++)
+                join_fill_fn(&probe_ctx, 0, t, t + 1);
+    }
+
+    /* Phase 3: Build result DataFrame with parallel column gather */
     int64_t left_ncols = td_table_ncols(left_df);
     int64_t right_ncols = td_table_ncols(right_df);
     result = td_table_new(left_ncols + right_ncols);
@@ -2757,15 +3485,19 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
         int64_t name_id = td_table_col_name(left_df, c);
         if (!col) continue;
 
-        uint8_t esz = td_elem_size(col->type);
         td_t* new_col = td_vec_new(col->type, pair_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
 
-        char* src = (char*)td_data(col);
-        char* dst = (char*)td_data(new_col);
-        for (int64_t i = 0; i < pair_count; i++) {
-            memcpy(dst + i * esz, src + l_idx[i] * esz, esz);
+        if (pair_count > 0) {
+            gather_ctx_t gctx = {
+                .idx = l_idx, .src_col = col, .dst_col = new_col,
+                .esz = td_elem_size(col->type), .nullable = false,
+            };
+            if (pool && pair_count > TD_PARALLEL_THRESHOLD)
+                td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
+            else
+                gather_fn(&gctx, 0, 0, pair_count);
         }
         result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
@@ -2786,19 +3518,19 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
         }
         if (is_key) continue;
 
-        uint8_t esz = td_elem_size(col->type);
         td_t* new_col = td_vec_new(col->type, pair_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
 
-        char* src = (char*)td_data(col);
-        char* dst = (char*)td_data(new_col);
-        for (int64_t i = 0; i < pair_count; i++) {
-            if (r_idx[i] >= 0) {
-                memcpy(dst + i * esz, src + r_idx[i] * esz, esz);
-            } else {
-                memset(dst + i * esz, 0, esz);
-            }
+        if (pair_count > 0) {
+            gather_ctx_t gctx = {
+                .idx = r_idx, .src_col = col, .dst_col = new_col,
+                .esz = td_elem_size(col->type), .nullable = (join_type == 1),
+            };
+            if (pool && pair_count > TD_PARALLEL_THRESHOLD)
+                td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
+            else
+                gather_fn(&gctx, 0, 0, pair_count);
         }
         result = td_table_add_col(result, name_id, new_col);
         td_release(new_col);
@@ -2809,6 +3541,7 @@ join_cleanup:
     scratch_free(ht_heads_hdr);
     scratch_free(l_idx_hdr);
     scratch_free(r_idx_hdr);
+    scratch_free(counts_hdr);
 
     return result;
 }

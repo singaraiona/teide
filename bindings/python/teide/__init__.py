@@ -218,9 +218,10 @@ class TeideLib:
         lib.td_filter.argtypes = [c_graph_p, c_op_p, c_op_p]
         lib.td_filter.restype = c_op_p
 
-        # Sort: (graph, df_node, keys**, descs*, n_cols)
+        # Sort: (graph, df_node, keys**, descs*, nulls_first*, n_cols)
         lib.td_sort_op.argtypes = [c_graph_p, c_op_p,
                                     ctypes.POINTER(c_op_p),
+                                    ctypes.POINTER(ctypes.c_uint8),
                                     ctypes.POINTER(ctypes.c_uint8),
                                     ctypes.c_uint8]
         lib.td_sort_op.restype = c_op_p
@@ -341,11 +342,12 @@ class TeideLib:
     def filter(self, g, input_op, pred):
         return self._lib.td_filter(g, input_op, pred)
 
-    def sort_op(self, g, df_node, keys, descs):
+    def sort_op(self, g, df_node, keys, descs, nulls_first=None):
         n = len(keys)
         keys_arr = (c_op_p * n)(*keys)
         descs_arr = (ctypes.c_uint8 * n)(*descs)
-        return self._lib.td_sort_op(g, df_node, keys_arr, descs_arr, n)
+        nf = (ctypes.c_uint8 * n)(*nulls_first) if nulls_first else None
+        return self._lib.td_sort_op(g, df_node, keys_arr, descs_arr, nf, n)
 
     def group(self, g, keys, agg_ops, agg_ins):
         n_keys = len(keys)

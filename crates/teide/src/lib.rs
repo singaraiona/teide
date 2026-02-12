@@ -736,6 +736,10 @@ impl Table {
                     let p = data as *const i64;
                     Some(*p.add(row))
                 }
+                ffi::TD_BOOL => {
+                    let p = data as *const u8;
+                    Some(*p.add(row) as i64)
+                }
                 ffi::TD_I32 => {
                     let p = data as *const i32;
                     Some(*p.add(row) as i64)

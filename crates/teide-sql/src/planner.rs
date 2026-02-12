@@ -14,7 +14,7 @@ use teide::{Column, Context, Graph, Table};
 use crate::expr::{
     agg_op_from_name, collect_aggregates, collect_window_functions, expr_default_name,
     format_agg_name, has_window_functions, is_aggregate, is_count_distinct, is_pure_aggregate,
-    is_window_function, parse_window_frame, plan_agg_input, plan_expr, plan_having_expr,
+    parse_window_frame, plan_agg_input, plan_expr, plan_having_expr,
     plan_post_agg_expr,
 };
 use crate::{ExecResult, Session, SqlError, SqlResult, StoredTable};
@@ -1395,21 +1395,20 @@ fn plan_window_stage(
         new_schema.entry(display.clone()).or_insert(col_idx);
     }
 
-    // Rewrite SELECT items: replace window function calls with identifier refs
+    // Rewrite SELECT items: replace window function calls with identifier refs.
+    // Handles both top-level window functions and nested ones (e.g. ROW_NUMBER() OVER(...) <= 3).
     let mut win_idx = 0;
     let new_items: Vec<SelectItem> = select_items
         .iter()
         .map(|item| match item {
-            SelectItem::UnnamedExpr(expr) if is_window_function(expr) => {
-                let col_name = win_col_names[win_idx].clone();
-                win_idx += 1;
-                SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(col_name)))
+            SelectItem::UnnamedExpr(expr) => {
+                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
+                SelectItem::UnnamedExpr(rewritten)
             }
-            SelectItem::ExprWithAlias { expr, alias } if is_window_function(expr) => {
-                let col_name = win_col_names[win_idx].clone();
-                win_idx += 1;
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
                 SelectItem::ExprWithAlias {
-                    expr: Expr::Identifier(Ident::new(col_name)),
+                    expr: rewritten,
                     alias: alias.clone(),
                 }
             }
@@ -1418,6 +1417,42 @@ fn plan_window_stage(
         .collect();
 
     Ok((result, new_schema, new_items))
+}
+
+/// Recursively replace window function calls in an expression with identifier
+/// references to pre-computed window result columns (_w0, _w1, ...).
+fn rewrite_window_refs(expr: &Expr, col_names: &[String], idx: &mut usize) -> Expr {
+    match expr {
+        Expr::Function(f) if f.over.is_some() => {
+            let col_name = col_names[*idx].clone();
+            *idx += 1;
+            Expr::Identifier(Ident::new(col_name))
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(rewrite_window_refs(left, col_names, idx)),
+            op: op.clone(),
+            right: Box::new(rewrite_window_refs(right, col_names, idx)),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(rewrite_window_refs(inner, col_names, idx)),
+        },
+        Expr::Nested(inner) => {
+            Expr::Nested(Box::new(rewrite_window_refs(inner, col_names, idx)))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+            kind,
+        } => Expr::Cast {
+            expr: Box::new(rewrite_window_refs(inner, col_names, idx)),
+            data_type: data_type.clone(),
+            format: format.clone(),
+            kind: kind.clone(),
+        },
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------

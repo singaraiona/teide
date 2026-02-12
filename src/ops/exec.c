@@ -494,6 +494,93 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
 }
 
 /* ============================================================================
+ * Parallel index gather — used by filter, sort, and join
+ * ============================================================================ */
+
+/* Fused multi-column gather — single pass over index array for all columns.
+ * Much faster than per-column gather because: (1) indices read once not N times,
+ * (2) prefetch covers all columns at once. */
+#define MGATHER_MAX_COLS 16
+typedef struct {
+    const int64_t* idx;
+    char*          srcs[MGATHER_MAX_COLS];
+    char*          dsts[MGATHER_MAX_COLS];
+    uint8_t        esz[MGATHER_MAX_COLS];
+    int64_t        ncols;
+} multi_gather_ctx_t;
+
+static void multi_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    multi_gather_ctx_t* c = (multi_gather_ctx_t*)raw;
+    const int64_t* idx = c->idx;
+    int64_t nc = c->ncols;
+
+    /* Process one column at a time per batch of rows.
+     * This focuses random reads on a single source array, giving the
+     * hardware prefetcher only 1 stream to track (instead of ncols
+     * concurrent streams, which overflows the L2 miss queue). */
+#define MG_BATCH 512
+#define MG_PF    16
+    for (int64_t base = start; base < end; base += MG_BATCH) {
+        int64_t bstart = base;
+        int64_t bend = base + MG_BATCH;
+        if (bend > end) bend = end;
+        for (int64_t col = 0; col < nc; col++) {
+            uint8_t e = c->esz[col];
+            char* src = c->srcs[col];
+            char* dst = c->dsts[col];
+            for (int64_t i = bstart; i < bend; i++) {
+                if (i + MG_PF < bend)
+                    __builtin_prefetch(src + idx[i + MG_PF] * e, 0, 0);
+                memcpy(dst + i * e, src + idx[i] * e, e);
+            }
+        }
+    }
+#undef MG_PF
+#undef MG_BATCH
+}
+
+/* Parallel index gather — single column with prefetching */
+typedef struct {
+    int64_t*     idx;
+    td_t*        src_col;
+    td_t*        dst_col;
+    uint8_t      esz;
+    bool         nullable;  /* true = idx may contain -1 (LEFT JOIN nulls) */
+} gather_ctx_t;
+
+static void gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gather_ctx_t* c = (gather_ctx_t*)raw;
+    char* src = (char*)td_data(c->src_col);
+    char* dst = (char*)td_data(c->dst_col);
+    uint8_t esz = c->esz;
+    const int64_t* idx = c->idx;
+#define GATHER_PF 16
+
+    if (c->nullable) {
+        for (int64_t i = start; i < end; i++) {
+            if (i + GATHER_PF < end) {
+                int64_t pf = idx[i + GATHER_PF];
+                if (pf >= 0) __builtin_prefetch(src + pf * esz, 0, 0);
+            }
+            int64_t r = idx[i];
+            if (r >= 0)
+                memcpy(dst + i * esz, src + r * esz, esz);
+            else
+                memset(dst + i * esz, 0, esz);
+        }
+    } else {
+        for (int64_t i = start; i < end; i++) {
+            if (i + GATHER_PF < end)
+                __builtin_prefetch(src + idx[i + GATHER_PF] * esz, 0, 0);
+            memcpy(dst + i * esz, src + idx[i] * esz, esz);
+        }
+    }
+#undef GATHER_PF
+}
+
+/* ============================================================================
  * Filter execution
  * ============================================================================ */
 
@@ -524,42 +611,138 @@ static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
     return result;
 }
 
+/* Sequential DataFrame filter fallback (small tables or alloc failure). */
+static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
+                             int64_t pass_count) {
+    td_t* tbl = td_table_new(ncols);
+    if (!tbl || TD_IS_ERR(tbl)) return tbl;
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(input, c);
+        if (!col || TD_IS_ERR(col)) continue;
+        int64_t name_id = td_table_col_name(input, c);
+        td_t* filtered = exec_filter_vec(col, pred, pass_count);
+        if (!filtered || TD_IS_ERR(filtered)) { td_release(tbl); return filtered; }
+        td_table_add_col(tbl, name_id, filtered);
+        td_release(filtered);
+    }
+    return tbl;
+}
+
 static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     (void)g;
     (void)op;
     if (!input || TD_IS_ERR(input)) return input;
     if (!pred || TD_IS_ERR(pred)) return pred;
 
-    /* Count passing elements */
+    /* Count passing elements — single sequential scan over predicate */
     int64_t pass_count = 0;
-    td_morsel_t mp;
-    td_morsel_init(&mp, pred);
-    while (td_morsel_next(&mp)) {
-        uint8_t* bits = (uint8_t*)mp.morsel_ptr;
-        for (int64_t i = 0; i < mp.morsel_len; i++)
-            if (bits[i]) pass_count++;
+    {
+        td_morsel_t mp;
+        td_morsel_init(&mp, pred);
+        while (td_morsel_next(&mp)) {
+            uint8_t* bits = (uint8_t*)mp.morsel_ptr;
+            for (int64_t i = 0; i < mp.morsel_len; i++)
+                if (bits[i]) pass_count++;
+        }
     }
 
-    /* DataFrame filter: filter each column, build new table */
-    if (input->type == TD_TABLE) {
-        int64_t ncols = td_table_ncols(input);
-        td_t* tbl = td_table_new(ncols);
-        if (!tbl || TD_IS_ERR(tbl)) return tbl;
+    /* Vector filter — single column, use sequential path */
+    if (input->type != TD_TABLE)
+        return exec_filter_vec(input, pred, pass_count);
 
+    /* DataFrame filter: parallel gather using compact match index */
+    int64_t ncols = td_table_ncols(input);
+
+    /* For small pass counts, fall back to sequential */
+    if (pass_count <= TD_PARALLEL_THRESHOLD || ncols <= 0)
+        return exec_filter_seq(input, pred, ncols, pass_count);
+
+    /* Build match_idx: match_idx[j] = row of j-th matching element */
+    td_t* idx_hdr = NULL;
+    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
+                                   (size_t)pass_count * sizeof(int64_t));
+    if (!match_idx)
+        return exec_filter_seq(input, pred, ncols, pass_count);
+
+    {
+        int64_t j = 0;
+        td_morsel_t mp;
+        td_morsel_init(&mp, pred);
+        int64_t row_base = 0;
+        while (td_morsel_next(&mp)) {
+            uint8_t* bits = (uint8_t*)mp.morsel_ptr;
+            for (int64_t i = 0; i < mp.morsel_len; i++)
+                if (bits[i]) match_idx[j++] = row_base + i;
+            row_base += mp.morsel_len;
+        }
+    }
+
+    /* Parallel gather — same pattern as sort gather */
+    td_pool_t* pool = td_pool_get();
+    td_t* tbl = td_table_new(ncols);
+    if (!tbl || TD_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl; }
+
+    /* Pre-allocate output columns */
+    td_t* new_cols[ncols];
+    int64_t col_names[ncols];
+    int64_t valid_ncols = 0;
+
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(input, c);
+        col_names[c] = td_table_col_name(input, c);
+        if (!col || TD_IS_ERR(col)) { new_cols[c] = NULL; continue; }
+        td_t* nc = td_vec_new(col->type, pass_count);
+        if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
+        nc->len = pass_count;
+        new_cols[c] = nc;
+        valid_ncols++;
+    }
+
+    if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
+        /* Fused multi-column gather */
+        multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
+        for (int64_t c = 0; c < ncols; c++) {
+            if (!new_cols[c]) continue;
+            td_t* col = td_table_get_col_idx(input, c);
+            int64_t ci = mgctx.ncols;
+            mgctx.srcs[ci] = (char*)td_data(col);
+            mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
+            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.ncols++;
+        }
+        td_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
+    } else if (pool) {
+        /* Per-column parallel gather */
         for (int64_t c = 0; c < ncols; c++) {
             td_t* col = td_table_get_col_idx(input, c);
-            if (!col || TD_IS_ERR(col)) continue;
-            int64_t name_id = td_table_col_name(input, c);
-            td_t* filtered = exec_filter_vec(col, pred, pass_count);
-            if (!filtered || TD_IS_ERR(filtered)) { td_release(tbl); return filtered; }
-            td_table_add_col(tbl, name_id, filtered);
-            td_release(filtered);
+            if (!col || !new_cols[c]) continue;
+            gather_ctx_t gctx = {
+                .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
+                .esz = td_elem_size(col->type), .nullable = false,
+            };
+            td_pool_dispatch(pool, gather_fn, &gctx, pass_count);
         }
-        return tbl;
+    } else {
+        /* Sequential gather with index */
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(input, c);
+            if (!col || !new_cols[c]) continue;
+            uint8_t esz = td_elem_size(col->type);
+            char* src = (char*)td_data(col);
+            char* dst = (char*)td_data(new_cols[c]);
+            for (int64_t i = 0; i < pass_count; i++)
+                memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
+        }
     }
 
-    /* Vector filter */
-    return exec_filter_vec(input, pred, pass_count);
+    for (int64_t c = 0; c < ncols; c++) {
+        if (!new_cols[c]) continue;
+        td_table_add_col(tbl, col_names[c], new_cols[c]);
+        td_release(new_cols[c]);
+    }
+
+    scratch_free(idx_hdr);
+    return tbl;
 }
 
 /* ============================================================================
@@ -621,89 +804,6 @@ static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
         if (cmp != 0) return cmp;
     }
     return 0;
-}
-
-/* Fused multi-column gather — single pass over index array for all columns.
- * Much faster than per-column gather because: (1) indices read once not N times,
- * (2) prefetch covers all columns at once. */
-#define MGATHER_MAX_COLS 16
-typedef struct {
-    const int64_t* idx;
-    char*          srcs[MGATHER_MAX_COLS];
-    char*          dsts[MGATHER_MAX_COLS];
-    uint8_t        esz[MGATHER_MAX_COLS];
-    int64_t        ncols;
-} multi_gather_ctx_t;
-
-static void multi_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    multi_gather_ctx_t* c = (multi_gather_ctx_t*)raw;
-    const int64_t* idx = c->idx;
-    int64_t nc = c->ncols;
-
-    /* Process one column at a time per batch of rows.
-     * This focuses random reads on a single source array, giving the
-     * hardware prefetcher only 1 stream to track (instead of ncols
-     * concurrent streams, which overflows the L2 miss queue). */
-#define MG_BATCH 512
-#define MG_PF    16
-    for (int64_t base = start; base < end; base += MG_BATCH) {
-        int64_t bstart = base;
-        int64_t bend = base + MG_BATCH;
-        if (bend > end) bend = end;
-        for (int64_t col = 0; col < nc; col++) {
-            uint8_t e = c->esz[col];
-            char* src = c->srcs[col];
-            char* dst = c->dsts[col];
-            for (int64_t i = bstart; i < bend; i++) {
-                if (i + MG_PF < bend)
-                    __builtin_prefetch(src + idx[i + MG_PF] * e, 0, 0);
-                memcpy(dst + i * e, src + idx[i] * e, e);
-            }
-        }
-    }
-#undef MG_PF
-#undef MG_BATCH
-}
-
-/* Parallel index gather — used by sort and join for column materialization */
-typedef struct {
-    int64_t*     idx;
-    td_t*        src_col;
-    td_t*        dst_col;
-    uint8_t      esz;
-    bool         nullable;  /* true = idx may contain -1 (LEFT JOIN nulls) */
-} gather_ctx_t;
-
-static void gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    gather_ctx_t* c = (gather_ctx_t*)raw;
-    char* src = (char*)td_data(c->src_col);
-    char* dst = (char*)td_data(c->dst_col);
-    uint8_t esz = c->esz;
-    const int64_t* idx = c->idx;
-#define GATHER_PF 16
-
-    if (c->nullable) {
-        for (int64_t i = start; i < end; i++) {
-            if (i + GATHER_PF < end) {
-                int64_t pf = idx[i + GATHER_PF];
-                if (pf >= 0) __builtin_prefetch(src + pf * esz, 0, 0);
-            }
-            int64_t r = idx[i];
-            if (r >= 0)
-                memcpy(dst + i * esz, src + r * esz, esz);
-            else
-                memset(dst + i * esz, 0, esz);
-        }
-    } else {
-        for (int64_t i = start; i < end; i++) {
-            if (i + GATHER_PF < end)
-                __builtin_prefetch(src + idx[i + GATHER_PF] * esz, 0, 0);
-            memcpy(dst + i * esz, src + idx[i] * esz, esz);
-        }
-    }
-#undef GATHER_PF
 }
 
 /* --------------------------------------------------------------------------

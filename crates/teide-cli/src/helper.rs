@@ -6,6 +6,8 @@ use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Helper, Result};
 
+use crate::theme;
+
 // ---------------------------------------------------------------------------
 // SQL keyword / function lists
 // ---------------------------------------------------------------------------
@@ -23,20 +25,6 @@ const AGG_FUNCTIONS: &[&str] = &["SUM", "AVG", "MIN", "MAX", "COUNT"];
 const OPERATORS: &[&str] = &["AND", "OR", "NOT"];
 
 const DOT_COMMANDS: &[&str] = &[".mode", ".tables", ".timer", ".help", ".quit", ".exit"];
-
-// ---------------------------------------------------------------------------
-// ANSI colors — Nord palette (cool/muted)
-// ---------------------------------------------------------------------------
-
-// Monokai Pro palette
-const KW: &str = "\x1b[1;38;2;249;38;114m"; // bold pink — SQL keywords
-const FN: &str = "\x1b[1;38;2;166;226;46m"; // bold green — aggregate functions
-const STR: &str = "\x1b[38;2;230;219;116m"; // yellow — string literals
-const NUM: &str = "\x1b[38;2;174;129;255m"; // purple — number literals
-const OP: &str = "\x1b[1;38;2;249;38;114m"; // bold pink — operators
-const DOT: &str = "\x1b[38;2;102;217;239m"; // cyan — dot commands
-const DIM: &str = "\x1b[38;2;117;113;94m"; // comment gray — hints/dim
-const RESET: &str = "\x1b[0m";
 
 // ---------------------------------------------------------------------------
 // SqlHelper
@@ -81,9 +69,10 @@ impl SqlHelper {
 
 impl Highlighter for SqlHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        use theme::*;
         // Dot commands
         if line.starts_with('.') {
-            return Owned(format!("{DOT}{line}{RESET}"));
+            return Owned(format!("{DOT_CMD}{line}{R}"));
         }
 
         let mut out = String::with_capacity(line.len() + 128);
@@ -106,7 +95,7 @@ impl Highlighter for SqlHelper {
                 }
                 out.push_str(STR);
                 out.push_str(&line[start..i]);
-                out.push_str(RESET);
+                out.push_str(R);
                 continue;
             }
 
@@ -125,7 +114,7 @@ impl Highlighter for SqlHelper {
                 } else {
                     out.push_str(NUM);
                     out.push_str(&line[start..i]);
-                    out.push_str(RESET);
+                    out.push_str(R);
                 }
                 continue;
             }
@@ -140,17 +129,20 @@ impl Highlighter for SqlHelper {
                 let upper = word.to_ascii_uppercase();
 
                 if AGG_FUNCTIONS.contains(&upper.as_str()) {
-                    out.push_str(FN);
+                    out.push_str(BOLD);
+                    out.push_str(FN_CLR);
                     out.push_str(word);
-                    out.push_str(RESET);
+                    out.push_str(R);
                 } else if OPERATORS.contains(&upper.as_str()) {
+                    out.push_str(BOLD);
                     out.push_str(OP);
                     out.push_str(word);
-                    out.push_str(RESET);
+                    out.push_str(R);
                 } else if SQL_KEYWORDS.contains(&upper.as_str()) {
+                    out.push_str(BOLD);
                     out.push_str(KW);
                     out.push_str(word);
-                    out.push_str(RESET);
+                    out.push_str(R);
                 } else {
                     out.push_str(word);
                 }
@@ -166,7 +158,7 @@ impl Highlighter for SqlHelper {
                 }
                 out.push_str(OP);
                 out.push_str(&line[start..i]);
-                out.push_str(RESET);
+                out.push_str(R);
                 continue;
             }
 
@@ -184,18 +176,14 @@ impl Highlighter for SqlHelper {
         default: bool,
     ) -> Cow<'b, str> {
         if default {
-            Owned(format!(
-                "\x1b[1;38;2;166;226;46m‣\x1b[0m "
-            ))
+            Owned(format!("{}{}▸{} ", theme::BOLD, theme::PROMPT, theme::R))
         } else {
-            Owned(format!(
-                "\x1b[2m   ...  \x1b[0m "
-            ))
+            Owned(format!("{}  ...  {} ", theme::PROMPT_CONT, theme::R))
         }
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Owned(format!("{DIM}{hint}{RESET}"))
+        Owned(format!("{}{hint}{}", theme::HINT, theme::R))
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {

@@ -1,4 +1,5 @@
 mod helper;
+mod theme;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -46,7 +47,7 @@ fn run_single_query(sql: &str) {
     match teide_sql::execute_sql(&ctx, sql) {
         Ok(result) => print_result(&result, &OutputFormat::Table),
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("{}Error: {e}{}", theme::ERROR, theme::R);
             std::process::exit(1);
         }
     }
@@ -67,8 +68,8 @@ fn run_sql_file(path: &PathBuf) {
             Ok(teide_sql::ExecResult::Query(result)) => {
                 print_result(&result, &OutputFormat::Table);
             }
-            Ok(teide_sql::ExecResult::Ddl(msg)) => println!("{msg}"),
-            Err(e) => eprintln!("Error: {e}"),
+            Ok(teide_sql::ExecResult::Ddl(msg)) => println!("{}{msg}{}", theme::SUCCESS, theme::R),
+            Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
         }
     }
 }
@@ -143,11 +144,11 @@ fn run_repl(preload_csv: Option<&str>) {
                         }
                         print_result(&result, &format);
                         if show_timer {
-                            eprintln!("Run Time: {:.3}s", start.elapsed().as_secs_f64());
+                            eprintln!("{}Run Time: {:.3}s{}", theme::TIMER, start.elapsed().as_secs_f64(), theme::R);
                         }
                     }
                     Ok(teide_sql::ExecResult::Ddl(msg)) => {
-                        println!("{msg}");
+                        println!("{}{msg}{}", theme::SUCCESS, theme::R);
                         // Update stored table names for Tab-completion
                         if let Some(h) = editor.helper_mut() {
                             h.table_names = session
@@ -157,10 +158,10 @@ fn run_repl(preload_csv: Option<&str>) {
                                 .collect();
                         }
                         if show_timer {
-                            eprintln!("Run Time: {:.3}s", start.elapsed().as_secs_f64());
+                            eprintln!("{}Run Time: {:.3}s{}", theme::TIMER, start.elapsed().as_secs_f64(), theme::R);
                         }
                     }
-                    Err(e) => eprintln!("Error: {e}"),
+                    Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
                 }
             }
             Err(rustyline::error::ReadlineError::Eof) => break,
@@ -243,6 +244,7 @@ fn type_name(typ: i8) -> &'static str {
 
 fn print_table(result: &teide_sql::SqlResult) {
     use std::fmt::Write;
+    use theme::*;
 
     let table = &result.table;
     let nrows = table.nrows() as usize;
@@ -250,7 +252,7 @@ fn print_table(result: &teide_sql::SqlResult) {
     let ncols = col_indices.len();
 
     if ncols == 0 {
-        println!("(empty result)");
+        println!("{FOOTER}(empty result){R}");
         return;
     }
 
@@ -283,15 +285,19 @@ fn print_table(result: &teide_sql::SqlResult) {
     let tail_n = if show_dots { TAIL_ROWS } else { 0 };
     let shown = head_n + tail_n;
 
-    // Format all cell values
+    // Format all cell values + track which are NULL for dimming
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(shown + 3);
+    let mut is_null: Vec<Vec<bool>> = Vec::with_capacity(shown + 3);
     for r in 0..head_n {
-        cells.push(
-            col_indices
-                .iter()
-                .map(|&c| format_cell(table, c, r))
-                .collect(),
-        );
+        let mut row = Vec::with_capacity(ncols);
+        let mut nulls = Vec::with_capacity(ncols);
+        for &c in &col_indices {
+            let val = format_cell(table, c, r);
+            nulls.push(val == "NULL");
+            row.push(val);
+        }
+        cells.push(row);
+        is_null.push(nulls);
     }
     if show_dots {
         cells.push(
@@ -299,13 +305,17 @@ fn print_table(result: &teide_sql::SqlResult) {
                 .map(|_| "\u{00b7}\u{00b7}\u{00b7}".to_string())
                 .collect(),
         );
+        is_null.push(vec![false; ncols]);
         for r in (nrows - tail_n)..nrows {
-            cells.push(
-                col_indices
-                    .iter()
-                    .map(|&c| format_cell(table, c, r))
-                    .collect(),
-            );
+            let mut row = Vec::with_capacity(ncols);
+            let mut nulls = Vec::with_capacity(ncols);
+            for &c in &col_indices {
+                let val = format_cell(table, c, r);
+                nulls.push(val == "NULL");
+                row.push(val);
+            }
+            cells.push(row);
+            is_null.push(nulls);
         }
     }
 
@@ -336,104 +346,99 @@ fn print_table(result: &teide_sql::SqlResult) {
         w[ncols - 1] += extra;
         inner_width += extra;
     }
-    let mut buf = String::with_capacity(inner_width + 4);
+    let mut buf = String::with_capacity(inner_width * 2);
+
+    // Helper: push a horizontal border line
+    macro_rules! hline {
+        ($left:expr, $mid:expr, $right:expr) => {{
+            buf.clear();
+            buf.push_str(BORDER);
+            buf.push($left);
+            for c in 0..ncols {
+                if c > 0 { buf.push($mid); }
+                for _ in 0..w[c] + 2 { buf.push('─'); }
+            }
+            buf.push($right);
+            buf.push_str(R);
+            println!("{buf}");
+        }};
+    }
 
     // Top border
-    buf.push('┌');
-    for c in 0..ncols {
-        if c > 0 {
-            buf.push('┬');
-        }
-        for _ in 0..w[c] + 2 {
-            buf.push('─');
-        }
-    }
-    buf.push('┐');
-    println!("{buf}");
+    hline!('┌', '┬', '┐');
 
     // Column names
     buf.clear();
-    buf.push('│');
     for c in 0..ncols {
-        if c > 0 {
-            buf.push('│');
-        }
-        let _ = write!(buf, " {:^width$} ", col_names[c], width = w[c]);
+        buf.push_str(BORDER);
+        buf.push('│');
+        buf.push_str(R);
+        let _ = write!(buf, " {BOLD}{HEADER}{:^width$}{R} ", col_names[c], width = w[c]);
     }
+    buf.push_str(BORDER);
     buf.push('│');
+    buf.push_str(R);
     println!("{buf}");
 
     // Column types
     buf.clear();
-    buf.push('│');
     for c in 0..ncols {
-        if c > 0 {
-            buf.push('│');
-        }
-        let _ = write!(buf, " {:^width$} ", col_types[c], width = w[c]);
+        buf.push_str(BORDER);
+        buf.push('│');
+        buf.push_str(R);
+        let _ = write!(buf, " {TYPE_DIM}{:^width$}{R} ", col_types[c], width = w[c]);
     }
+    buf.push_str(BORDER);
     buf.push('│');
+    buf.push_str(R);
     println!("{buf}");
 
     // Header/data separator
-    buf.clear();
-    buf.push('├');
-    for c in 0..ncols {
-        if c > 0 {
-            buf.push('┼');
-        }
-        for _ in 0..w[c] + 2 {
-            buf.push('─');
-        }
-    }
-    buf.push('┤');
-    println!("{buf}");
+    hline!('├', '┼', '┤');
 
     // Data rows
-    for row in &cells {
+    let dots_idx = if show_dots { Some(head_n) } else { None };
+    for (ri, row) in cells.iter().enumerate() {
         buf.clear();
-        buf.push('│');
+        let is_dots = dots_idx == Some(ri);
         for c in 0..ncols {
-            if c > 0 {
-                buf.push('│');
-            }
-            if is_right[c] {
-                let _ = write!(buf, " {:>width$} ", row[c], width = w[c]);
+            buf.push_str(BORDER);
+            buf.push('│');
+            buf.push_str(R);
+            if is_dots {
+                let _ = write!(buf, " {FOOTER}{:^width$}{R} ", row[c], width = w[c]);
+            } else if is_null[ri][c] {
+                let _ = write!(buf, " {ITALIC}{NULL_CLR}{:>width$}{R} ", row[c], width = w[c]);
+            } else if is_right[c] {
+                let _ = write!(buf, " {TEXT}{:>width$}{R} ", row[c], width = w[c]);
             } else {
-                let _ = write!(buf, " {:<width$} ", row[c], width = w[c]);
+                let _ = write!(buf, " {TEXT}{:<width$}{R} ", row[c], width = w[c]);
             }
         }
+        buf.push_str(BORDER);
         buf.push('│');
+        buf.push_str(R);
         println!("{buf}");
     }
 
     // Footer top border
-    buf.clear();
-    buf.push('├');
-    for c in 0..ncols {
-        if c > 0 {
-            buf.push('┴');
-        }
-        for _ in 0..w[c] + 2 {
-            buf.push('─');
-        }
-    }
-    buf.push('┤');
-    println!("{buf}");
+    hline!('├', '┴', '┤');
 
     // Footer content
     let pad = inner_width - footer_left.len() - footer_right.len() - 2;
     buf.clear();
-    let _ = write!(buf, "│ {footer_left}{:pad$}{footer_right} │", "");
+    let _ = write!(buf, "{BORDER}│{R} {FOOTER}{footer_left}{:pad$}{footer_right}{R} {BORDER}│{R}", "");
     println!("{buf}");
 
     // Bottom border
     buf.clear();
+    buf.push_str(BORDER);
     buf.push('└');
     for _ in 0..inner_width {
         buf.push('─');
     }
     buf.push('┘');
+    buf.push_str(R);
     println!("{buf}");
 }
 
@@ -577,63 +582,64 @@ fn handle_dot_command(
     timer: &mut bool,
     session: &teide_sql::Session,
 ) {
+    use theme::*;
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     match parts[0] {
         ".mode" => {
             if parts.len() < 2 {
-                println!("Usage: .mode table|csv|json");
+                println!("{FOOTER}Usage: .mode table|csv|json{R}");
                 return;
             }
             match parts[1] {
                 "table" => {
                     *format = OutputFormat::Table;
-                    println!("Output mode: table");
+                    println!("{SUCCESS}Output mode: table{R}");
                 }
                 "csv" => {
                     *format = OutputFormat::Csv;
-                    println!("Output mode: csv");
+                    println!("{SUCCESS}Output mode: csv{R}");
                 }
                 "json" => {
                     *format = OutputFormat::Json;
-                    println!("Output mode: json");
+                    println!("{SUCCESS}Output mode: json{R}");
                 }
-                _ => println!("Unknown mode. Use: table, csv, json"),
+                _ => println!("{ERROR}Unknown mode. Use: table, csv, json{R}"),
             }
         }
         ".timer" => {
             if parts.len() < 2 {
-                println!("Usage: .timer on|off");
+                println!("{FOOTER}Usage: .timer on|off{R}");
                 return;
             }
             match parts[1] {
                 "on" => {
                     *timer = true;
-                    println!("Timer: on");
+                    println!("{SUCCESS}Timer: on{R}");
                 }
                 "off" => {
                     *timer = false;
-                    println!("Timer: off");
+                    println!("{SUCCESS}Timer: off{R}");
                 }
-                _ => println!("Usage: .timer on|off"),
+                _ => println!("{FOOTER}Usage: .timer on|off{R}"),
             }
         }
         ".tables" => {
             let names = session.table_names();
             if names.is_empty() {
-                println!("No stored tables.");
+                println!("{FOOTER}No stored tables.{R}");
             } else {
                 let mut sorted = names;
                 sorted.sort();
                 for name in sorted {
                     if let Some((nrows, ncols)) = session.table_info(name) {
-                        println!("  {name:20} {nrows} rows, {ncols} cols");
+                        println!("  {HEADER}{name:20}{R} {FOOTER}{nrows} rows, {ncols} cols{R}");
                     }
                 }
             }
         }
         ".help" => print_help(),
         ".quit" | ".exit" => std::process::exit(0),
-        _ => println!("Unknown command: {}. Type .help for commands.", parts[0]),
+        _ => println!("{ERROR}Unknown command: {}. Type .help for commands.{R}", parts[0]),
     }
 }
 
@@ -642,24 +648,45 @@ fn handle_dot_command(
 // ---------------------------------------------------------------------------
 
 fn print_banner() {
-    println!("Teide v{} -- Fast SQL engine", env!("CARGO_PKG_VERSION"));
-    println!("Type .help for commands, or enter SQL terminated with ;");
+    use theme::*;
+    let ver = env!("CARGO_PKG_VERSION");
+    let hash = env!("GIT_HASH");
+    let arch = std::env::consts::ARCH;
+    let tag = format!("v{}  \u{b7}  {}  \u{b7}  {}", ver, hash, arch);
+    let help = "type .help for commands";
+    let tag_w = tag.chars().count();
+    let help_w = help.chars().count();
+    let w = tag_w.max(help_w);
+    // top border: ╭─ Teide SQL ──...──╮
+    // fixed display chars between ╭ and ╮: ─(1) SP(1) "Teide SQL"(9) SP(1) ─(1) = 13
+    // content lines: │ SP {w chars} SP │  → inner = w + 2
+    // so fill = (w + 2) - 13 = w - 11
+    let fill = if w > 11 { w - 11 } else { 0 };
+    println!("{BAN_BORDER}\u{256d}\u{2500} {BOLD}{BAN_TITLE}Teide SQL{R}{BAN_BORDER} \u{2500}{}\u{256e}{R}",
+             "\u{2500}".repeat(fill));
+    println!("{BAN_BORDER}\u{2502}{R} {BAN_INFO}{}{}{R} {BAN_BORDER}\u{2502}{R}",
+             tag, " ".repeat(w - tag_w));
+    println!("{BAN_BORDER}\u{2502}{R} {BAN_HELP}{}{}{R} {BAN_BORDER}\u{2502}{R}",
+             help, " ".repeat(w - help_w));
+    println!("{BAN_BORDER}\u{2570}{}\u{256f}{R}",
+             "\u{2500}".repeat(w + 2));
     println!();
 }
 
 fn print_help() {
-    println!("Commands:");
-    println!("  .mode table|csv|json  Set output format");
-    println!("  .tables               List stored tables");
-    println!("  .timer on|off         Show query execution time");
-    println!("  .help                 Show this help");
-    println!("  .quit                 Exit");
+    use theme::*;
+    println!("{BOLD}{HEADER}Commands:{R}");
+    println!("  {NORD7}.mode table|csv|json{R}  {NORD3}Set output format{R}");
+    println!("  {NORD7}.tables{R}               {NORD3}List stored tables{R}");
+    println!("  {NORD7}.timer on|off{R}         {NORD3}Show query execution time{R}");
+    println!("  {NORD7}.help{R}                 {NORD3}Show this help{R}");
+    println!("  {NORD7}.quit{R}                 {NORD3}Exit{R}");
     println!();
-    println!("SQL:");
-    println!("  SELECT id1, SUM(v1) FROM 'data.csv' GROUP BY id1;");
-    println!("  CREATE TABLE t AS SELECT * FROM 'data.csv' WHERE id1 = 'id016';");
-    println!("  SELECT * FROM t GROUP BY id1;");
-    println!("  DROP TABLE t;");
+    println!("{BOLD}{HEADER}SQL:{R}");
+    println!("  {TEXT}SELECT id1, SUM(v1) FROM 'data.csv' GROUP BY id1;{R}");
+    println!("  {TEXT}CREATE TABLE t AS SELECT * FROM 'data.csv' WHERE id1 = 'id016';{R}");
+    println!("  {TEXT}SELECT * FROM t GROUP BY id1;{R}");
+    println!("  {TEXT}DROP TABLE t;{R}");
 }
 
 fn dirs_or_home() -> PathBuf {

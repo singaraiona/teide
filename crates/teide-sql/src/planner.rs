@@ -1,6 +1,6 @@
 // SQL planner: translates sqlparser AST into Teide execution graph.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName,
@@ -63,10 +63,12 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
             let nrows = result.table.nrows();
             let ncols = result.columns.len();
 
+            // Rename table columns to match SQL aliases so downstream scans work
+            let table = result.table.with_column_names(&result.columns);
             session.tables.insert(
                 table_name.clone(),
                 StoredTable {
-                    table: result.table,
+                    table,
                     columns: result.columns,
                 },
             );
@@ -150,10 +152,12 @@ fn plan_query(
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.to_lowercase();
             let result = plan_query(ctx, &cte.query, Some(&cte_map))?;
+            // Rename table columns to match SQL aliases so downstream scans work
+            let table = result.table.with_column_names(&result.columns);
             cte_map.insert(
                 cte_name,
                 StoredTable {
-                    table: result.table,
+                    table,
                     columns: result.columns,
                 },
             );
@@ -310,8 +314,54 @@ fn plan_query(
     // DISTINCT flag
     let is_distinct = matches!(&select.distinct, Some(Distinct::Distinct));
 
-    // Resolve FROM clause (possibly with JOINs)
-    let (table, schema) = resolve_from(ctx, &select.from, effective_tables)?;
+    // Resolve FROM clause, with predicate pushdown for subqueries.
+    // When FROM is a single subquery with window functions or GROUP BY,
+    // equality predicates on PARTITION BY / GROUP BY keys are injected into the
+    // subquery's WHERE before materialization — avoids processing all rows.
+    let (table, schema, effective_where): (Table, HashMap<String, usize>, Option<Expr>) =
+        if select.from.len() == 1
+            && select.from[0].joins.is_empty()
+            && select.selection.is_some()
+        {
+            if let TableFactor::Derived { subquery, .. } = &select.from[0].relation {
+                let where_expr = select.selection.as_ref().unwrap();
+                let pushable_cols = get_pushable_columns_from_query(subquery);
+                if !pushable_cols.is_empty() {
+                    let terms = split_conjunction(where_expr);
+                    let mut push = Vec::new();
+                    let mut keep = Vec::new();
+                    for term in &terms {
+                        if extract_equality_column(term)
+                            .map(|c| pushable_cols.contains(&c))
+                            .unwrap_or(false)
+                        {
+                            push.push((*term).clone());
+                        } else {
+                            keep.push((*term).clone());
+                        }
+                    }
+                    if !push.is_empty() {
+                        let modified = inject_predicates_into_query(subquery, &push);
+                        let result = plan_query(ctx, &modified, effective_tables)?;
+                        let tbl = result.table.with_column_names(&result.columns);
+                        let sch = build_result_schema(&tbl, &result.columns);
+                        (tbl, sch, join_conjunction(keep))
+                    } else {
+                        let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
+                        (tbl, sch, select.selection.clone())
+                    }
+                } else {
+                    let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
+                    (tbl, sch, select.selection.clone())
+                }
+            } else {
+                let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
+                (tbl, sch, select.selection.clone())
+            }
+        } else {
+            let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
+            (tbl, sch, select.selection.clone())
+        };
 
     // Build SELECT alias → expression map (for GROUP BY on aliases)
     let select_items = &select.projection;
@@ -348,9 +398,9 @@ fn plan_query(
     });
 
     // Stage 1: WHERE filter (resolve subqueries first)
-    // For GROUP BY queries, push predicate down as a mask instead of materializing.
+    // Uses effective_where which may have had predicates removed by pushdown above.
     let (working_table, filter_mask): (Table, Option<*mut teide::td_t>) =
-        if let Some(ref where_expr) = select.selection {
+        if let Some(ref where_expr) = effective_where {
             let resolved = if has_subqueries(where_expr) {
                 resolve_subqueries(ctx, where_expr, effective_tables)?
             } else {
@@ -413,7 +463,11 @@ fn plan_query(
             } => false,
             _ => true, // CAST, arithmetic, function calls, etc.
         });
-        if needs_expr {
+        if needs_expr || working_table.ncols() as usize != aliases.len() {
+            // Expression evaluation needed, OR simple column selection from a wider
+            // table (e.g. SELECT id1, v1 FROM 9-col table). The projection ensures
+            // the result table's column count matches the alias list — required for
+            // subquery/CTE materialization with with_column_names().
             plan_expr_select(ctx, &working_table, select_items, &schema)?
         } else {
             (working_table, aliases)
@@ -750,17 +804,12 @@ fn resolve_table_factor(
             let schema = build_schema(&table);
             Ok((table, schema))
         }
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            let alias_name = alias
-                .as_ref()
-                .map(|a| a.name.value.to_lowercase())
-                .ok_or_else(|| SqlError::Plan("Subquery in FROM requires an alias".into()))?;
+        TableFactor::Derived { subquery, .. } => {
             let result = plan_query(ctx, subquery, tables)?;
-            let schema = build_result_schema(&result.table, &result.columns);
-            let _ = alias_name; // alias used for qualification, schema uses column names
-            Ok((result.table, schema))
+            // Rename columns to match SQL aliases so outer scans work
+            let table = result.table.with_column_names(&result.columns);
+            let schema = build_result_schema(&table, &result.columns);
+            Ok((table, schema))
         }
         _ => Err(SqlError::Plan(
             "Only simple table references and subqueries are supported in FROM".into(),
@@ -1397,24 +1446,35 @@ fn plan_window_stage(
 
     // Rewrite SELECT items: replace window function calls with identifier refs.
     // Handles both top-level window functions and nested ones (e.g. ROW_NUMBER() OVER(...) <= 3).
+    // Wildcards are expanded to original columns only (excluding _w0, _w1, ... intermediates).
     let mut win_idx = 0;
-    let new_items: Vec<SelectItem> = select_items
-        .iter()
-        .map(|item| match item {
+    let mut new_items: Vec<SelectItem> = Vec::new();
+    for item in select_items {
+        match item {
             SelectItem::UnnamedExpr(expr) => {
                 let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
-                SelectItem::UnnamedExpr(rewritten)
+                new_items.push(SelectItem::UnnamedExpr(rewritten));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
-                SelectItem::ExprWithAlias {
+                new_items.push(SelectItem::ExprWithAlias {
                     expr: rewritten,
                     alias: alias.clone(),
+                });
+            }
+            SelectItem::Wildcard(_) => {
+                // Expand to original columns only — skip _w* intermediates
+                let mut cols: Vec<_> = schema.iter().collect();
+                cols.sort_by_key(|(_, idx)| **idx);
+                for (name, _) in cols {
+                    new_items.push(SelectItem::UnnamedExpr(
+                        Expr::Identifier(Ident::new(name.clone())),
+                    ));
                 }
             }
-            other => other.clone(),
-        })
-        .collect();
+            other => new_items.push(other.clone()),
+        }
+    }
 
     Ok((result, new_schema, new_items))
 }
@@ -1966,6 +2026,126 @@ fn has_subqueries(expr: &Expr) -> bool {
         _ => false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Predicate pushdown into FROM subqueries
+// ---------------------------------------------------------------------------
+
+/// Split a conjunction (AND chain) into individual terms.
+fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut terms = split_conjunction(left);
+            terms.extend(split_conjunction(right));
+            terms
+        }
+        other => vec![other],
+    }
+}
+
+/// Join terms back into a conjunction (AND chain). Returns None if empty.
+fn join_conjunction(terms: Vec<Expr>) -> Option<Expr> {
+    let mut iter = terms.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, term| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOperator::And,
+        right: Box::new(term),
+    }))
+}
+
+/// If expr is `column = literal`, return the column name.
+fn extract_equality_column(expr: &Expr) -> Option<String> {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    {
+        if let Expr::Identifier(ident) = left.as_ref() {
+            if matches!(right.as_ref(), Expr::Value(_)) {
+                return Some(ident.value.to_lowercase());
+            }
+        }
+        if let Expr::Identifier(ident) = right.as_ref() {
+            if matches!(left.as_ref(), Expr::Value(_)) {
+                return Some(ident.value.to_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Determine which columns can accept pushdown predicates from an outer query.
+/// - Window functions: PARTITION BY key columns (intersection of all windows)
+/// - GROUP BY: GROUP BY key columns
+/// - Neither: empty set (no pushdown — can't verify column origin safely)
+fn get_pushable_columns_from_query(query: &Query) -> HashSet<String> {
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return HashSet::new(),
+    };
+
+    if has_window_functions(&select.projection) {
+        let win_funcs = match collect_window_functions(&select.projection) {
+            Ok(wf) => wf,
+            Err(_) => return HashSet::new(),
+        };
+        let mut pkeys: Option<HashSet<String>> = None;
+        for (_, info) in &win_funcs {
+            let mut keys = HashSet::new();
+            for e in &info.spec.partition_by {
+                if let Expr::Identifier(id) = e {
+                    keys.insert(id.value.to_lowercase());
+                }
+            }
+            pkeys = Some(match pkeys {
+                None => keys,
+                Some(existing) => existing.intersection(&keys).cloned().collect(),
+            });
+        }
+        pkeys.unwrap_or_default()
+    } else {
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+                let mut cols = HashSet::new();
+                for e in exprs {
+                    if let Expr::Identifier(id) = e {
+                        cols.insert(id.value.to_lowercase());
+                    }
+                }
+                cols
+            }
+            _ => HashSet::new(),
+        }
+    }
+}
+
+/// Clone a query and inject additional WHERE predicates (ANDed with existing WHERE).
+fn inject_predicates_into_query(query: &Query, preds: &[Expr]) -> Query {
+    let mut q = query.clone();
+    if preds.is_empty() {
+        return q;
+    }
+    let new_pred = join_conjunction(preds.to_vec()).unwrap();
+    if let SetExpr::Select(ref mut select) = *q.body {
+        select.selection = Some(match select.selection.take() {
+            Some(existing) => Expr::BinaryOp {
+                left: Box::new(existing),
+                op: BinaryOperator::And,
+                right: Box::new(new_pred),
+            },
+            None => new_pred,
+        });
+    }
+    q
+}
+
+// ---------------------------------------------------------------------------
 
 /// Extract GROUP BY column names.
 /// Accepts table column names or SELECT alias names (for expression-based keys).

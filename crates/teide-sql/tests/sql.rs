@@ -1020,3 +1020,177 @@ fn window_first_last_value_sql() {
         }
     }
 }
+
+#[test]
+fn window_expr_with_wildcard_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // SELECT *, ROW_NUMBER() OVER (...) <= 2 should produce original cols + bool column
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT *, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) <= 2 FROM csv",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    // 9 original columns + 1 bool expression column = 10
+    assert_eq!(r.columns.len(), 10, "expected 10 columns, got {:?}", r.columns);
+    // Last column should be bool type (type code 1)
+    let last_col = r.columns.len() - 1;
+    assert_eq!(r.table.col_type(last_col), 1, "last column should be bool");
+    // id001 has 4 rows; top-2 by DESC v1 (v1=4,3) → true; v1=2,1 → false
+    let mut true_count = 0;
+    for row in 0..r.table.nrows() as usize {
+        let id1 = r.table.get_str(0, row).unwrap().to_string();
+        let flag = r.table.get_i64(last_col, row).unwrap();
+        if id1 == "id001" && flag != 0 {
+            true_count += 1;
+        }
+    }
+    assert_eq!(true_count, 2, "id001 should have exactly 2 rows with <= 2 = true");
+}
+
+#[test]
+fn cte_column_alias_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // CTE with aliased columns should preserve aliases for the outer query
+    let r = unwrap_query(
+        session
+            .execute(
+                "WITH w AS (SELECT id1, v1 + v2 AS total FROM csv) \
+                 SELECT id1, total FROM w WHERE total > 10 ORDER BY total DESC LIMIT 5",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.columns.len(), 2);
+    assert_eq!(r.columns[0], "id1");
+    assert_eq!(r.columns[1], "total");
+    // Verify values are correct (v1 + v2 > 10 means large rows)
+    for row in 0..r.table.nrows() as usize {
+        let total = r.table.get_i64(1, row).unwrap();
+        assert!(total > 10, "total should be > 10, got {}", total);
+    }
+
+    // CTE with window function alias
+    let r2 = unwrap_query(
+        session
+            .execute(
+                "WITH w AS (SELECT id1, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) AS rn FROM csv) \
+                 SELECT * FROM w WHERE rn <= 2 ORDER BY id1, rn",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r2.columns.len(), 2);
+    assert_eq!(r2.columns[1], "rn");
+    // 5 partitions (id001..id005) × 2 rows each = 10 rows
+    assert_eq!(r2.table.nrows(), 10, "expected 10 rows from 5 partitions × top-2");
+    for row in 0..r2.table.nrows() as usize {
+        let rn = r2.table.get_i64(1, row).unwrap();
+        assert!(rn <= 2, "rn should be <= 2, got {}", rn);
+    }
+}
+
+#[test]
+fn subquery_predicate_pushdown_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    // Subquery without alias should work (aliasless derived table)
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT * FROM (SELECT id1, v1 FROM csv) sub WHERE id1 = 'id001'",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.columns.len(), 2);
+    assert_eq!(r.table.nrows(), 4, "id001 has 4 rows");
+    for row in 0..r.table.nrows() as usize {
+        assert_eq!(r.table.get_str(0, row).unwrap(), "id001");
+    }
+
+    // Predicate pushdown: equality on PARTITION BY key pushed into subquery
+    // The result must be identical whether or not pushdown happens
+    let r2 = unwrap_query(
+        session
+            .execute(
+                "SELECT * FROM (\
+                     SELECT *, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) <= 2 AS top2 \
+                     FROM csv\
+                 ) sub WHERE id1 = 'id001'",
+            )
+            .unwrap(),
+    );
+    // id001 has 4 rows; top2 = true for the 2 with highest v1 (v1=4, v1=3)
+    assert_eq!(r2.table.nrows(), 4, "id001 has 4 rows after pushdown");
+    let mut true_count = 0;
+    for row in 0..r2.table.nrows() as usize {
+        assert_eq!(r2.table.get_str(0, row).unwrap(), "id001");
+        let top2 = r2.table.get_i64(r2.columns.len() - 1, row).unwrap();
+        if top2 != 0 {
+            true_count += 1;
+        }
+    }
+    assert_eq!(true_count, 2, "exactly 2 rows should have top2=true");
+
+    // Non-partition-key predicates stay in outer WHERE (not pushed)
+    let r3 = unwrap_query(
+        session
+            .execute(
+                "SELECT * FROM (\
+                     SELECT *, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) AS rn \
+                     FROM csv\
+                 ) sub WHERE id1 = 'id001' AND rn <= 2",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r3.table.nrows(), 2, "top-2 rows of id001 partition");
+    for row in 0..r3.table.nrows() as usize {
+        assert_eq!(r3.table.get_str(0, row).unwrap(), "id001");
+        let rn = r3.table.get_i64(r3.columns.len() - 1, row).unwrap();
+        assert!(rn <= 2, "rn should be <= 2, got {}", rn);
+    }
+
+    // Aliasless subquery (no AS sub) should also work
+    let r4 = unwrap_query(
+        session
+            .execute(
+                "SELECT * FROM (\
+                     SELECT *, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) <= 2 AS top2 \
+                     FROM csv\
+                 ) WHERE id1 = 'id002'",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r4.table.nrows(), 4, "id002 has 4 rows");
+    for row in 0..r4.table.nrows() as usize {
+        assert_eq!(r4.table.get_str(0, row).unwrap(), "id002");
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_subquery_window_filter() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let mut session = setup_bench_groupby().expect("10M CSV not found");
+
+    let sql = "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 DESC) <= 3 FROM t) WHERE id1 = 'id001' AND id2 = 'id085' AND id3 = 'id000094499'";
+
+    // Warmup
+    let _ = session.execute(sql).unwrap();
+
+    // Timed runs
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let r = unwrap_query(session.execute(sql).unwrap());
+        times.push(t.elapsed());
+        assert_eq!(r.table.nrows(), 1);
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    let min = times[0];
+    eprintln!("bench_subquery_window_filter: min={:?} median={:?}", min, median);
+}

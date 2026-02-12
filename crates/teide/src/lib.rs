@@ -703,6 +703,23 @@ impl Table {
         self.raw = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
     }
 
+    /// Create a new table with the same column data but renamed columns.
+    /// `names` must have exactly `ncols()` entries.
+    pub fn with_column_names(&self, names: &[String]) -> Self {
+        let nc = self.ncols() as usize;
+        assert_eq!(names.len(), nc);
+        unsafe {
+            let mut new_raw = ffi::td_table_new(nc as i64);
+            for i in 0..nc {
+                let col = ffi::td_table_get_col_idx(self.raw, i as i64);
+                let name_id = sym_intern(&names[i]);
+                ffi::td_retain(col);
+                new_raw = ffi::td_table_add_col(new_raw, name_id, col);
+            }
+            Table::from_raw(new_raw)
+        }
+    }
+
     /// Raw column vector at index (returns None for out-of-range or error).
     pub fn get_col_idx(&self, idx: i64) -> Option<*mut ffi::td_t> {
         let p = unsafe { ffi::td_table_get_col_idx(self.raw, idx) };

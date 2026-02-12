@@ -1046,95 +1046,45 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
         }
     }
 
-    /* Encode each string as a comparable uint64_t (first 8 bytes, BE).
-     * For strings sharing the first 8 bytes, we fall back to full comparison
-     * during merge sort.  In practice ENUM values are short and distinct,
-     * so the uint64_t prefix resolves almost all comparisons. */
-    td_t* skeys_hdr;
-    uint64_t* skeys = (uint64_t*)scratch_alloc(&skeys_hdr,
-                           (size_t)n_ids * sizeof(uint64_t));
-    if (!skeys) { scratch_free(lens_hdr); scratch_free(ptrs_hdr);
-                  scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
-    for (uint32_t i = 0; i < n_ids; i++) {
-        uint64_t k = 0;
-        if (ptrs[i]) {
-            uint32_t n = lens[i] > 8 ? 8 : lens[i];
-            for (uint32_t b = 0; b < n; b++)
-                k |= (uint64_t)(uint8_t)ptrs[i][b] << (56 - 8*b);
-        }
-        skeys[i] = k;
-    }
-
-    /* Radix sort IDs by their uint64_t string keys (8-pass, 8-bit digits).
-     * For the common case of ≤100K ENUM values, this completes in <1ms. */
+    /* Merge sort intern IDs by full string comparison.  For ≤100K ENUM
+     * values this completes in <1ms and correctly handles strings that
+     * share long common prefixes (e.g. "id000000001"–"id000099999"). */
     {
-        td_t* itmp_hdr;
-        uint32_t* itmp = (uint32_t*)scratch_alloc(&itmp_hdr,
+        td_t* tmp_hdr;
+        uint32_t* tmp = (uint32_t*)scratch_alloc(&tmp_hdr,
                              (size_t)n_ids * sizeof(uint32_t));
-        td_t* ktmp_hdr;
-        uint64_t* ktmp = (uint64_t*)scratch_alloc(&ktmp_hdr,
-                             (size_t)n_ids * sizeof(uint64_t));
-        if (!itmp || !ktmp) {
-            if (itmp) scratch_free(itmp_hdr);
-            if (ktmp) scratch_free(ktmp_hdr);
-            scratch_free(skeys_hdr); scratch_free(lens_hdr);
-            scratch_free(ptrs_hdr); scratch_free(ids_hdr);
-            *hdr_out = NULL; return NULL;
-        }
+        if (!tmp) { scratch_free(lens_hdr); scratch_free(ptrs_hdr);
+                    scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
 
-        uint32_t* src_ids = ids;
-        uint32_t* dst_ids = itmp;
-        uint64_t* src_keys = skeys;
-        uint64_t* dst_keys = ktmp;
-        td_t* src_ids_hdr = ids_hdr;
-        td_t* dst_ids_hdr = itmp_hdr;
-
-        for (int pass = 0; pass < 8; pass++) {
-            int shift = pass * 8;
-
-            /* Check if this byte is uniform → skip pass */
-            uint8_t first_byte = (uint8_t)(src_keys[0] >> shift);
-            bool uniform = true;
-            for (uint32_t i = 1; i < n_ids; i++) {
-                if ((uint8_t)(src_keys[i] >> shift) != first_byte) {
-                    uniform = false; break;
+        /* Bottom-up merge sort */
+        for (uint32_t width = 1; width < n_ids; width *= 2) {
+            for (uint32_t i = 0; i < n_ids; i += 2 * width) {
+                uint32_t lo = i;
+                uint32_t mid = lo + width;
+                if (mid > n_ids) mid = n_ids;
+                uint32_t hi = lo + 2 * width;
+                if (hi > n_ids) hi = n_ids;
+                /* Merge ids[lo..mid) and ids[mid..hi) into tmp[lo..hi) */
+                uint32_t a = lo, b = mid, k = lo;
+                while (a < mid && b < hi) {
+                    uint32_t ia = ids[a], ib = ids[b];
+                    uint32_t la = lens[ia], lb = lens[ib];
+                    uint32_t ml = la < lb ? la : lb;
+                    int cmp = 0;
+                    if (ml > 0) cmp = memcmp(ptrs[ia], ptrs[ib], ml);
+                    if (cmp == 0) cmp = (la > lb) - (la < lb);
+                    if (cmp <= 0) tmp[k++] = ids[a++];
+                    else          tmp[k++] = ids[b++];
                 }
+                while (a < mid) tmp[k++] = ids[a++];
+                while (b < hi)  tmp[k++] = ids[b++];
             }
-            if (uniform) continue;
-
-            /* Count */
-            uint32_t counts[256] = {0};
-            for (uint32_t i = 0; i < n_ids; i++)
-                counts[(src_keys[i] >> shift) & 0xFF]++;
-
-            /* Prefix sum */
-            uint32_t offsets[256];
-            offsets[0] = 0;
-            for (int b = 1; b < 256; b++)
-                offsets[b] = offsets[b-1] + counts[b-1];
-
-            /* Scatter */
-            for (uint32_t i = 0; i < n_ids; i++) {
-                uint8_t byte = (src_keys[i] >> shift) & 0xFF;
-                uint32_t pos = offsets[byte]++;
-                dst_ids[pos] = src_ids[i];
-                dst_keys[pos] = src_keys[i];
-            }
-
-            /* Swap src/dst */
-            uint32_t* st = src_ids; src_ids = dst_ids; dst_ids = st;
-            uint64_t* sk = src_keys; src_keys = dst_keys; dst_keys = sk;
-            td_t* sh = src_ids_hdr; src_ids_hdr = dst_ids_hdr; dst_ids_hdr = sh;
+            /* Swap ids and tmp */
+            uint32_t* s = ids; ids = tmp; tmp = s;
+            td_t* sh = ids_hdr; ids_hdr = tmp_hdr; tmp_hdr = sh;
         }
-
-        /* Result is in src_ids. Update ids/ids_hdr to point to it. */
-        ids = src_ids;
-        ids_hdr = src_ids_hdr;
-        /* Free the other buffer */
-        scratch_free(dst_ids_hdr);
-        scratch_free(ktmp_hdr);
+        scratch_free(tmp_hdr);
     }
-    scratch_free(skeys_hdr);
     scratch_free(lens_hdr);
     scratch_free(ptrs_hdr);
 

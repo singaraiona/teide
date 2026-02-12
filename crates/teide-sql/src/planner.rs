@@ -221,10 +221,83 @@ fn plan_query(
             // Apply ORDER BY and LIMIT from the outer query
             return apply_post_processing(ctx, query, result, left_result.columns, effective_tables);
         }
-        SetExpr::SetOperation { .. } => {
-            return Err(SqlError::Plan(
-                "Only UNION ALL is supported for set operations".into(),
-            ))
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let is_all = matches!(
+                set_quantifier,
+                sqlparser::ast::SetQuantifier::All
+            );
+
+            let left_query = Query {
+                with: None,
+                body: left.clone(),
+                order_by: None,
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+            };
+            let right_query = Query {
+                with: None,
+                body: right.clone(),
+                order_by: None,
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+            };
+            let left_result = plan_query(ctx, &left_query, effective_tables)?;
+            let right_result = plan_query(ctx, &right_query, effective_tables)?;
+
+            if left_result.columns.len() != right_result.columns.len() {
+                return Err(SqlError::Plan(format!(
+                    "{:?}: column count mismatch ({} vs {})",
+                    op,
+                    left_result.columns.len(),
+                    right_result.columns.len()
+                )));
+            }
+
+            let keep_matches = matches!(op, sqlparser::ast::SetOperator::Intersect);
+
+            let result = exec_set_operation(
+                ctx,
+                &left_result.table,
+                &right_result.table,
+                keep_matches,
+            )?;
+
+            // Without ALL: apply DISTINCT
+            let result = if !is_all {
+                let aliases: Vec<String> = (0..result.ncols() as usize)
+                    .map(|i| result.col_name_str(i).to_string())
+                    .collect();
+                let schema = build_schema(&result);
+                let (distinct_result, _) = plan_distinct(ctx, &result, &aliases, &schema)?;
+                distinct_result
+            } else {
+                result
+            };
+
+            return apply_post_processing(
+                ctx,
+                query,
+                result,
+                left_result.columns,
+                effective_tables,
+            );
         }
         _ => {
             return Err(SqlError::Plan(
@@ -248,8 +321,23 @@ fn plan_query(
         }
     }
 
-    // GROUP BY column names (accepts table columns and SELECT aliases)
-    let group_by_cols = extract_group_by_columns(&select.group_by, &schema, &alias_exprs)?;
+    // Collect SELECT aliases for positional GROUP BY (GROUP BY 1, 2)
+    let select_aliases_for_gb: Vec<String> = select_items
+        .iter()
+        .map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.to_lowercase(),
+            SelectItem::UnnamedExpr(e) => crate::expr::expr_default_name(e),
+            _ => String::new(),
+        })
+        .collect();
+
+    // GROUP BY column names (accepts table columns, SELECT aliases, expressions, and positions)
+    let group_by_cols = extract_group_by_columns(
+        &select.group_by,
+        &schema,
+        &mut alias_exprs,
+        &select_aliases_for_gb,
+    )?;
     let has_group_by = !group_by_cols.is_empty();
 
     // Detect aggregates in SELECT
@@ -460,10 +548,30 @@ fn resolve_from(
     if from.is_empty() {
         return Err(SqlError::Plan("Missing FROM clause".into()));
     }
+
+    // Multiple FROM tables = implicit CROSS JOIN: SELECT * FROM t1, t2
     if from.len() > 1 {
-        return Err(SqlError::Plan(
-            "Multiple FROM tables not supported (use JOIN syntax)".into(),
-        ));
+        let (mut result_table, mut result_schema) =
+            resolve_table_factor(ctx, &from[0].relation, tables)?;
+        // Process joins on first table
+        for join in &from[0].joins {
+            let (right_table, right_schema) = resolve_table_factor(ctx, &join.relation, tables)?;
+            result_table = exec_cross_join(ctx, &result_table, &right_table)?;
+            result_schema = build_schema(&result_table);
+            let _ = right_schema;
+        }
+        // Cross join with subsequent FROM tables
+        for twj in &from[1..] {
+            let (right_table, _) = resolve_table_factor(ctx, &twj.relation, tables)?;
+            result_table = exec_cross_join(ctx, &result_table, &right_table)?;
+            result_schema = build_schema(&result_table);
+            for join in &twj.joins {
+                let (right_table2, _) = resolve_table_factor(ctx, &join.relation, tables)?;
+                result_table = exec_cross_join(ctx, &result_table, &right_table2)?;
+                result_schema = build_schema(&result_table);
+            }
+        }
+        return Ok((result_table, result_schema));
     }
 
     let twj = &from[0];
@@ -485,7 +593,11 @@ fn resolve_from(
                 1
             }
             JoinOperator::CrossJoin => {
-                return Err(SqlError::Plan("CROSS JOIN not supported yet".into()));
+                let result = exec_cross_join(ctx, &left_table, &right_table)?;
+                let merged_schema = build_schema(&result);
+                left_table = result;
+                left_schema = merged_schema;
+                continue;
             }
             _ => {
                 return Err(SqlError::Plan(format!(
@@ -703,10 +815,34 @@ fn plan_group_select(
             select_plan.push(SelectPlan::PostAggExpr(expr.clone(), display.clone()));
             final_aliases.push(display);
         } else {
-            return Err(SqlError::Plan(format!(
-                "Expression '{}' must be in GROUP BY or contain an aggregate",
-                expr
-            )));
+            // Check if this expression matches a GROUP BY expression key
+            let expr_str = format!("{expr}").to_lowercase();
+            let mut matched_key = None;
+            for (alias, gb_expr) in alias_exprs.iter() {
+                if group_by_cols.contains(alias) {
+                    let gb_str = format!("{gb_expr}").to_lowercase();
+                    if gb_str == expr_str {
+                        matched_key = Some(alias.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(key) = matched_key {
+                let display = explicit_alias.unwrap_or_else(|| expr_default_name(expr));
+                select_plan.push(SelectPlan::KeyRef(key));
+                final_aliases.push(display);
+            } else if !has_group_by {
+                // No GROUP BY — this shouldn't happen (would have been caught earlier)
+                return Err(SqlError::Plan(format!(
+                    "Expression '{}' must be in GROUP BY or contain an aggregate",
+                    expr
+                )));
+            } else {
+                return Err(SqlError::Plan(format!(
+                    "Expression '{}' must be in GROUP BY or contain an aggregate",
+                    expr
+                )));
+            }
         }
     }
 
@@ -1154,6 +1290,210 @@ fn concat_tables(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, S
     Ok(unsafe { Table::from_raw(result_raw) })
 }
 
+/// Execute a CROSS JOIN (Cartesian product) of two tables.
+fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+    let l_nrows = left.nrows() as usize;
+    let r_nrows = right.nrows() as usize;
+    let out_nrows = l_nrows.checked_mul(r_nrows).ok_or_else(|| {
+        SqlError::Plan("CROSS JOIN result too large".into())
+    })?;
+    let l_ncols = left.ncols();
+    let r_ncols = right.ncols();
+
+    let result_raw = unsafe { teide::ffi_table_new(l_ncols + r_ncols) };
+    if result_raw.is_null() {
+        return Err(SqlError::Engine(teide::Error::Oom));
+    }
+    let mut result_raw = result_raw;
+
+    // Left columns: repeat each row r_nrows times
+    for c in 0..l_ncols {
+        let col = left.get_col_idx(c).ok_or(SqlError::Plan(
+            "CROSS JOIN: left column missing".into(),
+        ))?;
+        let name_id = left.col_name(c);
+        let col_type = unsafe { teide::raw::td_type(col) };
+        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
+        if new_col.is_null() || teide::ffi_is_err(new_col) {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        let src = unsafe { teide::raw::td_data(col) };
+        let dst = unsafe { teide::raw::td_data(new_col) };
+        for lr in 0..l_nrows {
+            for rr in 0..r_nrows {
+                let out_row = lr * r_nrows + rr;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.add(lr * esz),
+                        dst.add(out_row * esz),
+                        esz,
+                    );
+                }
+            }
+        }
+        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        unsafe { teide::ffi_release(new_col) };
+    }
+
+    // Right columns: tile the entire column l_nrows times
+    for c in 0..r_ncols {
+        let col = right.get_col_idx(c).ok_or(SqlError::Plan(
+            "CROSS JOIN: right column missing".into(),
+        ))?;
+        let name_id = right.col_name(c);
+        let col_type = unsafe { teide::raw::td_type(col) };
+        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
+        if new_col.is_null() || teide::ffi_is_err(new_col) {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        let src = unsafe { teide::raw::td_data(col) };
+        let dst = unsafe { teide::raw::td_data(new_col) };
+        for lr in 0..l_nrows {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src,
+                    dst.add(lr * r_nrows * esz),
+                    r_nrows * esz,
+                );
+            }
+        }
+        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        unsafe { teide::ffi_release(new_col) };
+    }
+
+    unsafe { teide::ffi_retain(result_raw) };
+    Ok(unsafe { Table::from_raw(result_raw) })
+}
+
+/// Execute EXCEPT ALL or INTERSECT ALL between two tables.
+/// `keep_matches = true` → INTERSECT (keep left rows that exist in right).
+/// `keep_matches = false` → EXCEPT (keep left rows that do NOT exist in right).
+fn exec_set_operation(
+    _ctx: &Context,
+    left: &Table,
+    right: &Table,
+    keep_matches: bool,
+) -> Result<Table, SqlError> {
+    use std::collections::HashMap as StdMap;
+
+    let l_nrows = left.nrows() as usize;
+    let r_nrows = right.nrows() as usize;
+    let ncols = left.ncols();
+
+    // Hash all right-side rows
+    let mut right_counts: StdMap<u64, usize> = StdMap::new();
+    for r in 0..r_nrows {
+        let h = hash_table_row(right, r, ncols as usize);
+        *right_counts.entry(h).or_insert(0) += 1;
+    }
+
+    // Probe with left-side rows, collect indices to keep
+    let mut keep_indices: Vec<usize> = Vec::new();
+    let mut remaining = right_counts.clone();
+    for r in 0..l_nrows {
+        let h = hash_table_row(left, r, ncols as usize);
+        let in_right = remaining.get(&h).copied().unwrap_or(0) > 0;
+        if keep_matches {
+            // INTERSECT: keep if in right
+            if in_right {
+                keep_indices.push(r);
+                *remaining.get_mut(&h).unwrap() -= 1;
+            }
+        } else {
+            // EXCEPT: keep if NOT in right
+            if in_right {
+                *remaining.get_mut(&h).unwrap() -= 1;
+            } else {
+                keep_indices.push(r);
+            }
+        }
+    }
+
+    // Build result table with kept rows
+    let result_raw = unsafe { teide::ffi_table_new(ncols) };
+    if result_raw.is_null() {
+        return Err(SqlError::Engine(teide::Error::Oom));
+    }
+    let mut result_raw = result_raw;
+    let out_nrows = keep_indices.len();
+
+    for c in 0..ncols {
+        let col = left.get_col_idx(c).ok_or(SqlError::Plan(
+            "SET operation: column missing".into(),
+        ))?;
+        let name_id = left.col_name(c);
+        let col_type = unsafe { teide::raw::td_type(col) };
+        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
+        if new_col.is_null() || teide::ffi_is_err(new_col) {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        let src = unsafe { teide::raw::td_data(col) };
+        let dst = unsafe { teide::raw::td_data(new_col) };
+        for (out_row, &in_row) in keep_indices.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(in_row * esz),
+                    dst.add(out_row * esz),
+                    esz,
+                );
+            }
+        }
+        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        unsafe { teide::ffi_release(new_col) };
+    }
+
+    unsafe { teide::ffi_retain(result_raw) };
+    Ok(unsafe { Table::from_raw(result_raw) })
+}
+
+/// Hash a table row across all columns for set operations.
+fn hash_table_row(table: &Table, row: usize, ncols: usize) -> u64 {
+    let mut h: u64 = 0;
+    for c in 0..ncols {
+        let col = match table.get_col_idx(c as i64) {
+            Some(p) => p,
+            None => continue,
+        };
+        let col_type = unsafe { teide::raw::td_type(col) };
+        let data = unsafe { teide::raw::td_data(col) };
+        let kh: u64 = match col_type {
+            6 | 14 | 11 => {
+                // TD_I64, TD_SYM, TD_TIMESTAMP
+                let v = unsafe { *(data as *const i64).add(row) };
+                v as u64
+            }
+            7 => {
+                // TD_F64
+                let v = unsafe { *(data as *const f64).add(row) };
+                v.to_bits()
+            }
+            5 => {
+                // TD_I32
+                let v = unsafe { *(data as *const i32).add(row) };
+                v as u64
+            }
+            15 => {
+                // TD_ENUM
+                let v = unsafe { *(data as *const u32).add(row) };
+                v as u64
+            }
+            _ => 0,
+        };
+        h = if c == 0 {
+            kh.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(kh >> 32)
+        } else {
+            h ^ kh.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(h >> 16)
+        };
+    }
+    h
+}
+
 /// Apply ORDER BY and LIMIT from the outer query to a result.
 fn apply_post_processing(
     ctx: &Context,
@@ -1297,6 +1637,13 @@ fn resolve_subqueries(
             })
         }
 
+        // EXISTS (subquery): evaluate and replace with boolean literal
+        Expr::Exists { subquery, negated } => {
+            let result = plan_query(ctx, subquery, tables)?;
+            let exists = result.table.nrows() > 0;
+            Ok(Expr::Value(Value::Boolean(exists ^ negated)))
+        }
+
         // Recurse into compound expressions
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(resolve_subqueries(ctx, left, tables)?),
@@ -1367,7 +1714,7 @@ fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr
 /// Check if an expression tree contains any subqueries that need resolution.
 fn has_subqueries(expr: &Expr) -> bool {
     match expr {
-        Expr::Subquery(_) | Expr::InSubquery { .. } => true,
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
         Expr::BinaryOp { left, right, .. } => has_subqueries(left) || has_subqueries(right),
         Expr::UnaryOp { expr, .. } => has_subqueries(expr),
         Expr::Nested(inner) => has_subqueries(inner),
@@ -1384,12 +1731,14 @@ fn has_subqueries(expr: &Expr) -> bool {
 fn extract_group_by_columns(
     group_by: &GroupByExpr,
     schema: &HashMap<String, usize>,
-    alias_exprs: &HashMap<String, Expr>,
+    alias_exprs: &mut HashMap<String, Expr>,
+    select_aliases: &[String],
 ) -> Result<Vec<String>, SqlError> {
     match group_by {
         GroupByExpr::All(_) => Err(SqlError::Plan("GROUP BY ALL not supported".into())),
         GroupByExpr::Expressions(exprs, _modifiers) => {
             let mut cols = Vec::new();
+            let mut gb_counter = 0usize;
             for expr in exprs {
                 match expr {
                     Expr::Identifier(ident) => {
@@ -1402,10 +1751,26 @@ fn extract_group_by_columns(
                         }
                         cols.push(name);
                     }
-                    _ => {
-                        return Err(SqlError::Plan(
-                            "Only column names supported in GROUP BY".into(),
-                        ))
+                    // Positional GROUP BY: GROUP BY 1, 2
+                    Expr::Value(Value::Number(n, _)) => {
+                        let pos = n.parse::<usize>().map_err(|_| {
+                            SqlError::Plan(format!("Invalid positional GROUP BY: {n}"))
+                        })?;
+                        if pos == 0 || pos > select_aliases.len() {
+                            return Err(SqlError::Plan(format!(
+                                "GROUP BY position {} out of range (1-{})",
+                                pos,
+                                select_aliases.len()
+                            )));
+                        }
+                        cols.push(select_aliases[pos - 1].clone());
+                    }
+                    // Expression GROUP BY: GROUP BY FLOOR(v1/10)
+                    other => {
+                        let alias = format!("_gb_{}", gb_counter);
+                        gb_counter += 1;
+                        alias_exprs.insert(alias.clone(), other.clone());
+                        cols.push(alias);
                     }
                 }
             }

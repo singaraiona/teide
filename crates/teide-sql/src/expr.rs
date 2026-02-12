@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
+    BinaryOperator, CastKind, DataType, DateTimeField, DuplicateTreatment, Expr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
 
 use teide::{AggOp, Column, Graph};
@@ -284,7 +284,31 @@ pub fn plan_expr(
             Ok(g.substr(s, start, len))
         }
 
+        Expr::Extract { field, expr: inner, .. } => {
+            let col = plan_expr(g, inner, schema)?;
+            let field_id = map_datetime_field(field)?;
+            Ok(g.extract(col, field_id))
+        }
+
         _ => Err(SqlError::Plan(format!("Unsupported expression: {expr}"))),
+    }
+}
+
+/// Map sqlparser DateTimeField to Teide extract_field constants.
+fn map_datetime_field(field: &DateTimeField) -> Result<i64, SqlError> {
+    match field {
+        DateTimeField::Year => Ok(teide::extract_field::YEAR),
+        DateTimeField::Month => Ok(teide::extract_field::MONTH),
+        DateTimeField::Day => Ok(teide::extract_field::DAY),
+        DateTimeField::Hour => Ok(teide::extract_field::HOUR),
+        DateTimeField::Minute => Ok(teide::extract_field::MINUTE),
+        DateTimeField::Second => Ok(teide::extract_field::SECOND),
+        DateTimeField::Dow | DateTimeField::DayOfWeek => Ok(teide::extract_field::DOW),
+        DateTimeField::Doy | DateTimeField::DayOfYear => Ok(teide::extract_field::DOY),
+        DateTimeField::Epoch => Ok(teide::extract_field::EPOCH),
+        _ => Err(SqlError::Plan(format!(
+            "Unsupported EXTRACT field: {field}"
+        ))),
     }
 }
 
@@ -335,20 +359,49 @@ fn plan_scalar_function(
 
         // 2-arg functions
         "round" => {
-            // ROUND(x) or ROUND(x, n) — for now just truncate to integer via cast
             if args.is_empty() || args.len() > 2 {
                 return Err(SqlError::Plan("ROUND takes 1 or 2 arguments".into()));
             }
             let a = plan_expr(g, &args[0], schema)?;
             if args.len() == 1 {
-                // round to integer: cast to i64 then back to f64
-                let as_int = g.cast(a, teide::types::I64);
-                Ok(g.cast(as_int, teide::types::F64))
+                // ROUND(x) → FLOOR(x + 0.5)
+                let half = g.const_f64(0.5);
+                let shifted = g.add(a, half);
+                Ok(g.floor(shifted))
             } else {
-                // ROUND(x, n) — not easily expressible without a native op
-                Err(SqlError::Plan(
-                    "ROUND with precision not yet supported".into(),
-                ))
+                // ROUND(x, n): extract n as integer constant
+                let n = match &args[1] {
+                    Expr::Value(Value::Number(s, _)) => s.parse::<i32>().map_err(|_| {
+                        SqlError::Plan("ROUND precision must be an integer".into())
+                    })?,
+                    Expr::UnaryOp {
+                        op: UnaryOperator::Minus,
+                        expr,
+                    } => match expr.as_ref() {
+                        Expr::Value(Value::Number(s, _)) => -s.parse::<i32>().map_err(|_| {
+                            SqlError::Plan("ROUND precision must be an integer".into())
+                        })?,
+                        _ => {
+                            return Err(SqlError::Plan(
+                                "ROUND precision must be an integer literal".into(),
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(SqlError::Plan(
+                            "ROUND precision must be an integer literal".into(),
+                        ))
+                    }
+                };
+                // ROUND(x, n) → FLOOR(x * scale + 0.5) / scale
+                let scale = 10.0_f64.powi(n);
+                let scale_node = g.const_f64(scale);
+                let half = g.const_f64(0.5);
+                let scaled = g.mul(a, scale_node);
+                let shifted = g.add(scaled, half);
+                let floored = g.floor(shifted);
+                let inv_scale = g.const_f64(1.0 / scale);
+                Ok(g.mul(floored, inv_scale))
             }
         }
 
@@ -463,7 +516,135 @@ fn plan_scalar_function(
             Ok(g.concat(&cols))
         }
 
+        // Date/time functions
+        "current_date" => {
+            // Microseconds since 2000-01-01 for start of today (UTC)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // Convert Unix seconds to Teide epoch (2000-01-01 = Unix 946684800)
+            let teide_secs = now - 946684800;
+            // Truncate to start of day, convert to microseconds
+            let day_us = (teide_secs / 86400) * 86400 * 1_000_000;
+            Ok(g.const_i64(day_us))
+        }
+        "current_timestamp" | "now" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let unix_us = now.as_micros() as i64;
+            // Convert to Teide epoch (2000-01-01 = Unix 946684800 seconds)
+            let teide_us = unix_us - 946_684_800_000_000i64;
+            Ok(g.const_i64(teide_us))
+        }
+        "extract" => {
+            // EXTRACT can also be called as a function: extract('year', col)
+            if args.len() != 2 {
+                return Err(SqlError::Plan("EXTRACT() requires 2 arguments".into()));
+            }
+            let field_name = parse_field_arg(&args[0])?;
+            let col = plan_expr(g, &args[1], schema)?;
+            let field_id = resolve_field_name(&field_name)?;
+            Ok(g.extract(col, field_id))
+        }
+        "date_trunc" => {
+            // DATE_TRUNC('unit', timestamp)
+            if args.len() != 2 {
+                return Err(SqlError::Plan("DATE_TRUNC() requires 2 arguments".into()));
+            }
+            let field_name = parse_field_arg(&args[0])?;
+            let col = plan_expr(g, &args[1], schema)?;
+            let field_id = resolve_field_name(&field_name)?;
+            Ok(g.date_trunc(col, field_id))
+        }
+        "date_diff" | "datediff" => {
+            // DATE_DIFF('unit', start, end) → integer count of units between timestamps
+            if args.len() != 3 {
+                return Err(SqlError::Plan("DATE_DIFF() requires 3 arguments".into()));
+            }
+            let field_name = parse_field_arg(&args[0])?;
+            let start = plan_expr(g, &args[1], schema)?;
+            let end = plan_expr(g, &args[2], schema)?;
+
+            match field_name.as_str() {
+                "second" => {
+                    let diff = g.sub(end, start);
+                    let divisor = g.const_i64(1_000_000);
+                    let fv = g.div(diff, divisor);
+                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                }
+                "minute" => {
+                    let diff = g.sub(end, start);
+                    let divisor = g.const_i64(60_000_000);
+                    let fv = g.div(diff, divisor);
+                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                }
+                "hour" => {
+                    let diff = g.sub(end, start);
+                    let divisor = g.const_i64(3_600_000_000);
+                    let fv = g.div(diff, divisor);
+                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                }
+                "day" => {
+                    let diff = g.sub(end, start);
+                    let divisor = g.const_i64(86_400_000_000);
+                    let fv = g.div(diff, divisor);
+                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                }
+                "month" => {
+                    // (year2*12+month2) - (year1*12+month1)
+                    let y1 = g.extract(start, teide::extract_field::YEAR);
+                    let m1 = g.extract(start, teide::extract_field::MONTH);
+                    let y2 = g.extract(end, teide::extract_field::YEAR);
+                    let m2 = g.extract(end, teide::extract_field::MONTH);
+                    let twelve = g.const_i64(12);
+                    let twelve2 = g.const_i64(12);
+                    let ym1 = g.add(g.mul(y1, twelve), m1);
+                    let ym2 = g.add(g.mul(y2, twelve2), m2);
+                    Ok(g.sub(ym2, ym1))
+                }
+                "year" => {
+                    let y1 = g.extract(start, teide::extract_field::YEAR);
+                    let y2 = g.extract(end, teide::extract_field::YEAR);
+                    Ok(g.sub(y2, y1))
+                }
+                _ => Err(SqlError::Plan(format!(
+                    "Unsupported DATE_DIFF unit: {field_name}"
+                ))),
+            }
+        }
+
         _ => Err(SqlError::Plan(format!("Unsupported function: {name}"))),
+    }
+}
+
+/// Parse a field/unit argument from a function call (string literal or identifier).
+fn parse_field_arg(arg: &Expr) -> Result<String, SqlError> {
+    match arg {
+        Expr::Value(Value::SingleQuotedString(s)) => Ok(s.to_lowercase()),
+        Expr::Identifier(id) => Ok(id.value.to_lowercase()),
+        _ => Err(SqlError::Plan(
+            "Field/unit argument must be a string or identifier".into(),
+        )),
+    }
+}
+
+/// Resolve a field name string to a Teide extract_field constant.
+fn resolve_field_name(name: &str) -> Result<i64, SqlError> {
+    match name {
+        "year" => Ok(teide::extract_field::YEAR),
+        "month" => Ok(teide::extract_field::MONTH),
+        "day" => Ok(teide::extract_field::DAY),
+        "hour" => Ok(teide::extract_field::HOUR),
+        "minute" => Ok(teide::extract_field::MINUTE),
+        "second" => Ok(teide::extract_field::SECOND),
+        "dow" | "dayofweek" => Ok(teide::extract_field::DOW),
+        "doy" | "dayofyear" => Ok(teide::extract_field::DOY),
+        "epoch" => Ok(teide::extract_field::EPOCH),
+        _ => Err(SqlError::Plan(format!(
+            "Unsupported date/time field: {name}"
+        ))),
     }
 }
 

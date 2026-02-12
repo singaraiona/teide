@@ -685,6 +685,44 @@ td_op_t* td_alias(td_graph_t* g, td_op_t* input, const char* name) {
     return &g->nodes[ext->base.id];
 }
 
+td_op_t* td_extract(td_graph_t* g, td_op_t* col, int64_t field) {
+    uint32_t col_id = col->id;
+    uint32_t est = col->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    col = &g->nodes[col_id];  /* re-resolve after potential realloc */
+
+    ext->base.opcode = OP_EXTRACT;
+    ext->base.arity = 1;
+    ext->base.inputs[0] = col;
+    ext->base.out_type = TD_I64;
+    ext->base.est_rows = est;
+    ext->sym = field;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
+td_op_t* td_date_trunc(td_graph_t* g, td_op_t* col, int64_t field) {
+    uint32_t col_id = col->id;
+    uint32_t est = col->est_rows;
+
+    td_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    col = &g->nodes[col_id];  /* re-resolve after potential realloc */
+
+    ext->base.opcode = OP_DATE_TRUNC;
+    ext->base.arity = 1;
+    ext->base.inputs[0] = col;
+    ext->base.out_type = TD_I64;  /* returns timestamp (microseconds) */
+    ext->base.est_rows = est;
+    ext->sym = field;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 td_op_t* td_materialize(td_graph_t* g, td_op_t* input) {
     td_op_t* n = graph_alloc_node(g);
     if (!n) return NULL;

@@ -228,6 +228,19 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_REPLACE      41
 #define OP_TRIM         42
 #define OP_CONCAT       43
+#define OP_EXTRACT      45
+#define OP_DATE_TRUNC   46
+
+/* EXTRACT / DATE_TRUNC field identifiers */
+#define TD_EXTRACT_YEAR    0
+#define TD_EXTRACT_MONTH   1
+#define TD_EXTRACT_DAY     2
+#define TD_EXTRACT_HOUR    3
+#define TD_EXTRACT_MINUTE  4
+#define TD_EXTRACT_SECOND  5
+#define TD_EXTRACT_DOW     6
+#define TD_EXTRACT_DOY     7
+#define TD_EXTRACT_EPOCH   8
 
 /* Opcodes — Reductions (pipeline breakers) */
 #define OP_SUM          50
@@ -522,6 +535,10 @@ td_op_t* td_substr(td_graph_t* g, td_op_t* str, td_op_t* start, td_op_t* len);
 td_op_t* td_replace(td_graph_t* g, td_op_t* str, td_op_t* from, td_op_t* to);
 td_op_t* td_trim_op(td_graph_t* g, td_op_t* a);
 td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n);
+
+/* Date/time extraction and truncation */
+td_op_t* td_extract(td_graph_t* g, td_op_t* col, int64_t field);
+td_op_t* td_date_trunc(td_graph_t* g, td_op_t* col, int64_t field);
 
 /* Reduction ops */
 td_op_t* td_sum(td_graph_t* g, td_op_t* a);

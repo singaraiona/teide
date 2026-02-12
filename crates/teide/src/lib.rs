@@ -80,6 +80,18 @@ mod ffi {
     pub const OP_LAST: u16 = 57;
     pub const OP_COUNT_DISTINCT: u16 = 58;
 
+    // ---- EXTRACT field constants ------------------------------------------
+
+    pub const TD_EXTRACT_YEAR: i64 = 0;
+    pub const TD_EXTRACT_MONTH: i64 = 1;
+    pub const TD_EXTRACT_DAY: i64 = 2;
+    pub const TD_EXTRACT_HOUR: i64 = 3;
+    pub const TD_EXTRACT_MINUTE: i64 = 4;
+    pub const TD_EXTRACT_SECOND: i64 = 5;
+    pub const TD_EXTRACT_DOW: i64 = 6;
+    pub const TD_EXTRACT_DOY: i64 = 7;
+    pub const TD_EXTRACT_EPOCH: i64 = 8;
+
     // ---- Error constants --------------------------------------------------
 
     pub const TD_OK: u32 = 0;
@@ -165,6 +177,7 @@ mod ffi {
         pub fn td_str_len(s: *mut td_t) -> usize;
 
         // Vector API
+        pub fn td_vec_new(type_: i8, capacity: i64) -> *mut td_t;
         pub fn td_vec_concat(a: *mut td_t, b: *mut td_t) -> *mut td_t;
 
         // CSV API
@@ -305,6 +318,10 @@ mod ffi {
             args: *mut *mut td_op_t,
             n: c_int,
         ) -> *mut td_op_t;
+
+        // Date/time extraction and truncation
+        pub fn td_extract(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
+        pub fn td_date_trunc(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
 
         // Optimizer + executor
         pub fn td_optimize(g: *mut td_graph_t, root: *mut td_op_t) -> *mut td_op_t;
@@ -913,6 +930,16 @@ impl Graph<'_> {
         Column { raw: unsafe { ffi::td_cast(self.raw, a.raw, target_type) } }
     }
 
+    // ---- Date/time extraction ---------------------------------------------
+
+    pub fn extract(&self, col: Column, field: i64) -> Column {
+        Column { raw: unsafe { ffi::td_extract(self.raw, col.raw, field) } }
+    }
+
+    pub fn date_trunc(&self, col: Column, field: i64) -> Column {
+        Column { raw: unsafe { ffi::td_date_trunc(self.raw, col.raw, field) } }
+    }
+
     // ---- Reduction ops ----------------------------------------------------
 
     pub fn sum(&self, a: Column) -> Column {
@@ -1161,6 +1188,11 @@ pub use ffi::td_t;
 pub use ffi::td_op_t;
 pub use ffi::td_graph_t;
 
+/// Low-level FFI access for downstream crates (e.g., teide-sql).
+pub mod raw {
+    pub use super::ffi::{td_type, td_data, td_len, td_type_sizes, td_vec_new, td_t};
+}
+
 /// Low-level helper: get column by symbol ID from a raw table pointer.
 /// Returns null if not found. Caller must NOT release the result.
 pub unsafe fn ffi_table_get_col(df: *mut ffi::td_t, name_id: i64) -> *mut ffi::td_t {
@@ -1195,6 +1227,19 @@ pub unsafe fn ffi_retain(v: *mut ffi::td_t) {
 /// Check if a raw pointer is an error sentinel.
 pub fn ffi_is_err(p: *mut ffi::td_t) -> bool {
     ffi::td_is_err(p)
+}
+
+// Re-export EXTRACT field constants
+pub mod extract_field {
+    pub const YEAR: i64 = super::ffi::TD_EXTRACT_YEAR;
+    pub const MONTH: i64 = super::ffi::TD_EXTRACT_MONTH;
+    pub const DAY: i64 = super::ffi::TD_EXTRACT_DAY;
+    pub const HOUR: i64 = super::ffi::TD_EXTRACT_HOUR;
+    pub const MINUTE: i64 = super::ffi::TD_EXTRACT_MINUTE;
+    pub const SECOND: i64 = super::ffi::TD_EXTRACT_SECOND;
+    pub const DOW: i64 = super::ffi::TD_EXTRACT_DOW;
+    pub const DOY: i64 = super::ffi::TD_EXTRACT_DOY;
+    pub const EPOCH: i64 = super::ffi::TD_EXTRACT_EPOCH;
 }
 
 // Re-export type constants

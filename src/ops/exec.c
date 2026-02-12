@@ -569,6 +569,162 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
 /* Forward declaration — exec_node is defined later */
 static td_t* exec_node(td_graph_t* g, td_op_t* op);
 
+/* --------------------------------------------------------------------------
+ * Sort comparator: compare two row indices across all sort keys.
+ * Returns negative if a < b, positive if a > b, 0 if equal.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    td_t**       vecs;
+    uint8_t*     desc;
+    uint8_t*     nulls_first;
+    uint8_t      n_sort;
+} sort_cmp_ctx_t;
+
+static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
+    for (uint8_t k = 0; k < ctx->n_sort; k++) {
+        td_t* col = ctx->vecs[k];
+        if (!col) continue;
+        int cmp = 0;
+        int null_cmp = 0;
+        int desc = ctx->desc ? ctx->desc[k] : 0;
+        int nf = ctx->nulls_first ? ctx->nulls_first[k] : desc;
+
+        if (col->type == TD_F64) {
+            double va = ((double*)td_data(col))[a];
+            double vb = ((double*)td_data(col))[b];
+            int a_null = isnan(va);
+            int b_null = isnan(vb);
+            if (a_null && b_null) { cmp = 0; null_cmp = 1; }
+            else if (a_null) { cmp = nf ? -1 : 1; null_cmp = 1; }
+            else if (b_null) { cmp = nf ? 1 : -1; null_cmp = 1; }
+            else if (va < vb) cmp = -1;
+            else if (va > vb) cmp = 1;
+        } else if (col->type == TD_I64 || col->type == TD_SYM || col->type == TD_TIMESTAMP) {
+            int64_t va = ((int64_t*)td_data(col))[a];
+            int64_t vb = ((int64_t*)td_data(col))[b];
+            if (va < vb) cmp = -1;
+            else if (va > vb) cmp = 1;
+        } else if (col->type == TD_I32) {
+            int32_t va = ((int32_t*)td_data(col))[a];
+            int32_t vb = ((int32_t*)td_data(col))[b];
+            if (va < vb) cmp = -1;
+            else if (va > vb) cmp = 1;
+        } else if (col->type == TD_ENUM) {
+            uint32_t va = ((uint32_t*)td_data(col))[a];
+            uint32_t vb = ((uint32_t*)td_data(col))[b];
+            td_t* sa = td_sym_str((int64_t)va);
+            td_t* sb = td_sym_str((int64_t)vb);
+            if (sa && sb) cmp = td_str_cmp(sa, sb);
+        }
+
+        if (desc && !null_cmp) cmp = -cmp;
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
+/* Insertion sort for small arrays — used as base case for merge sort */
+static void sort_insertion(const sort_cmp_ctx_t* ctx, int64_t* arr, int64_t n) {
+    for (int64_t i = 1; i < n; i++) {
+        int64_t key = arr[i];
+        int64_t j = i - 1;
+        while (j >= 0 && sort_cmp(ctx, arr[j], key) > 0) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+/* Single-threaded merge sort (recursive, with insertion sort base case) */
+static void sort_merge_recursive(const sort_cmp_ctx_t* ctx,
+                                  int64_t* arr, int64_t* tmp, int64_t n) {
+    if (n <= 64) {
+        sort_insertion(ctx, arr, n);
+        return;
+    }
+    int64_t mid = n / 2;
+    sort_merge_recursive(ctx, arr, tmp, mid);
+    sort_merge_recursive(ctx, arr + mid, tmp + mid, n - mid);
+
+    /* Merge arr[0..mid) and arr[mid..n) into tmp, then copy back */
+    int64_t i = 0, j = mid, k = 0;
+    while (i < mid && j < n) {
+        if (sort_cmp(ctx, arr[i], arr[j]) <= 0)
+            tmp[k++] = arr[i++];
+        else
+            tmp[k++] = arr[j++];
+    }
+    while (i < mid) tmp[k++] = arr[i++];
+    while (j < n) tmp[k++] = arr[j++];
+    memcpy(arr, tmp, (size_t)n * sizeof(int64_t));
+}
+
+/* Parallel sort phase 1 context */
+typedef struct {
+    const sort_cmp_ctx_t* cmp_ctx;
+    int64_t*  indices;
+    int64_t*  tmp;
+    int64_t   nrows;
+    uint32_t  n_chunks;
+} sort_phase1_ctx_t;
+
+static void sort_phase1_fn(void* arg, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    sort_phase1_ctx_t* ctx = (sort_phase1_ctx_t*)arg;
+    for (int64_t chunk_idx = start; chunk_idx < end; chunk_idx++) {
+        int64_t chunk_size = (ctx->nrows + ctx->n_chunks - 1) / ctx->n_chunks;
+        int64_t lo = chunk_idx * chunk_size;
+        int64_t hi = lo + chunk_size;
+        if (hi > ctx->nrows) hi = ctx->nrows;
+        if (lo >= hi) continue;
+        sort_merge_recursive(ctx->cmp_ctx, ctx->indices + lo, ctx->tmp + lo, hi - lo);
+    }
+}
+
+/* Merge two adjacent sorted runs: [lo..mid) and [mid..hi) from src into dst */
+static void merge_runs(const sort_cmp_ctx_t* ctx,
+                        const int64_t* src, int64_t* dst,
+                        int64_t lo, int64_t mid, int64_t hi) {
+    int64_t i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        if (sort_cmp(ctx, src[i], src[j]) <= 0)
+            dst[k++] = src[i++];
+        else
+            dst[k++] = src[j++];
+    }
+    while (i < mid) dst[k++] = src[i++];
+    while (j < hi) dst[k++] = src[j++];
+}
+
+/* Parallel merge pass context */
+typedef struct {
+    const sort_cmp_ctx_t* cmp_ctx;
+    const int64_t*  src;
+    int64_t*        dst;
+    int64_t         nrows;
+    int64_t         run_size;
+} sort_merge_ctx_t;
+
+static void sort_merge_fn(void* arg, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    sort_merge_ctx_t* ctx = (sort_merge_ctx_t*)arg;
+    for (int64_t pair_idx = start; pair_idx < end; pair_idx++) {
+        int64_t lo = pair_idx * 2 * ctx->run_size;
+        int64_t mid = lo + ctx->run_size;
+        int64_t hi = mid + ctx->run_size;
+        if (mid > ctx->nrows) mid = ctx->nrows;
+        if (hi > ctx->nrows) hi = ctx->nrows;
+        if (lo >= ctx->nrows) continue;
+        if (mid >= hi) {
+            /* Only one run — copy directly */
+            memcpy(ctx->dst + lo, ctx->src + lo, (size_t)(hi - lo) * sizeof(int64_t));
+        } else {
+            merge_runs(ctx->cmp_ctx, ctx->src, ctx->dst, lo, mid, hi);
+        }
+    }
+}
+
 static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     if (!df || TD_IS_ERR(df)) return df;
 
@@ -579,11 +735,13 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
     int64_t ncols = td_table_ncols(df);
     uint8_t n_sort = ext->sort.n_cols;
 
+    /* Allocate index array */
     td_t* indices_hdr;
     int64_t* indices = (int64_t*)scratch_alloc(&indices_hdr, (size_t)nrows * sizeof(int64_t));
     if (!indices) return TD_ERR_PTR(TD_ERR_OOM);
     for (int64_t i = 0; i < nrows; i++) indices[i] = i;
 
+    /* Resolve sort key vectors */
     td_t* sort_vecs[n_sort];
     uint8_t sort_owned[n_sort];
     memset(sort_vecs, 0, n_sort * sizeof(td_t*));
@@ -595,7 +753,6 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
             sort_vecs[k] = td_table_get_col(df, key_ext->sym);
         } else {
-            /* Expression key: evaluate against current DataFrame */
             td_t* saved = g->df;
             g->df = df;
             sort_vecs[k] = exec_node(g, key_op);
@@ -604,58 +761,83 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df) {
         }
     }
 
-    for (int64_t i = 1; i < nrows; i++) {
-        int64_t key = indices[i];
-        int64_t j = i - 1;
-        while (j >= 0) {
-            int cmp = 0;
-            int64_t ij = indices[j];
-            for (uint8_t k = 0; k < n_sort && cmp == 0; k++) {
-                td_t* col = sort_vecs[k];
-                if (!col) continue;
-                int desc = ext->sort.desc ? ext->sort.desc[k] : 0;
-                int nf = ext->sort.nulls_first ? ext->sort.nulls_first[k] : desc;
-                int null_cmp = 0;
+    /* Build comparator context */
+    sort_cmp_ctx_t cmp_ctx = {
+        .vecs = sort_vecs,
+        .desc = ext->sort.desc,
+        .nulls_first = ext->sort.nulls_first,
+        .n_sort = n_sort,
+    };
 
-                if (col->type == TD_F64) {
-                    double a = ((double*)td_data(col))[ij];
-                    double b = ((double*)td_data(col))[key];
-                    int a_null = isnan(a);
-                    int b_null = isnan(b);
-                    if (a_null && b_null) { cmp = 0; null_cmp = 1; }
-                    else if (a_null) { cmp = nf ? -1 : 1; null_cmp = 1; }
-                    else if (b_null) { cmp = nf ? 1 : -1; null_cmp = 1; }
-                    else if (a < b) cmp = -1;
-                    else if (a > b) cmp = 1;
-                } else if (col->type == TD_I64 || col->type == TD_SYM || col->type == TD_TIMESTAMP) {
-                    int64_t a = ((int64_t*)td_data(col))[ij];
-                    int64_t b = ((int64_t*)td_data(col))[key];
-                    if (a < b) cmp = -1;
-                    else if (a > b) cmp = 1;
-                } else if (col->type == TD_I32) {
-                    int32_t a = ((int32_t*)td_data(col))[ij];
-                    int32_t b = ((int32_t*)td_data(col))[key];
-                    if (a < b) cmp = -1;
-                    else if (a > b) cmp = 1;
-                } else if (col->type == TD_ENUM) {
-                    uint32_t a = ((uint32_t*)td_data(col))[ij];
-                    uint32_t b = ((uint32_t*)td_data(col))[key];
-                    td_t* sa = td_sym_str((int64_t)a);
-                    td_t* sb = td_sym_str((int64_t)b);
-                    if (sa && sb) cmp = td_str_cmp(sa, sb);
-                }
+    /* Sort using parallel merge sort for large arrays, insertion sort for small */
+    if (nrows <= 64) {
+        sort_insertion(&cmp_ctx, indices, nrows);
+    } else {
+        td_pool_t* pool = td_pool_get();
+        uint32_t n_workers = pool ? td_pool_total_workers(pool) : 1;
 
-                /* Null comparisons already encode absolute direction;
-                   only flip for non-null value comparisons */
-                if (desc && !null_cmp) cmp = -cmp;
-            }
-            if (cmp <= 0) break;
-            indices[j + 1] = indices[j];
-            j--;
+        /* Allocate temporary buffer for merge operations */
+        td_t* tmp_hdr;
+        int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr, (size_t)nrows * sizeof(int64_t));
+        if (!tmp) {
+            scratch_free(indices_hdr);
+            return TD_ERR_PTR(TD_ERR_OOM);
         }
-        indices[j + 1] = key;
+
+        /* Phase 1: parallel local sort of chunks */
+        uint32_t n_chunks = n_workers;
+        if (pool && n_chunks > 1 && nrows > 1024) {
+            sort_phase1_ctx_t p1ctx = {
+                .cmp_ctx = &cmp_ctx,
+                .indices = indices,
+                .tmp = tmp,
+                .nrows = nrows,
+                .n_chunks = n_chunks,
+            };
+            td_pool_dispatch_n(pool, sort_phase1_fn, &p1ctx, n_chunks);
+        } else {
+            /* Single-threaded: sort the entire array */
+            n_chunks = 1;
+            sort_merge_recursive(&cmp_ctx, indices, tmp, nrows);
+        }
+
+        /* Phase 2: iterative merge passes (log2(n_chunks) levels) */
+        if (n_chunks > 1) {
+            int64_t chunk_size = (nrows + n_chunks - 1) / n_chunks;
+            int64_t run_size = chunk_size;
+            int64_t* src = indices;
+            int64_t* dst = tmp;
+
+            while (run_size < nrows) {
+                int64_t n_pairs = (nrows + 2 * run_size - 1) / (2 * run_size);
+                sort_merge_ctx_t mctx = {
+                    .cmp_ctx = &cmp_ctx,
+                    .src = src,
+                    .dst = dst,
+                    .nrows = nrows,
+                    .run_size = run_size,
+                };
+                if (pool && n_pairs > 1) {
+                    td_pool_dispatch_n(pool, sort_merge_fn, &mctx, (uint32_t)n_pairs);
+                } else {
+                    /* Single merge pair */
+                    sort_merge_fn(&mctx, 0, 0, n_pairs);
+                }
+                /* Swap src and dst */
+                int64_t* t = src; src = dst; dst = t;
+                run_size *= 2;
+            }
+
+            /* If final result is in tmp (not indices), copy back */
+            if (src != indices) {
+                memcpy(indices, src, (size_t)nrows * sizeof(int64_t));
+            }
+        }
+
+        scratch_free(tmp_hdr);
     }
 
+    /* Materialize sorted result */
     td_t* result = td_table_new(ncols);
     if (!result || TD_IS_ERR(result)) {
         scratch_free(indices_hdr); return result;
@@ -3016,6 +3198,238 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
+ * EXTRACT — date/time component extraction from timestamps
+ *
+ * Input:  i64 vector of microseconds since 2000-01-01T00:00:00Z
+ * Output: i64 vector of extracted field values
+ *
+ * Uses Howard Hinnant's civil_from_days algorithm (public domain) for
+ * Gregorian calendar decomposition.
+ * ============================================================================ */
+
+static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    if (!input || TD_IS_ERR(input)) return input;
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) { td_release(input); return TD_ERR_PTR(TD_ERR_NYI); }
+
+    int64_t field = ext->sym;
+    int64_t len = input->len;
+
+    td_t* result = td_vec_new(TD_I64, len);
+    if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
+    result->len = len;
+
+    int64_t* out = (int64_t*)td_data(result);
+
+    #define USEC_PER_SEC  1000000LL
+    #define USEC_PER_MIN  (60LL  * USEC_PER_SEC)
+    #define USEC_PER_HOUR (3600LL * USEC_PER_SEC)
+    #define USEC_PER_DAY  (86400LL * USEC_PER_SEC)
+
+    td_morsel_t m;
+    td_morsel_init(&m, input);
+    int64_t off = 0;
+
+    while (td_morsel_next(&m)) {
+        int64_t n = m.morsel_len;
+        const int64_t* src = (const int64_t*)m.morsel_ptr;
+
+        for (int64_t i = 0; i < n; i++) {
+            int64_t us = src[i];  /* microseconds since 2000-01-01 */
+
+            if (field == TD_EXTRACT_EPOCH) {
+                out[off + i] = us;
+            } else if (field == TD_EXTRACT_HOUR) {
+                int64_t day_us = us % USEC_PER_DAY;
+                if (day_us < 0) day_us += USEC_PER_DAY;
+                out[off + i] = day_us / USEC_PER_HOUR;
+            } else if (field == TD_EXTRACT_MINUTE) {
+                int64_t day_us = us % USEC_PER_DAY;
+                if (day_us < 0) day_us += USEC_PER_DAY;
+                out[off + i] = (day_us % USEC_PER_HOUR) / USEC_PER_MIN;
+            } else if (field == TD_EXTRACT_SECOND) {
+                int64_t day_us = us % USEC_PER_DAY;
+                if (day_us < 0) day_us += USEC_PER_DAY;
+                out[off + i] = (day_us % USEC_PER_MIN) / USEC_PER_SEC;
+            } else {
+                /* Calendar fields: YEAR, MONTH, DAY, DOW, DOY */
+                /* Floor-divide microseconds to get day count */
+                int64_t days_since_2000 = us / USEC_PER_DAY;
+                if (us < 0 && us % USEC_PER_DAY != 0) days_since_2000--;
+
+                /* Hinnant civil_from_days: shift to 0000-03-01 era-based epoch */
+                int64_t z = days_since_2000 + 10957 + 719468;
+                int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+                uint64_t doe = (uint64_t)(z - era * 146097);
+                uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+                int64_t y = (int64_t)yoe + era * 400;
+                uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
+                uint64_t mp = (5*doy_mar + 2) / 153;
+                uint64_t d = doy_mar - (153*mp + 2) / 5 + 1;
+                uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
+                y += (mo <= 2);
+
+                if (field == TD_EXTRACT_YEAR) {
+                    out[off + i] = y;
+                } else if (field == TD_EXTRACT_MONTH) {
+                    out[off + i] = (int64_t)mo;
+                } else if (field == TD_EXTRACT_DAY) {
+                    out[off + i] = (int64_t)d;
+                } else if (field == TD_EXTRACT_DOW) {
+                    /* ISO day of week: Mon=1 .. Sun=7
+                     * 2000-01-01 was Saturday (ISO 6).
+                     * Formula: ((days%7)+7+5)%7 + 1 */
+                    out[off + i] = ((days_since_2000 % 7) + 7 + 5) % 7 + 1;
+                } else if (field == TD_EXTRACT_DOY) {
+                    /* Day of year [1..366], January-based */
+                    static const int dbm[13] = {
+                        0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+                    };
+                    int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+                    int64_t doy_jan = dbm[mo] + (int64_t)d;
+                    if (mo > 2 && leap) doy_jan++;
+                    out[off + i] = doy_jan;
+                } else {
+                    out[off + i] = 0;
+                }
+            }
+        }
+        off += n;
+    }
+
+    #undef USEC_PER_SEC
+    #undef USEC_PER_MIN
+    #undef USEC_PER_HOUR
+    #undef USEC_PER_DAY
+
+    td_release(input);
+    return result;
+}
+
+/* ============================================================================
+ * DATE_TRUNC — truncate timestamp to specified precision
+ *
+ * Returns microseconds since 2000-01-01 truncated to the given field.
+ * Sub-day: modular arithmetic. Month/year: calendar decompose + recompose.
+ * ============================================================================ */
+
+/* Convert (year, month, day) to days since 2000-01-01 using the inverse of
+ * Hinnant's civil_from_days. */
+static int64_t days_from_civil(int64_t y, int64_t m, int64_t d) {
+    y -= (m <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    uint64_t yoe = (uint64_t)(y - era * 400);
+    uint64_t doy = (153 * (m > 2 ? (uint64_t)m - 3 : (uint64_t)m + 9) + 2) / 5 + (uint64_t)d - 1;
+    uint64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468 - 10957;
+}
+
+static td_t* exec_date_trunc(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    if (!input || TD_IS_ERR(input)) return input;
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) { td_release(input); return TD_ERR_PTR(TD_ERR_NYI); }
+
+    int64_t field = ext->sym;
+    int64_t len = input->len;
+
+    td_t* result = td_vec_new(TD_I64, len);
+    if (!result || TD_IS_ERR(result)) { td_release(input); return result; }
+    result->len = len;
+
+    int64_t* out = (int64_t*)td_data(result);
+
+    #define DT_USEC_PER_SEC  1000000LL
+    #define DT_USEC_PER_MIN  (60LL  * DT_USEC_PER_SEC)
+    #define DT_USEC_PER_HOUR (3600LL * DT_USEC_PER_SEC)
+    #define DT_USEC_PER_DAY  (86400LL * DT_USEC_PER_SEC)
+
+    td_morsel_t m;
+    td_morsel_init(&m, input);
+    int64_t off = 0;
+
+    while (td_morsel_next(&m)) {
+        int64_t n = m.morsel_len;
+        const int64_t* src = (const int64_t*)m.morsel_ptr;
+
+        for (int64_t i = 0; i < n; i++) {
+            int64_t us = src[i];
+
+            switch (field) {
+                case TD_EXTRACT_SECOND: {
+                    /* Truncate to second boundary */
+                    int64_t r = us % DT_USEC_PER_SEC;
+                    out[off + i] = us - r - (r < 0 ? DT_USEC_PER_SEC : 0);
+                    break;
+                }
+                case TD_EXTRACT_MINUTE: {
+                    int64_t r = us % DT_USEC_PER_MIN;
+                    out[off + i] = us - r - (r < 0 ? DT_USEC_PER_MIN : 0);
+                    break;
+                }
+                case TD_EXTRACT_HOUR: {
+                    int64_t r = us % DT_USEC_PER_HOUR;
+                    out[off + i] = us - r - (r < 0 ? DT_USEC_PER_HOUR : 0);
+                    break;
+                }
+                case TD_EXTRACT_DAY: {
+                    int64_t r = us % DT_USEC_PER_DAY;
+                    out[off + i] = us - r - (r < 0 ? DT_USEC_PER_DAY : 0);
+                    break;
+                }
+                case TD_EXTRACT_MONTH: {
+                    /* Decompose to y/m/d, set d=1, recompose */
+                    int64_t days2k = us / DT_USEC_PER_DAY;
+                    if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--;
+                    int64_t z = days2k + 10957 + 719468;
+                    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+                    uint64_t doe = (uint64_t)(z - era * 146097);
+                    uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+                    int64_t y = (int64_t)yoe + era * 400;
+                    uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
+                    uint64_t mp = (5*doy_mar + 2) / 153;
+                    uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
+                    y += (mo <= 2);
+                    out[off + i] = days_from_civil(y, (int64_t)mo, 1) * DT_USEC_PER_DAY;
+                    break;
+                }
+                case TD_EXTRACT_YEAR: {
+                    /* Decompose to y/m/d, set m=1 d=1, recompose */
+                    int64_t days2k = us / DT_USEC_PER_DAY;
+                    if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--;
+                    int64_t z = days2k + 10957 + 719468;
+                    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+                    uint64_t doe = (uint64_t)(z - era * 146097);
+                    uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+                    int64_t y = (int64_t)yoe + era * 400;
+                    uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
+                    uint64_t mp = (5*doy_mar + 2) / 153;
+                    uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
+                    y += (mo <= 2);
+                    out[off + i] = days_from_civil(y, 1, 1) * DT_USEC_PER_DAY;
+                    break;
+                }
+                default:
+                    out[off + i] = us;
+                    break;
+            }
+        }
+        off += n;
+    }
+
+    #undef DT_USEC_PER_SEC
+    #undef DT_USEC_PER_MIN
+    #undef DT_USEC_PER_HOUR
+    #undef DT_USEC_PER_DAY
+
+    td_release(input);
+    return result;
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -3215,6 +3629,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         }
         case OP_CONCAT: {
             return exec_concat(g, op);
+        }
+
+        case OP_EXTRACT: {
+            return exec_extract(g, op);
+        }
+
+        case OP_DATE_TRUNC: {
+            return exec_date_trunc(g, op);
         }
 
         case OP_ALIAS: {

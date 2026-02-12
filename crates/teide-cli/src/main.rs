@@ -109,8 +109,6 @@ fn run_repl(preload_csv: Option<&str>) {
     let mut show_timer = false;
 
     loop {
-        // Validator handles multi-line: returns Incomplete until input ends with ';'
-        // rustyline shows "teide ❯" for first line, "   ...> " for continuations
         match editor.readline("▸ ") {
             Ok(line) => {
                 let trimmed = line.trim();
@@ -583,6 +581,7 @@ fn handle_dot_command(
     session: &teide_sql::Session,
 ) {
     use theme::*;
+
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     match parts[0] {
         ".mode" => {
@@ -649,6 +648,7 @@ fn handle_dot_command(
 
 fn print_banner() {
     use theme::*;
+
     let ver = env!("CARGO_PKG_VERSION");
     let hash = env!("GIT_HASH");
     let arch = std::env::consts::ARCH;
@@ -657,10 +657,6 @@ fn print_banner() {
     let tag_w = tag.chars().count();
     let help_w = help.chars().count();
     let w = tag_w.max(help_w);
-    // top border: ╭─ Teide SQL ──...──╮
-    // fixed display chars between ╭ and ╮: ─(1) SP(1) "Teide SQL"(9) SP(1) ─(1) = 13
-    // content lines: │ SP {w chars} SP │  → inner = w + 2
-    // so fill = (w + 2) - 13 = w - 11
     let fill = if w > 11 { w - 11 } else { 0 };
     println!("{BAN_BORDER}\u{256d}\u{2500} {BOLD}{BAN_TITLE}Teide SQL{R}{BAN_BORDER} \u{2500}{}\u{256e}{R}",
              "\u{2500}".repeat(fill));
@@ -675,6 +671,7 @@ fn print_banner() {
 
 fn print_help() {
     use theme::*;
+
     println!("{BOLD}{HEADER}Commands:{R}");
     println!("  {NORD7}.mode table|csv|json{R}  {NORD3}Set output format{R}");
     println!("  {NORD7}.tables{R}               {NORD3}List stored tables{R}");

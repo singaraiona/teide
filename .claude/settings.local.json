@@ -5,7 +5,8 @@
   "permissions": {
     "allow": [
       "Bash(*)",
-      "WebFetch(*)"
+      "WebFetch(*)",
+      "mcp__plugin_playwright_playwright__browser_take_screenshot"
     ]
   },
   "enableAllProjectMcpServers": true,

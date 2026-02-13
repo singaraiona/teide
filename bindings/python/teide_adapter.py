@@ -214,7 +214,7 @@ class TeideAdapter:
         """Execute filter + group-by query."""
         g = lib.graph_new(df_ptr)
         try:
-            # Build filter predicate
+            # Build filter predicate and evaluate to BOOL mask
             col_name, cmp_op, val = filter_spec
             scan_node = lib.scan(g, col_name)
             const_node = lib.const_i64(g, val)
@@ -223,9 +223,14 @@ class TeideAdapter:
                        "gt": lib._lib.td_gt, "lt": lib._lib.td_lt,
                        "eq": lib._lib.td_eq}
             pred = cmp_map[cmp_op](g, scan_node, const_node)
-            filt = lib._lib.td_filter(g, scan_node, pred)
 
-            # Group-by on filtered data
+            # Evaluate predicate to BOOL vector and set as filter_mask
+            mask_ptr = lib.execute(g, pred)
+            if mask_ptr and mask_ptr >= 32:
+                lib.graph_set_filter_mask(g, mask_ptr)
+                lib.release(mask_ptr)
+
+            # Group-by with filter_mask (exec_group skips masked-out rows)
             n_keys = len(key_names)
             n_aggs = len(agg_ops)
             keys = [lib.scan(g, name) for name in key_names]
@@ -248,7 +253,7 @@ class TeideAdapter:
         """Execute double-filter + group-by query."""
         g = lib.graph_new(df_ptr)
         try:
-            # Build first predicate
+            # Build AND-composed predicate
             cmp_map = {"ge": lib._lib.td_ge, "le": lib._lib.td_le,
                        "gt": lib._lib.td_gt, "lt": lib._lib.td_lt}
 
@@ -261,9 +266,14 @@ class TeideAdapter:
             p2 = cmp_map[filt2[1]](g, s2, c2)
 
             pred = lib._lib.td_and(g, p1, p2)
-            filt = lib._lib.td_filter(g, s1, pred)
 
-            # Group-by
+            # Evaluate predicate to BOOL vector and set as filter_mask
+            mask_ptr = lib.execute(g, pred)
+            if mask_ptr and mask_ptr >= 32:
+                lib.graph_set_filter_mask(g, mask_ptr)
+                lib.release(mask_ptr)
+
+            # Group-by with filter_mask
             n_keys = len(key_names)
             n_aggs = len(agg_ops)
             keys = [lib.scan(g, name) for name in key_names]
@@ -352,7 +362,7 @@ class TeideAdapter:
             keys_arr = (ctypes.c_void_p * n_cols)(*keys)
             descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])
 
-            root = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, n_cols)
+            root = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, None, n_cols)
             root = lib.optimize(g, root)
             result = lib.execute(g, root)
             if not result or result < 32:

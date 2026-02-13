@@ -540,23 +540,29 @@ class Query:
                 expr = op[1]
                 pred_node = _emit_expr(lib, g, expr)
                 if current is None:
-                    # Table-level filter: store predicate to apply to
-                    # downstream scan nodes (group-by keys, agg inputs, etc.)
-                    filter_pred = pred_node
+                    # Compose chained predicates with AND
+                    if filter_pred is not None:
+                        filter_pred = lib._lib.td_and(g, filter_pred, pred_node)
+                    else:
+                        filter_pred = pred_node
                 else:
                     current = lib._lib.td_filter(g, current, pred_node)
 
             elif op[0] == "group":
                 key_col_names, agg_exprs = op[1], op[2]
 
-                # Build key scan nodes, applying pending filter if any
+                if filter_pred is not None:
+                    # Evaluate predicate to BOOL mask, set as g->filter_mask.
+                    # exec_group checks filter_mask and skips rows where mask=0.
+                    mask_ptr = lib.execute(g, filter_pred)
+                    if mask_ptr and mask_ptr >= 32:
+                        lib.graph_set_filter_mask(g, mask_ptr)
+                        lib.release(mask_ptr)
+                    filter_pred = None
+
+                # Build key scan nodes (no per-column filter wrapping)
                 n_keys = len(key_col_names)
-                key_nodes = []
-                for name in key_col_names:
-                    node = lib.scan(g, name)
-                    if filter_pred is not None:
-                        node = lib._lib.td_filter(g, node, filter_pred)
-                    key_nodes.append(node)
+                key_nodes = [lib.scan(g, name) for name in key_col_names]
 
                 # Decompose agg expressions into (opcode, input_scan_node)
                 agg_ops = []
@@ -566,12 +572,7 @@ class Query:
                         raise ValueError("group_by.agg() requires aggregation expressions")
                     agg_ops.append(agg_expr.kw["op"])
                     inner = agg_expr.kw["arg"]
-                    input_node = _emit_expr(lib, g, inner)
-                    if filter_pred is not None:
-                        input_node = lib._lib.td_filter(g, input_node, filter_pred)
-                    agg_inputs.append(input_node)
-
-                filter_pred = None  # consumed
+                    agg_inputs.append(_emit_expr(lib, g, inner))
 
                 n_aggs = len(agg_ops)
                 keys_arr = (ctypes.c_void_p * n_keys)(*key_nodes)
@@ -584,30 +585,33 @@ class Query:
                 col_names, descs = op[1], op[2]
                 n_cols = len(col_names)
 
-                # Sort needs a table_node — use const_table if we have a result, else use bound table
                 if current is not None:
                     table_node = current
                 else:
                     table_node = lib.const_table(g, self._ptr)
 
-                key_nodes = []
-                for name in col_names:
-                    node = lib.scan(g, name)
-                    if filter_pred is not None:
-                        node = lib._lib.td_filter(g, node, filter_pred)
-                    key_nodes.append(node)
+                # Apply pending filter to the TABLE node (not per-column).
+                # exec_filter handles TABLE input: returns a filtered table.
+                # exec_sort then resolves key columns from the filtered table.
+                if filter_pred is not None:
+                    table_node = lib._lib.td_filter(g, table_node, filter_pred)
+                    filter_pred = None
 
-                filter_pred = None  # consumed
+                key_nodes = [lib.scan(g, name) for name in col_names]
 
                 keys_arr = (ctypes.c_void_p * n_cols)(*key_nodes)
                 descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])
                 pinned.extend([keys_arr, descs_arr])
-                current = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, n_cols)
+                current = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, None, n_cols)
 
             elif op[0] == "head":
                 n = op[1]
                 if current is None:
                     current = lib.const_table(g, self._ptr)
+                # Apply pending filter to the TABLE node before head
+                if filter_pred is not None:
+                    current = lib._lib.td_filter(g, current, filter_pred)
+                    filter_pred = None
                 current = lib.head(g, current, n)
 
             elif op[0] == "select":

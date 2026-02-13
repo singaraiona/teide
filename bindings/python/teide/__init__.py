@@ -43,6 +43,20 @@ c_graph_p = ctypes.c_void_p # td_graph_t*
 c_op_p = ctypes.c_void_p    # td_op_t*
 
 
+class _td_graph_t(ctypes.Structure):
+    """Mirror of the C td_graph_t struct for direct field access."""
+    _fields_ = [
+        ('nodes', ctypes.c_void_p),
+        ('node_count', ctypes.c_uint32),
+        ('node_cap', ctypes.c_uint32),
+        ('table', ctypes.c_void_p),
+        ('ext_nodes', ctypes.c_void_p),
+        ('ext_count', ctypes.c_uint32),
+        ('ext_cap', ctypes.c_uint32),
+        ('filter_mask', ctypes.c_void_p),
+    ]
+
+
 def _find_lib():
     """Find libteide shared library.
 
@@ -394,6 +408,16 @@ class TeideLib:
 
     def head(self, g, input_op, n):
         return self._lib.td_head(g, input_op, n)
+
+    def graph_set_filter_mask(self, g, mask):
+        """Set filter_mask on graph for predicate pushdown in group-by.
+
+        The graph retains the mask and releases it in graph_free.
+        Caller should release their own reference after this call.
+        """
+        self._lib.td_retain(mask)
+        gs = _td_graph_t.from_address(g)
+        gs.filter_mask = mask
 
     def optimize(self, g, root):
         return self._lib.td_optimize(g, root)

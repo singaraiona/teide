@@ -771,9 +771,9 @@ fn csv_date_time_auto_infer() {
     // TIME: 00:00:00 → 0 microseconds
     assert_eq!(table.get_i64(1, 2).unwrap(), 0);
     // TIME: 09:30:00 → 9*3600 + 30*60 = 34200 seconds = 34200000000 µs
-    assert_eq!(table.get_i64(1, 0).unwrap(), 34200_000_000);
+    assert_eq!(table.get_i64(1, 0).unwrap(), 34_200_000_000);
     // TIME: 14:15:30.500000 → 51330.5 seconds = 51330500000 µs
-    assert_eq!(table.get_i64(1, 1).unwrap(), 51330_500_000);
+    assert_eq!(table.get_i64(1, 1).unwrap(), 51_330_500_000);
 
     // TIMESTAMP: 1970-01-01T00:00:00 → 0 µs since epoch
     assert_eq!(table.get_i64(2, 2).unwrap(), 0);

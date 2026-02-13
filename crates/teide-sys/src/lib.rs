@@ -42,7 +42,6 @@ pub const TD_TIMESTAMP: i8 = 11;
 pub const TD_GUID: i8 = 12;
 pub const TD_TABLE: i8 = 13;
 pub const TD_SYM: i8 = 14;
-pub const TD_SYMBOL: i8 = TD_SYM;
 pub const TD_ENUM: i8 = 15;
 
 pub const TD_TYPE_COUNT: usize = 16;
@@ -61,7 +60,6 @@ pub const TD_ATOM_TIME: i8 = -TD_TIME;
 pub const TD_ATOM_TIMESTAMP: i8 = -TD_TIMESTAMP;
 pub const TD_ATOM_GUID: i8 = -TD_GUID;
 pub const TD_ATOM_SYM: i8 = -TD_SYM;
-pub const TD_ATOM_SYMBOL: i8 = TD_ATOM_SYM;
 pub const TD_ATOM_ENUM: i8 = -TD_ENUM;
 
 // ===== Attribute Flags =====

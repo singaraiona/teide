@@ -473,7 +473,7 @@ static bool try_affine_sumavg_input(td_graph_t* g, td_t* tbl, td_op_t* input_op,
 
 #define EXPR_MAX_REGS 16
 #define EXPR_MAX_INS  48
-#define EXPR_MORSEL   1024
+#define EXPR_MORSEL   TD_MORSEL_ELEMS
 
 typedef struct {
     uint8_t opcode;     /* OP_ADD, OP_NEG, OP_CAST, etc. */

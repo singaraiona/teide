@@ -87,7 +87,6 @@ extern "C" {
 #define TD_GUID      12
 #define TD_TABLE     13
 #define TD_SYM       14
-#define TD_SYMBOL    TD_SYM   /* backward compat alias */
 #define TD_ENUM      15
 
 /* Atom variants (negative type tags) */
@@ -104,7 +103,6 @@ extern "C" {
 #define TD_ATOM_TIMESTAMP  (-TD_TIMESTAMP)
 #define TD_ATOM_GUID       (-TD_GUID)
 #define TD_ATOM_SYM        (-TD_SYM)
-#define TD_ATOM_SYMBOL     TD_ATOM_SYM  /* backward compat alias */
 #define TD_ATOM_ENUM       (-TD_ENUM)
 
 /* Number of types (positive range) */

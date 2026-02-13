@@ -39,6 +39,6 @@ const uint8_t td_type_sizes[TD_TYPE_COUNT] = {
     /* [TD_TIMESTAMP] = 11 */ 8,
     /* [TD_GUID]      = 12 */ 16,
     /* [TD_TABLE]     = 13 */ 8,   /* pointer-sized (td_t*) */
-    /* [TD_SYMBOL]    = 14 */ 8,
+    /* [TD_SYM]       = 14 */ 8,
     /* [TD_ENUM]      = 15 */ 4,
 };

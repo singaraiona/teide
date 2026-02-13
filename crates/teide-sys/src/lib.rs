@@ -453,6 +453,8 @@ pub struct td_mem_stats_t {
     pub slab_hits: usize,
     pub direct_count: usize,
     pub direct_bytes: usize,
+    pub sys_current: usize,
+    pub sys_peak: usize,
 }
 
 // ===== Opaque Forward Declarations =====

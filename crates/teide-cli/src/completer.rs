@@ -55,6 +55,7 @@ const DOT_COMMANDS: &[(&str, &str)] = &[
     (".mode", "Set output format: table|csv|json"),
     (".tables", "List stored tables"),
     (".timer", "Show query time: on|off"),
+    (".mem", "Show memory usage"),
     (".help", "Show available commands"),
     (".quit", "Exit the REPL"),
     (".exit", "Exit the REPL"),

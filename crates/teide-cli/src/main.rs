@@ -785,12 +785,45 @@ fn handle_dot_command(
                 }
             }
         }
+        ".mem" => {
+            let s = teide::mem_stats();
+            let arena_cur = s.bytes_allocated + s.direct_bytes;
+            let total_cur = arena_cur + s.sys_current;
+            println!("{HEADER}Memory usage:{R}");
+            println!("  {NORD7}Arena{R}    {FOOTER}{:>10}{R}  (peak {})  [{} allocs, {} frees, {} slab hits]",
+                fmt_bytes(arena_cur), fmt_bytes(s.peak_bytes),
+                s.alloc_count, s.free_count, s.slab_hits);
+            println!("  {NORD7}Direct{R}   {FOOTER}{:>10}{R}  [{} active mmaps]",
+                fmt_bytes(s.direct_bytes), s.direct_count);
+            println!("  {NORD7}System{R}   {FOOTER}{:>10}{R}  (peak {})",
+                fmt_bytes(s.sys_current), fmt_bytes(s.sys_peak));
+            println!("  {NORD7}Total{R}    {FOOTER}{:>10}{R}", fmt_bytes(total_cur));
+        }
         ".help" => print_help(),
         ".quit" => std::process::exit(0),
         _ => println!(
             "{ERROR}Unknown command: {}. Type .help for commands.{R}",
             parts[0]
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+fn fmt_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -838,6 +871,7 @@ fn print_help() {
     println!("  {NORD7}.mode table|csv|json{R}  {NORD3}Set output format{R}");
     println!("  {NORD7}.tables{R}               {NORD3}List stored tables{R}");
     println!("  {NORD7}.timer on|off{R}         {NORD3}Show query execution time{R}");
+    println!("  {NORD7}.mem{R}                  {NORD3}Show memory usage{R}");
     println!("  {NORD7}.help{R}                 {NORD3}Show this help{R}");
     println!("  {NORD7}.quit{R}                 {NORD3}Exit{R}");
     println!();

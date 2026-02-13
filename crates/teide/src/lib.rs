@@ -384,6 +384,41 @@ impl Context {
 }
 
 // ---------------------------------------------------------------------------
+// Memory statistics
+// ---------------------------------------------------------------------------
+
+/// Snapshot of engine memory usage.
+#[derive(Debug, Clone, Copy)]
+pub struct MemStats {
+    pub alloc_count: usize,
+    pub free_count: usize,
+    pub bytes_allocated: usize,
+    pub peak_bytes: usize,
+    pub slab_hits: usize,
+    pub direct_count: usize,
+    pub direct_bytes: usize,
+    pub sys_current: usize,
+    pub sys_peak: usize,
+}
+
+/// Return a snapshot of engine memory usage.
+pub fn mem_stats() -> MemStats {
+    let mut raw = ffi::td_mem_stats_t::default();
+    unsafe { ffi::td_mem_stats(&mut raw) };
+    MemStats {
+        alloc_count: raw.alloc_count,
+        free_count: raw.free_count,
+        bytes_allocated: raw.bytes_allocated,
+        peak_bytes: raw.peak_bytes,
+        slab_hits: raw.slab_hits,
+        direct_count: raw.direct_count,
+        direct_bytes: raw.direct_bytes,
+        sys_current: raw.sys_current,
+        sys_peak: raw.sys_peak,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Table — RAII wrapper around td_t* (type=TD_TABLE)
 // ---------------------------------------------------------------------------
 

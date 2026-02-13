@@ -1,8 +1,21 @@
-mod helper;
+mod completer;
+mod highlighter;
+mod prompt;
 mod theme;
+mod validator;
 
 use clap::Parser;
 use std::path::PathBuf;
+
+use reedline::{
+    default_emacs_keybindings, DescriptionMode, Emacs, FileBackedHistory, IdeMenu, KeyCode,
+    KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+};
+
+use completer::{ColumnInfo, CompletionUpdater, SqlCompleter, TableInfo};
+use highlighter::SqlHighlighter;
+use prompt::SqlPrompt;
+use validator::SqlValidator;
 
 #[derive(Parser)]
 #[command(name = "teide", version, about = "Fast SQL engine powered by Teide")]
@@ -38,7 +51,7 @@ fn main() {
         return;
     }
 
-    // Interactive REPL (run synchronously; Context is !Send)
+    // Interactive REPL
     run_repl(args.input.as_deref());
 }
 
@@ -68,7 +81,9 @@ fn run_sql_file(path: &PathBuf) {
             Ok(teide_sql::ExecResult::Query(result)) => {
                 print_result(&result, &OutputFormat::Table);
             }
-            Ok(teide_sql::ExecResult::Ddl(msg)) => println!("{}{msg}{}", theme::SUCCESS, theme::R),
+            Ok(teide_sql::ExecResult::Ddl(msg)) => {
+                println!("{}{msg}{}", theme::SUCCESS, theme::R)
+            }
             Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
         }
     }
@@ -91,26 +106,63 @@ fn run_repl(preload_csv: Option<&str>) {
         }
     }
 
-    let config = rustyline::Config::builder()
-        .max_history_size(1000)
-        .unwrap()
-        .completion_type(rustyline::config::CompletionType::List)
-        .edit_mode(rustyline::config::EditMode::Emacs)
-        .build();
+    // --- Components ---
+    let (completer, comp_updater) = SqlCompleter::new();
 
-    let helper = helper::SqlHelper::new();
-    let mut editor = rustyline::Editor::with_config(config).expect("Failed to create editor");
-    editor.set_helper(Some(helper));
+    let hinter = reedline::DefaultHinter::default()
+        .with_style(nu_ansi_term::Style::new().fg(nu_ansi_term::Color::DarkGray));
 
+    // --- IdeMenu with description panel ---
+    let ide_menu = IdeMenu::default()
+        .with_name("completion_menu")
+        .with_min_completion_width(20)
+        .with_max_completion_width(60)
+        .with_max_completion_height(10)
+        .with_padding(1)
+        .with_description_mode(DescriptionMode::PreferRight)
+        .with_min_description_width(20)
+        .with_max_description_width(40)
+        .with_default_border();
+
+    // --- Keybindings ---
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    // Shift+Tab to go backwards through menu
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
+
+    // --- History ---
     let history_path = dirs_or_home().join(".teide_history");
-    let _ = editor.load_history(&history_path);
+    let history = FileBackedHistory::with_file(1000, history_path.clone())
+        .expect("Failed to create history file");
 
+    // --- Assemble editor ---
+    let mut editor = Reedline::create()
+        .with_completer(Box::new(completer))
+        .with_highlighter(Box::new(SqlHighlighter))
+        .with_validator(Box::new(SqlValidator))
+        .with_hinter(Box::new(hinter))
+        .with_history(Box::new(history))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(ide_menu)))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)));
+
+    let prompt = SqlPrompt;
     let mut format = OutputFormat::Table;
     let mut show_timer = false;
 
     loop {
-        match editor.readline("▸ ") {
-            Ok(line) => {
+        match editor.read_line(&prompt) {
+            Ok(Signal::Success(line)) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -118,7 +170,6 @@ fn run_repl(preload_csv: Option<&str>) {
 
                 // Dot commands
                 if trimmed.starts_with('.') {
-                    editor.add_history_entry(trimmed).ok();
                     handle_dot_command(trimmed, &mut format, &mut show_timer, &session);
                     continue;
                 }
@@ -129,56 +180,86 @@ fn run_repl(preload_csv: Option<&str>) {
                     continue;
                 }
 
-                // Normalize history: always exactly one trailing ';'
-                let history_sql = format!("{sql};");
-                editor.add_history_entry(&history_sql).ok();
-
                 let start = std::time::Instant::now();
                 match session.execute(sql) {
                     Ok(teide_sql::ExecResult::Query(result)) => {
-                        // Update column cache for Tab-completion
-                        if let Some(h) = editor.helper_mut() {
-                            h.column_cache = result.columns.clone();
-                        }
+                        update_columns(&comp_updater, &result);
                         print_result(&result, &format);
                         if show_timer {
-                            eprintln!("{}Run Time: {:.3}s{}", theme::TIMER, start.elapsed().as_secs_f64(), theme::R);
+                            eprintln!(
+                                "{}Run Time: {:.3}s{}",
+                                theme::TIMER,
+                                start.elapsed().as_secs_f64(),
+                                theme::R
+                            );
                         }
                     }
                     Ok(teide_sql::ExecResult::Ddl(msg)) => {
                         println!("{}{msg}{}", theme::SUCCESS, theme::R);
-                        // Update stored table names for Tab-completion
-                        if let Some(h) = editor.helper_mut() {
-                            h.table_names = session
-                                .table_names()
-                                .into_iter()
-                                .map(|s| s.to_string())
-                                .collect();
-                        }
+                        update_tables(&comp_updater, &session);
                         if show_timer {
-                            eprintln!("{}Run Time: {:.3}s{}", theme::TIMER, start.elapsed().as_secs_f64(), theme::R);
+                            eprintln!(
+                                "{}Run Time: {:.3}s{}",
+                                theme::TIMER,
+                                start.elapsed().as_secs_f64(),
+                                theme::R
+                            );
                         }
                     }
                     Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
                 }
             }
-            Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Ok(Signal::CtrlD) => break,
+            Ok(Signal::CtrlC) => continue,
             Err(e) => {
-                eprintln!("Readline error: {e}");
+                eprintln!("Error: {e}");
                 break;
             }
         }
     }
+}
 
-    let _ = editor.save_history(&history_path);
+// ---------------------------------------------------------------------------
+// Completer updates (via shared Arc<Mutex<>> state)
+// ---------------------------------------------------------------------------
+
+fn update_columns(updater: &CompletionUpdater, result: &teide_sql::SqlResult) {
+    let table = &result.table;
+    let ncols = table.ncols() as usize;
+    let mut columns = Vec::with_capacity(ncols);
+    for i in 0..ncols {
+        columns.push(ColumnInfo {
+            name: if i < result.columns.len() {
+                result.columns[i].clone()
+            } else {
+                table.col_name_str(i).to_string()
+            },
+            type_name: type_name(table.col_type(i)).to_string(),
+            table_name: String::new(),
+        });
+    }
+    updater.set_columns(columns);
+}
+
+fn update_tables(updater: &CompletionUpdater, session: &teide_sql::Session) {
+    let names = session.table_names();
+    let tables: Vec<TableInfo> = names
+        .iter()
+        .filter_map(|name| {
+            session.table_info(name).map(|(nrows, ncols)| TableInfo {
+                name: name.to_string(),
+                nrows: nrows as usize,
+                ncols: ncols as usize,
+            })
+        })
+        .collect();
+    updater.set_tables(tables);
 }
 
 // ---------------------------------------------------------------------------
 // Column index resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve column names from SqlResult.columns to table column indices.
 fn resolve_col_indices(result: &teide_sql::SqlResult) -> Vec<usize> {
     let table = &result.table;
     let ncols = table.ncols() as usize;
@@ -196,15 +277,11 @@ fn resolve_col_indices(result: &teide_sql::SqlResult) -> Vec<usize> {
     for (pos, col_name) in result.columns.iter().enumerate() {
         if let Some(&idx) = name_to_idx.get(&col_name.to_lowercase()) {
             indices.push(idx);
-        } else {
-            // For GROUP BY results, columns are positional
-            if pos < ncols {
-                indices.push(pos);
-            }
+        } else if pos < ncols {
+            indices.push(pos);
         }
     }
 
-    // Fallback: if no columns matched, show all
     if indices.is_empty() {
         indices = (0..ncols).collect();
     }
@@ -254,7 +331,6 @@ fn print_table(result: &teide_sql::SqlResult) {
         return;
     }
 
-    // Column metadata
     let col_names: Vec<String> = col_indices
         .iter()
         .enumerate()
@@ -277,13 +353,11 @@ fn print_table(result: &teide_sql::SqlResult) {
         .map(|&idx| matches!(table.col_type(idx), 1 | 4 | 5 | 6 | 7))
         .collect();
 
-    // Determine which rows to display
     let show_dots = nrows > HEAD_ROWS + TAIL_ROWS;
     let head_n = if show_dots { HEAD_ROWS } else { nrows };
     let tail_n = if show_dots { TAIL_ROWS } else { 0 };
     let shown = head_n + tail_n;
 
-    // Format all cell values + track which are NULL for dimming
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(shown + 3);
     let mut is_null: Vec<Vec<bool>> = Vec::with_capacity(shown + 3);
     for r in 0..head_n {
@@ -317,7 +391,6 @@ fn print_table(result: &teide_sql::SqlResult) {
         }
     }
 
-    // Footer text
     let footer_left = if show_dots {
         format!("{nrows} rows ({shown} shown)")
     } else {
@@ -326,7 +399,6 @@ fn print_table(result: &teide_sql::SqlResult) {
     let footer_right = format!("{ncols} columns");
     let footer_min = footer_left.len() + footer_right.len() + 3;
 
-    // Calculate column widths
     let mut w: Vec<usize> = (0..ncols)
         .map(|c| {
             let mut max = col_names[c].len().max(col_types[c].len());
@@ -346,15 +418,18 @@ fn print_table(result: &teide_sql::SqlResult) {
     }
     let mut buf = String::with_capacity(inner_width * 2);
 
-    // Helper: push a horizontal border line
     macro_rules! hline {
         ($left:expr, $mid:expr, $right:expr) => {{
             buf.clear();
             buf.push_str(BORDER);
             buf.push($left);
             for c in 0..ncols {
-                if c > 0 { buf.push($mid); }
-                for _ in 0..w[c] + 2 { buf.push('─'); }
+                if c > 0 {
+                    buf.push($mid);
+                }
+                for _ in 0..w[c] + 2 {
+                    buf.push('\u{2500}');
+                }
             }
             buf.push($right);
             buf.push_str(R);
@@ -362,51 +437,61 @@ fn print_table(result: &teide_sql::SqlResult) {
         }};
     }
 
-    // Top border
-    hline!('┌', '┬', '┐');
+    hline!('\u{250c}', '\u{252c}', '\u{2510}');
 
-    // Column names
     buf.clear();
     for c in 0..ncols {
         buf.push_str(BORDER);
-        buf.push('│');
+        buf.push('\u{2502}');
         buf.push_str(R);
-        let _ = write!(buf, " {BOLD}{HEADER}{:^width$}{R} ", col_names[c], width = w[c]);
+        let _ = write!(
+            buf,
+            " {BOLD}{HEADER}{:^width$}{R} ",
+            col_names[c],
+            width = w[c]
+        );
     }
     buf.push_str(BORDER);
-    buf.push('│');
+    buf.push('\u{2502}');
     buf.push_str(R);
     println!("{buf}");
 
-    // Column types
     buf.clear();
     for c in 0..ncols {
         buf.push_str(BORDER);
-        buf.push('│');
+        buf.push('\u{2502}');
         buf.push_str(R);
-        let _ = write!(buf, " {TYPE_DIM}{:^width$}{R} ", col_types[c], width = w[c]);
+        let _ = write!(
+            buf,
+            " {TYPE_DIM}{:^width$}{R} ",
+            col_types[c],
+            width = w[c]
+        );
     }
     buf.push_str(BORDER);
-    buf.push('│');
+    buf.push('\u{2502}');
     buf.push_str(R);
     println!("{buf}");
 
-    // Header/data separator
-    hline!('├', '┼', '┤');
+    hline!('\u{251c}', '\u{253c}', '\u{2524}');
 
-    // Data rows
     let dots_idx = if show_dots { Some(head_n) } else { None };
     for (ri, row) in cells.iter().enumerate() {
         buf.clear();
         let is_dots = dots_idx == Some(ri);
         for c in 0..ncols {
             buf.push_str(BORDER);
-            buf.push('│');
+            buf.push('\u{2502}');
             buf.push_str(R);
             if is_dots {
                 let _ = write!(buf, " {FOOTER}{:^width$}{R} ", row[c], width = w[c]);
             } else if is_null[ri][c] {
-                let _ = write!(buf, " {ITALIC}{NULL_CLR}{:>width$}{R} ", row[c], width = w[c]);
+                let _ = write!(
+                    buf,
+                    " {ITALIC}{NULL_CLR}{:>width$}{R} ",
+                    row[c],
+                    width = w[c]
+                );
             } else if is_right[c] {
                 let _ = write!(buf, " {TEXT}{:>width$}{R} ", row[c], width = w[c]);
             } else {
@@ -414,28 +499,29 @@ fn print_table(result: &teide_sql::SqlResult) {
             }
         }
         buf.push_str(BORDER);
-        buf.push('│');
+        buf.push('\u{2502}');
         buf.push_str(R);
         println!("{buf}");
     }
 
-    // Footer top border
-    hline!('├', '┴', '┤');
+    hline!('\u{251c}', '\u{2534}', '\u{2524}');
 
-    // Footer content
     let pad = inner_width - footer_left.len() - footer_right.len() - 2;
     buf.clear();
-    let _ = write!(buf, "{BORDER}│{R} {FOOTER}{footer_left}{:pad$}{footer_right}{R} {BORDER}│{R}", "");
+    let _ = write!(
+        buf,
+        "{BORDER}\u{2502}{R} {FOOTER}{footer_left}{:pad$}{footer_right}{R} {BORDER}\u{2502}{R}",
+        ""
+    );
     println!("{buf}");
 
-    // Bottom border
     buf.clear();
     buf.push_str(BORDER);
-    buf.push('└');
+    buf.push('\u{2514}');
     for _ in 0..inner_width {
-        buf.push('─');
+        buf.push('\u{2500}');
     }
-    buf.push('┘');
+    buf.push('\u{2518}');
     buf.push_str(R);
     println!("{buf}");
 }
@@ -502,7 +588,6 @@ fn print_json(result: &teide_sql::SqlResult) {
     println!("]");
 }
 
-/// Format a cell value for table/CSV display.
 fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
@@ -540,7 +625,6 @@ fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
     }
 }
 
-/// Format a cell value for JSON output.
 fn format_json_value(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
@@ -631,14 +715,19 @@ fn handle_dot_command(
                 sorted.sort();
                 for name in sorted {
                     if let Some((nrows, ncols)) = session.table_info(name) {
-                        println!("  {HEADER}{name:20}{R} {FOOTER}{nrows} rows, {ncols} cols{R}");
+                        println!(
+                            "  {HEADER}{name:20}{R} {FOOTER}{nrows} rows, {ncols} cols{R}"
+                        );
                     }
                 }
             }
         }
         ".help" => print_help(),
         ".quit" | ".exit" => std::process::exit(0),
-        _ => println!("{ERROR}Unknown command: {}. Type .help for commands.{R}", parts[0]),
+        _ => println!(
+            "{ERROR}Unknown command: {}. Type .help for commands.{R}",
+            parts[0]
+        ),
     }
 }
 
@@ -658,14 +747,24 @@ fn print_banner() {
     let help_w = help.chars().count();
     let w = tag_w.max(help_w);
     let fill = if w > 11 { w - 11 } else { 0 };
-    println!("{BAN_BORDER}\u{256d}\u{2500} {BOLD}{BAN_TITLE}Teide SQL{R}{BAN_BORDER} \u{2500}{}\u{256e}{R}",
-             "\u{2500}".repeat(fill));
-    println!("{BAN_BORDER}\u{2502}{R} {BAN_INFO}{}{}{R} {BAN_BORDER}\u{2502}{R}",
-             tag, " ".repeat(w - tag_w));
-    println!("{BAN_BORDER}\u{2502}{R} {BAN_HELP}{}{}{R} {BAN_BORDER}\u{2502}{R}",
-             help, " ".repeat(w - help_w));
-    println!("{BAN_BORDER}\u{2570}{}\u{256f}{R}",
-             "\u{2500}".repeat(w + 2));
+    println!(
+        "{BAN_BORDER}\u{256d}\u{2500} {BOLD}{BAN_TITLE}Teide SQL{R}{BAN_BORDER} \u{2500}{}\u{256e}{R}",
+        "\u{2500}".repeat(fill)
+    );
+    println!(
+        "{BAN_BORDER}\u{2502}{R} {BAN_INFO}{}{}{R} {BAN_BORDER}\u{2502}{R}",
+        tag,
+        " ".repeat(w - tag_w)
+    );
+    println!(
+        "{BAN_BORDER}\u{2502}{R} {BAN_HELP}{}{}{R} {BAN_BORDER}\u{2502}{R}",
+        help,
+        " ".repeat(w - help_w)
+    );
+    println!(
+        "{BAN_BORDER}\u{2570}{}\u{256f}{R}",
+        "\u{2500}".repeat(w + 2)
+    );
     println!();
 }
 

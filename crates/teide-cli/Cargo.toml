@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 teide-sql = { path = "../teide-sql" }
 teide = { path = "../teide" }
-rustyline = "15"
+reedline = "0.45"
+nu-ansi-term = "0.50"
 clap = { version = "4", features = ["derive"] }

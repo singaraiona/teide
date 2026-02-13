@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use reedline::{Completer, Span, Suggestion};
 
@@ -141,6 +141,14 @@ pub struct CompletionState {
     pub tables: Vec<TableInfo>,
 }
 
+fn lock_completion_state(state: &Arc<Mutex<CompletionState>>) -> MutexGuard<'_, CompletionState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        // If a panic poisoned the mutex, keep serving completions with last-known state.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Handle held by the REPL loop to update completion metadata.
 #[derive(Clone)]
 pub struct CompletionUpdater {
@@ -149,11 +157,11 @@ pub struct CompletionUpdater {
 
 impl CompletionUpdater {
     pub fn set_columns(&self, columns: Vec<ColumnInfo>) {
-        self.state.lock().unwrap().columns = columns;
+        lock_completion_state(&self.state).columns = columns;
     }
 
     pub fn set_tables(&self, tables: Vec<TableInfo>) {
-        self.state.lock().unwrap().tables = tables;
+        lock_completion_state(&self.state).tables = tables;
     }
 }
 
@@ -219,7 +227,7 @@ impl Completer for SqlCompleter {
         let mut candidates: Vec<(i32, Suggestion)> = Vec::new();
 
         // Read shared state
-        let st = self.state.lock().unwrap();
+        let st = lock_completion_state(&self.state);
 
         match context {
             CompletionContext::Table => {
@@ -321,7 +329,7 @@ impl Completer for SqlCompleter {
                     }
                 }
             }
-            CompletionContext::DotCommand => unreachable!(),
+            CompletionContext::DotCommand => {}
         }
 
         // Sort by score descending

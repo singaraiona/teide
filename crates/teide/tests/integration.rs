@@ -120,7 +120,7 @@ fn scan_and_filter() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let v1 = g.scan("v1");
+    let v1 = g.scan("v1").unwrap();
     let three = g.const_i64(3);
     let pred = g.gt(v1, three);
     let filtered = g.filter(df, pred);
@@ -140,10 +140,10 @@ fn arithmetic() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let v1 = g.scan("v1");
-    let v2 = g.scan("v2");
+    let v1 = g.scan("v1").unwrap();
+    let v2 = g.scan("v2").unwrap();
     let sum_col = g.add(v1, v2);
-    let aliased = g.alias(sum_col, "v1_plus_v2");
+    let aliased = g.alias(sum_col, "v1_plus_v2").unwrap();
     let result_df = g.select(df, &[aliased]);
     let result = g.execute(result_df).unwrap();
 
@@ -166,9 +166,9 @@ fn group_by_sum() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table);
 
-    let id1 = g.scan("id1");
-    let v1 = g.scan("v1");
-    let grp = g.group_by(&[id1], &[AggOp::Sum], &[v1]);
+    let id1 = g.scan("id1").unwrap();
+    let v1 = g.scan("v1").unwrap();
+    let grp = g.group_by(&[id1], &[AggOp::Sum], &[v1]).unwrap();
     let result = g.execute(grp).unwrap();
 
     assert_eq!(result.nrows(), 5);
@@ -190,15 +190,15 @@ fn group_by_multi_agg() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table);
 
-    let id1 = g.scan("id1");
-    let v1a = g.scan("v1");
-    let v3a = g.scan("v3");
-    let v1b = g.scan("v1");
+    let id1 = g.scan("id1").unwrap();
+    let v1a = g.scan("v1").unwrap();
+    let v3a = g.scan("v3").unwrap();
+    let v1b = g.scan("v1").unwrap();
     let grp = g.group_by(
         &[id1],
         &[AggOp::Sum, AggOp::Avg, AggOp::Count],
         &[v1a, v3a, v1b],
-    );
+    ).unwrap();
     let result = g.execute(grp).unwrap();
 
     // 5 groups, 4 columns (id1 + 3 aggs)
@@ -240,10 +240,10 @@ fn group_by_multi_key() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table);
 
-    let id1 = g.scan("id1");
-    let id4 = g.scan("id4");
-    let v1 = g.scan("v1");
-    let grp = g.group_by(&[id1, id4], &[AggOp::Sum], &[v1]);
+    let id1 = g.scan("id1").unwrap();
+    let id4 = g.scan("id4").unwrap();
+    let v1 = g.scan("v1").unwrap();
+    let grp = g.group_by(&[id1, id4], &[AggOp::Sum], &[v1]).unwrap();
     let result = g.execute(grp).unwrap();
 
     // 15 distinct (id1, id4) groups
@@ -260,8 +260,8 @@ fn sort_single_asc() {
     let mut g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let id4 = g.scan("id4");
-    let sorted = g.sort(df, &[id4], &[false], None);
+    let id4 = g.scan("id4").unwrap();
+    let sorted = g.sort(df, &[id4], &[false], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -283,8 +283,8 @@ fn sort_single_desc() {
     let mut g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let v3 = g.scan("v3");
-    let sorted = g.sort(df, &[v3], &[true], None);
+    let v3 = g.scan("v3").unwrap();
+    let sorted = g.sort(df, &[v3], &[true], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -306,9 +306,9 @@ fn sort_multi_key() {
     let mut g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let id1 = g.scan("id1");
-    let id4 = g.scan("id4");
-    let sorted = g.sort(df, &[id1, id4], &[false, false], None);
+    let id1 = g.scan("id1").unwrap();
+    let id4 = g.scan("id4").unwrap();
+    let sorted = g.sort(df, &[id1, id4], &[false, false], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -337,8 +337,8 @@ fn sort_with_limit() {
     let mut g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let id4 = g.scan("id4");
-    let sorted = g.sort(df, &[id4], &[false], None);
+    let id4 = g.scan("id4").unwrap();
+    let sorted = g.sort(df, &[id4], &[false], None).unwrap();
     let limited = g.head(sorted, 3);
     let result = g.execute(limited).unwrap();
 
@@ -363,11 +363,11 @@ fn join_inner() {
     let mut g = ctx.graph(&left);
     let left_df = g.const_df(&left);
     let right_df = g.const_df(&right);
-    let left_id1 = g.scan("id1");
+    let left_id1 = g.scan("id1").unwrap();
     let right_id1_vec = right.get_col_idx(0).unwrap();
     let right_id1 = g.const_vec(right_id1_vec);
 
-    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 0);
+    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 0).unwrap();
     let result = g.execute(joined).unwrap();
 
     // id001(4) + id002(4) + id003(4) = 12 matched rows
@@ -388,11 +388,11 @@ fn join_left() {
     let mut g = ctx.graph(&left);
     let left_df = g.const_df(&left);
     let right_df = g.const_df(&right);
-    let left_id1 = g.scan("id1");
+    let left_id1 = g.scan("id1").unwrap();
     let right_id1_vec = right.get_col_idx(0).unwrap();
     let right_id1 = g.const_vec(right_id1_vec);
 
-    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 1);
+    let joined = g.join(left_df, &[left_id1], right_df, &[right_id1], 1).unwrap();
     let result = g.execute(joined).unwrap();
 
     // All 20 left rows preserved
@@ -437,8 +437,8 @@ fn project() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let id1 = g.scan("id1");
-    let v1 = g.scan("v1");
+    let id1 = g.scan("id1").unwrap();
+    let v1 = g.scan("v1").unwrap();
     let projected = g.select(df, &[id1, v1]);
     let result = g.execute(projected).unwrap();
 
@@ -457,8 +457,8 @@ fn alias_column() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let v1 = g.scan("v1");
-    let aliased = g.alias(v1, "my_v1");
+    let v1 = g.scan("v1").unwrap();
+    let aliased = g.alias(v1, "my_v1").unwrap();
     let projected = g.select(df, &[aliased]);
     let result = g.execute(projected).unwrap();
 
@@ -477,17 +477,17 @@ fn string_ops() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let id1 = g.scan("id1");
+    let id1 = g.scan("id1").unwrap();
     let upper_col = g.upper(id1);
-    let upper_aliased = g.alias(upper_col, "upper_id1");
+    let upper_aliased = g.alias(upper_col, "upper_id1").unwrap();
 
-    let id1b = g.scan("id1");
+    let id1b = g.scan("id1").unwrap();
     let len_col = g.strlen(id1b);
-    let len_aliased = g.alias(len_col, "len_id1");
+    let len_aliased = g.alias(len_col, "len_id1").unwrap();
 
-    let id1c = g.scan("id1");
+    let id1c = g.scan("id1").unwrap();
     let lower_col = g.lower(id1c);
-    let lower_aliased = g.alias(lower_col, "lower_id1");
+    let lower_aliased = g.alias(lower_col, "lower_id1").unwrap();
 
     let projected = g.select(df, &[upper_aliased, len_aliased, lower_aliased]);
     let result = g.execute(projected).unwrap();
@@ -513,13 +513,13 @@ fn concat_many_args() {
 
     let df = g.const_df(&table);
     let mut args = Vec::new();
-    args.push(g.scan("id1"));
+    args.push(g.scan("id1").unwrap());
     for _ in 0..19 {
-        args.push(g.const_str("x"));
+        args.push(g.const_str("x").unwrap());
     }
 
     let concat_col = g.concat(&args);
-    let aliased = g.alias(concat_col, "concat_many");
+    let aliased = g.alias(concat_col, "concat_many").unwrap();
     let projected = g.select(df, &[aliased]);
     let result = g.execute(projected).unwrap();
 
@@ -538,9 +538,9 @@ fn cast_i64_to_f64() {
     let g = ctx.graph(&table);
 
     let df = g.const_df(&table);
-    let v1 = g.scan("v1");
+    let v1 = g.scan("v1").unwrap();
     let casted = g.cast(v1, teide::types::F64);
-    let aliased = g.alias(casted, "v1_f64");
+    let aliased = g.alias(casted, "v1_f64").unwrap();
     let projected = g.select(df, &[aliased]);
     let result = g.execute(projected).unwrap();
 
@@ -576,9 +576,9 @@ fn window_row_number() {
     // ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 ASC)
     let mut g = ctx.graph(&table);
     let df = g.const_df(&table);
-    let part_key = g.scan("id1");
-    let order_key = g.scan("v1");
-    let dummy_input = g.scan("v1");
+    let part_key = g.scan("id1").unwrap();
+    let order_key = g.scan("v1").unwrap();
+    let dummy_input = g.scan("v1").unwrap();
 
     let win = g.window_op(
         df,
@@ -590,7 +590,7 @@ fn window_row_number() {
         FrameType::Rows,
         FrameBound::UnboundedPreceding,
         FrameBound::UnboundedFollowing,
-    );
+    ).unwrap();
     let result = g.execute(win).unwrap();
 
     // 20 rows, original 9 cols + 1 window col = 10
@@ -623,9 +623,9 @@ fn window_rank_with_ties() {
     // id2 has 2 distinct values, id4 has values 1-3 (with ties)
     let mut g = ctx.graph(&table);
     let df = g.const_df(&table);
-    let part_key = g.scan("id2");
-    let order_key = g.scan("id4");
-    let dummy = g.scan("id4");
+    let part_key = g.scan("id2").unwrap();
+    let order_key = g.scan("id4").unwrap();
+    let dummy = g.scan("id4").unwrap();
 
     let win = g.window_op(
         df,
@@ -637,7 +637,7 @@ fn window_rank_with_ties() {
         FrameType::Rows,
         FrameBound::UnboundedPreceding,
         FrameBound::UnboundedFollowing,
-    );
+    ).unwrap();
     let result = g.execute(win).unwrap();
 
     // 20 rows, 9 + 2 window cols = 11
@@ -665,8 +665,8 @@ fn window_running_sum() {
     // No partition → entire table is one partition
     let mut g = ctx.graph(&table);
     let df = g.const_df(&table);
-    let order_key = g.scan("v1");
-    let sum_input = g.scan("v1");
+    let order_key = g.scan("v1").unwrap();
+    let sum_input = g.scan("v1").unwrap();
 
     let win = g.window_op(
         df,
@@ -678,7 +678,7 @@ fn window_running_sum() {
         FrameType::Rows,
         FrameBound::UnboundedPreceding,
         FrameBound::CurrentRow,
-    );
+    ).unwrap();
     let result = g.execute(win).unwrap();
 
     assert_eq!(result.nrows(), 20);

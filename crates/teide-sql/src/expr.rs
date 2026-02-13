@@ -24,7 +24,7 @@ pub fn plan_expr(
             if !schema.contains_key(&name) {
                 return Err(SqlError::Plan(format!("Column '{}' not found", name)));
             }
-            Ok(g.scan(&name))
+            Ok(g.scan(&name)?)
         }
 
         Expr::Value(val) => match val {
@@ -38,7 +38,7 @@ pub fn plan_expr(
                     Ok(g.const_f64(f))
                 }
             }
-            Value::SingleQuotedString(s) => Ok(g.const_str(s)),
+            Value::SingleQuotedString(s) => Ok(g.const_str(s)?),
             Value::Boolean(b) => Ok(g.const_bool(*b)),
             Value::Null => {
                 // NULL represented as f64 NaN constant — C engine uses NaN-as-null
@@ -200,7 +200,7 @@ pub fn plan_expr(
             }
         }
 
-        // ILIKE (case-insensitive) — treat same as LIKE for now
+        // ILIKE (case-insensitive)
         Expr::ILike {
             negated,
             expr: inner,
@@ -208,8 +208,17 @@ pub fn plan_expr(
             ..
         } => {
             let input = plan_expr(g, inner, schema)?;
-            let pat = plan_expr(g, pattern, schema)?;
-            let result = g.like(input, pat);
+            let input_ci = g.lower(input);
+            let pat_ci = match pattern.as_ref() {
+                Expr::Value(Value::SingleQuotedString(s)) => {
+                    g.const_str(&s.to_lowercase())?
+                }
+                _ => {
+                    let pat = plan_expr(g, pattern, schema)?;
+                    g.lower(pat)
+                }
+            };
+            let result = g.like(input_ci, pat_ci);
             if *negated {
                 Ok(g.not(result))
             } else {
@@ -222,12 +231,12 @@ pub fn plan_expr(
             if parts.len() == 2 {
                 let col_name = parts[1].value.to_lowercase();
                 if schema.contains_key(&col_name) {
-                    return Ok(g.scan(&col_name));
+                    return Ok(g.scan(&col_name)?);
                 }
                 // Try fully qualified name "alias.col"
                 let full = format!("{}.{}", parts[0].value.to_lowercase(), col_name);
                 if schema.contains_key(&full) {
-                    return Ok(g.scan(&full));
+                    return Ok(g.scan(&full)?);
                 }
                 return Err(SqlError::Plan(format!("Column '{}' not found", col_name)));
             }
@@ -444,13 +453,13 @@ fn plan_scalar_function(
                 return plan_expr(g, &args[0], schema);
             }
             // Build right-to-left: last arg is the fallback, then wrap in IF chains
-            let mut result = plan_expr(g, args.last().unwrap(), schema)?;
+            let fallback = &args[args.len() - 1];
+            let mut result = plan_expr(g, fallback, schema)?;
             for arg in args[..args.len() - 1].iter().rev() {
                 let val = plan_expr(g, arg, schema)?;
                 let is_null = g.isnull(val);
                 let not_null = g.not(is_null);
-                let val_again = plan_expr(g, arg, schema)?;
-                result = g.if_then_else(not_null, val_again, result);
+                result = g.if_then_else(not_null, val, result);
             }
             Ok(result)
         }
@@ -462,8 +471,7 @@ fn plan_scalar_function(
             let b = plan_expr(g, &args[1], schema)?;
             let eq = g.eq(a, b);
             let null_val = g.const_f64(f64::NAN);
-            let a2 = plan_expr(g, &args[0], schema)?;
-            Ok(g.if_then_else(eq, null_val, a2))
+            Ok(g.if_then_else(eq, null_val, a))
         }
 
         // String functions
@@ -753,10 +761,10 @@ pub fn is_aggregate(expr: &Expr) -> bool {
             results,
             else_result,
         } => {
-            operand.as_ref().map_or(false, |e| is_aggregate(e))
-                || conditions.iter().any(|c| is_aggregate(c))
-                || results.iter().any(|r| is_aggregate(r))
-                || else_result.as_ref().map_or(false, |e| is_aggregate(e))
+            operand.as_ref().is_some_and(|e| is_aggregate(e))
+                || conditions.iter().any(is_aggregate)
+                || results.iter().any(is_aggregate)
+                || else_result.as_ref().is_some_and(|e| is_aggregate(e))
         }
         _ => false,
     }
@@ -826,7 +834,7 @@ pub fn plan_post_agg_expr(
                 // This aggregate should already be in the result — scan by native name
                 let alias = format_agg_name(f);
                 if let Some(native) = alias_to_native.get(&alias) {
-                    return Ok(g.scan(native));
+                    return Ok(g.scan(native)?);
                 }
                 return Err(SqlError::Plan(format!(
                     "Aggregate '{alias}' not found in GROUP BY result"
@@ -886,7 +894,7 @@ pub fn plan_post_agg_expr(
                     Ok(g.const_f64(f))
                 }
             }
-            Value::SingleQuotedString(s) => Ok(g.const_str(s)),
+            Value::SingleQuotedString(s) => Ok(g.const_str(s)?),
             Value::Boolean(b) => Ok(g.const_bool(*b)),
             Value::Null => Ok(g.const_f64(f64::NAN)),
             _ => Err(SqlError::Plan(format!("Unsupported value: {val}"))),
@@ -895,10 +903,10 @@ pub fn plan_post_agg_expr(
             // Could be a key column name or an aggregate alias
             let name = ident.value.to_lowercase();
             if let Some(native) = alias_to_native.get(&name) {
-                return Ok(g.scan(native));
+                return Ok(g.scan(native)?);
             }
             // Try as direct column name (key columns use native names)
-            Ok(g.scan(&name))
+            Ok(g.scan(&name)?)
         }
         _ => Err(SqlError::Plan(format!(
             "Unsupported expression in post-agg context: {expr}"
@@ -921,12 +929,12 @@ pub fn plan_having_expr(
                 // Try format_agg_name alias first ("sum(v1)")
                 let alias = format_agg_name(f);
                 if result_schema.contains_key(&alias) {
-                    return Ok(g.scan(&alias));
+                    return Ok(g.scan(&alias)?);
                 }
                 // Try C engine naming convention ("v1_sum")
                 if let Some(native) = predict_c_agg_name(f, original_schema) {
                     if result_schema.contains_key(&native) {
-                        return Ok(g.scan(&native));
+                        return Ok(g.scan(&native)?);
                     }
                 }
                 return Err(SqlError::Plan(format!(
@@ -968,7 +976,7 @@ pub fn plan_having_expr(
         Expr::Identifier(ident) => {
             let name = ident.value.to_lowercase();
             if result_schema.contains_key(&name) {
-                return Ok(g.scan(&name));
+                return Ok(g.scan(&name)?);
             }
             Err(SqlError::Plan(format!(
                 "Column '{}' not found in HAVING result",
@@ -1061,7 +1069,7 @@ pub fn plan_agg_input(
                 .min_by_key(|(_k, v)| **v)
                 .map(|(k, _)| k.clone())
                 .ok_or_else(|| SqlError::Plan("COUNT(*) on empty schema".into()))?;
-            Ok(g.scan(&first_col))
+            Ok(g.scan(&first_col)?)
         }
         _ => Err(SqlError::Plan(format!(
             "Only expressions and * supported as arguments to {}()",
@@ -1214,52 +1222,52 @@ fn parse_i64_literal(expr: &Expr) -> Result<i64, SqlError> {
 }
 
 /// Convert sqlparser WindowSpec to Teide FrameType + FrameBound pair.
-pub fn parse_window_frame(spec: &WindowSpec) -> (FrameType, FrameBound, FrameBound) {
+pub fn parse_window_frame(spec: &WindowSpec) -> Result<(FrameType, FrameBound, FrameBound), SqlError> {
     match &spec.window_frame {
         Some(frame) => {
             let ft = match frame.units {
                 WindowFrameUnits::Rows => FrameType::Rows,
                 _ => FrameType::Range,
             };
-            let start = convert_frame_bound(&frame.start_bound);
+            let start = convert_frame_bound(&frame.start_bound)?;
             let end = match &frame.end_bound {
-                Some(b) => convert_frame_bound(b),
+                Some(b) => convert_frame_bound(b)?,
                 None => FrameBound::CurrentRow,
             };
-            (ft, start, end)
+            Ok((ft, start, end))
         }
         None => {
             // SQL default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             // But with no ORDER BY, it's the whole partition
             if spec.order_by.is_empty() {
-                (
+                Ok((
                     FrameType::Range,
                     FrameBound::UnboundedPreceding,
                     FrameBound::UnboundedFollowing,
-                )
+                ))
             } else {
-                (
+                Ok((
                     FrameType::Range,
                     FrameBound::UnboundedPreceding,
                     FrameBound::CurrentRow,
-                )
+                ))
             }
         }
     }
 }
 
-fn convert_frame_bound(b: &WindowFrameBound) -> FrameBound {
+fn convert_frame_bound(b: &WindowFrameBound) -> Result<FrameBound, SqlError> {
     match b {
-        WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
-        WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
-        WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+        WindowFrameBound::CurrentRow => Ok(FrameBound::CurrentRow),
+        WindowFrameBound::Preceding(None) => Ok(FrameBound::UnboundedPreceding),
+        WindowFrameBound::Following(None) => Ok(FrameBound::UnboundedFollowing),
         WindowFrameBound::Preceding(Some(expr)) => {
-            let n = parse_i64_literal(expr).unwrap_or(1);
-            FrameBound::Preceding(n)
+            let n = parse_i64_literal(expr)?;
+            Ok(FrameBound::Preceding(n))
         }
         WindowFrameBound::Following(Some(expr)) => {
-            let n = parse_i64_literal(expr).unwrap_or(1);
-            FrameBound::Following(n)
+            let n = parse_i64_literal(expr)?;
+            Ok(FrameBound::Following(n))
         }
     }
 }
@@ -1305,7 +1313,10 @@ fn collect_win_funcs_inner(
     out: &mut Vec<(usize, WindowFuncInfo)>,
 ) -> Result<(), SqlError> {
     match expr {
-        Expr::Function(f) if f.over.is_some() => {
+        Expr::Function(f) => {
+            let Some(over) = f.over.as_ref() else {
+                return Ok(());
+            };
             let name = f.name.to_string().to_lowercase();
             let args = extract_func_args(f)?;
 
@@ -1313,7 +1324,7 @@ fn collect_win_funcs_inner(
             let wf = window_func_from_name(&name, &args)?;
 
             // Extract window spec
-            let spec = match f.over.as_ref().unwrap() {
+            let spec = match over {
                 WindowType::WindowSpec(s) => s.clone(),
                 WindowType::NamedWindow(_) => {
                     return Err(SqlError::Plan("Named windows not supported".into()));

@@ -64,7 +64,7 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
             let ncols = result.columns.len();
 
             // Rename table columns to match SQL aliases so downstream scans work
-            let table = result.table.with_column_names(&result.columns);
+            let table = result.table.with_column_names(&result.columns)?;
             session.tables.insert(
                 table_name.clone(),
                 StoredTable {
@@ -153,7 +153,7 @@ fn plan_query(
             let cte_name = cte.alias.name.value.to_lowercase();
             let result = plan_query(ctx, &cte.query, Some(&cte_map))?;
             // Rename table columns to match SQL aliases so downstream scans work
-            let table = result.table.with_column_names(&result.columns);
+            let table = result.table.with_column_names(&result.columns)?;
             cte_map.insert(
                 cte_name,
                 StoredTable {
@@ -323,8 +323,9 @@ fn plan_query(
             && select.from[0].joins.is_empty()
             && select.selection.is_some()
         {
-            if let TableFactor::Derived { subquery, .. } = &select.from[0].relation {
-                let where_expr = select.selection.as_ref().unwrap();
+            if let (TableFactor::Derived { subquery, .. }, Some(where_expr)) =
+                (&select.from[0].relation, select.selection.as_ref())
+            {
                 let pushable_cols = get_pushable_columns_from_query(subquery);
                 if !pushable_cols.is_empty() {
                     let terms = split_conjunction(where_expr);
@@ -343,7 +344,7 @@ fn plan_query(
                     if !push.is_empty() {
                         let modified = inject_predicates_into_query(subquery, &push);
                         let result = plan_query(ctx, &modified, effective_tables)?;
-                        let tbl = result.table.with_column_names(&result.columns);
+                        let tbl = result.table.with_column_names(&result.columns)?;
                         let sch = build_result_schema(&tbl, &result.columns);
                         (tbl, sch, join_conjunction(keep))
                     } else {
@@ -546,6 +547,7 @@ fn plan_query(
         }
     };
 
+    validate_result_table(&result_table)?;
     Ok(SqlResult {
         table: result_table,
         columns: result_aliases,
@@ -752,8 +754,10 @@ fn resolve_from(
             let left_df_node = g.const_df(&al_table);
             let right_df_node = g.const_df(&ar_table);
 
-            let left_key_nodes: Vec<teide::Column> =
-                join_keys.iter().map(|(lk, _)| g.scan(lk)).collect();
+            let left_key_nodes: Vec<teide::Column> = join_keys
+                .iter()
+                .map(|(lk, _)| g.scan(lk))
+                .collect::<teide::Result<Vec<_>>>()?;
 
             // Right keys: use const_vec to avoid cross-graph references
             let mut right_key_nodes: Vec<teide::Column> = Vec::new();
@@ -776,7 +780,7 @@ fn resolve_from(
                 right_df_node,
                 &right_key_nodes,
                 join_type,
-            );
+            )?;
 
             g.execute(joined)?
         };
@@ -807,7 +811,7 @@ fn resolve_table_factor(
         TableFactor::Derived { subquery, .. } => {
             let result = plan_query(ctx, subquery, tables)?;
             // Rename columns to match SQL aliases so outer scans work
-            let table = result.table.with_column_names(&result.columns);
+            let table = result.table.with_column_names(&result.columns)?;
             let schema = build_result_schema(&table, &result.columns);
             Ok((table, schema))
         }
@@ -898,7 +902,11 @@ fn plan_group_select(
             // Pure aggregate: SUM(v1), COUNT(*)
             let func = match expr {
                 Expr::Function(f) => f,
-                _ => unreachable!(),
+                _ => {
+                    return Err(SqlError::Plan(format!(
+                        "Expected aggregate function, got expression '{expr}'"
+                    )))
+                }
             };
             let agg_alias = format_agg_name(func);
             let agg_idx = register_agg(&mut all_aggs, func, &agg_alias);
@@ -914,7 +922,7 @@ fn plan_group_select(
                 }
             }
             let display = explicit_alias.unwrap_or_else(|| expr_default_name(expr));
-            select_plan.push(SelectPlan::PostAggExpr(expr.clone(), display.clone()));
+            select_plan.push(SelectPlan::PostAggExpr(Box::new(expr.clone()), display.clone()));
             final_aliases.push(display);
         } else {
             // Check if this expression matches a GROUP BY expression key
@@ -972,7 +980,7 @@ fn plan_group_select(
             // Expression-based key (e.g., CASE WHEN ... AS bucket, GROUP BY bucket)
             key_nodes.push(plan_expr(&mut g, expr, schema)?);
         } else {
-            key_nodes.push(g.scan(k));
+            key_nodes.push(g.scan(k)?);
         }
     }
 
@@ -985,7 +993,7 @@ fn plan_group_select(
         agg_inputs.push(input);
     }
 
-    let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs);
+    let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs)?;
 
     // Push filter mask into the graph so exec_group skips filtered rows
     if let Some(mask) = filter_mask {
@@ -1036,18 +1044,18 @@ fn plan_group_select(
     for plan in &select_plan {
         match plan {
             SelectPlan::KeyRef(alias) => {
-                proj_cols.push(pg.scan(alias));
+                proj_cols.push(pg.scan(alias)?);
                 proj_aliases.push(alias.clone());
             }
             SelectPlan::PureAgg(idx, alias) => {
                 // Always scan by native C engine name
                 let col_idx = key_names.len() + *idx;
                 let native = group_result.col_name_str(col_idx);
-                proj_cols.push(pg.scan(&native));
+                proj_cols.push(pg.scan(native)?);
                 proj_aliases.push(alias.clone());
             }
             SelectPlan::PostAggExpr(expr, alias) => {
-                let col = plan_post_agg_expr(&mut pg, expr, &alias_to_native)?;
+                let col = plan_post_agg_expr(&mut pg, expr.as_ref(), &alias_to_native)?;
                 proj_cols.push(col);
                 proj_aliases.push(alias.clone());
             }
@@ -1087,7 +1095,7 @@ fn register_agg(
 enum SelectPlan {
     KeyRef(String),
     PureAgg(usize, String), // (agg index, display alias)
-    PostAggExpr(Expr, String),
+    PostAggExpr(Box<Expr>, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,7 +1158,7 @@ fn plan_count_distinct_group(
         if let Some(expr) = alias_exprs.get(k) {
             key_nodes.push(plan_expr(&mut g, expr, schema)?);
         } else {
-            key_nodes.push(g.scan(k));
+            key_nodes.push(g.scan(k)?);
         }
     }
 
@@ -1172,16 +1180,19 @@ fn plan_count_distinct_group(
             .map(|(k, _)| k.clone())
             .ok_or_else(|| SqlError::Plan("Empty schema".into()))?;
         phase1_agg_ops.push(teide::AggOp::Count);
-        phase1_agg_inputs.push(g.scan(&first_col));
+        phase1_agg_inputs.push(g.scan(&first_col)?);
     }
 
-    let group_node = g.group_by(&key_nodes, &phase1_agg_ops, &phase1_agg_inputs);
+    let group_node = g.group_by(&key_nodes, &phase1_agg_ops, &phase1_agg_inputs)?;
     let phase1_result = g.execute(group_node)?;
 
     // Phase 2: GROUP BY [original_keys] with COUNT(*) for each distinct col
     // and FIRST for each regular aggregate
     let mut g2 = ctx.graph(&phase1_result);
-    let phase2_keys: Vec<Column> = key_names.iter().map(|k| g2.scan(k)).collect();
+    let phase2_keys: Vec<Column> = key_names
+        .iter()
+        .map(|k| g2.scan(k))
+        .collect::<teide::Result<Vec<_>>>()?;
 
     // For no-GROUP-BY case (e.g., SELECT COUNT(DISTINCT id1) FROM t),
     // we need a scalar reduction. Use the distinct col as key in phase 1,
@@ -1191,8 +1202,8 @@ fn plan_count_distinct_group(
         // Use a scalar GROUP BY (no keys) with COUNT(*) to produce a 1-row table.
         let first_col_name = phase1_result.col_name_str(0).to_string();
         let mut g2 = ctx.graph(&phase1_result);
-        let count_input = g2.scan(&first_col_name);
-        let group_node = g2.group_by(&[], &[teide::AggOp::Count], &[count_input]);
+        let count_input = g2.scan(&first_col_name)?;
+        let group_node = g2.group_by(&[], &[teide::AggOp::Count], &[count_input])?;
         let result = g2.execute(group_node)?;
         return Ok((result, final_aliases.to_vec()));
     }
@@ -1203,7 +1214,7 @@ fn plan_count_distinct_group(
     // COUNT(DISTINCT col) → COUNT(*) on the distinct col (counts unique groups)
     for dc in &distinct_cols {
         phase2_agg_ops.push(teide::AggOp::Count);
-        phase2_agg_inputs.push(g2.scan(dc));
+        phase2_agg_inputs.push(g2.scan(dc)?);
     }
 
     // Regular aggs → re-aggregate in phase 2 with compatible ops:
@@ -1225,7 +1236,7 @@ fn plan_count_distinct_group(
                 _ => teide::AggOp::First,
             };
             phase2_agg_ops.push(phase2_op);
-            phase2_agg_inputs.push(g2.scan(&native));
+            phase2_agg_inputs.push(g2.scan(&native)?);
         } else {
             return Err(SqlError::Plan(format!(
                 "Aggregate '{}' not found in phase 1 result (looked for '{}')",
@@ -1234,7 +1245,7 @@ fn plan_count_distinct_group(
         }
     }
 
-    let group_node2 = g2.group_by(&phase2_keys, &phase2_agg_ops, &phase2_agg_inputs);
+    let group_node2 = g2.group_by(&phase2_keys, &phase2_agg_ops, &phase2_agg_inputs)?;
     let phase2_result = g2.execute(group_node2)?;
 
     Ok((phase2_result, final_aliases.to_vec()))
@@ -1275,7 +1286,10 @@ fn plan_distinct(
 ) -> Result<(Table, Vec<String>), SqlError> {
     // GROUP BY all selected columns with a dummy COUNT(*) aggregate
     let mut g = ctx.graph(working_table);
-    let key_nodes: Vec<Column> = col_names.iter().map(|k| g.scan(k)).collect();
+    let key_nodes: Vec<Column> = col_names
+        .iter()
+        .map(|k| g.scan(k))
+        .collect::<teide::Result<Vec<_>>>()?;
 
     // Need at least one aggregate for td_group — use COUNT on first column
     let first_col = schema
@@ -1283,15 +1297,18 @@ fn plan_distinct(
         .min_by_key(|(_k, v)| **v)
         .map(|(k, _)| k.clone())
         .ok_or_else(|| SqlError::Plan("DISTINCT on empty table".into()))?;
-    let count_input = g.scan(&first_col);
-    let group_node = g.group_by(&key_nodes, &[teide::AggOp::Count], &[count_input]);
+    let count_input = g.scan(&first_col)?;
+    let group_node = g.group_by(&key_nodes, &[teide::AggOp::Count], &[count_input])?;
     let group_result = g.execute(group_node)?;
 
     // The result has keys + 1 COUNT column. We only want the keys.
     // Build a SELECT projection to drop the count column.
     let pg = ctx.graph(&group_result);
     let df_node = pg.const_df(&group_result);
-    let proj_cols: Vec<Column> = col_names.iter().map(|k| pg.scan(k)).collect();
+    let proj_cols: Vec<Column> = col_names
+        .iter()
+        .map(|k| pg.scan(k))
+        .collect::<teide::Result<Vec<_>>>()?;
     let proj = pg.select(df_node, &proj_cols);
     let result = pg.execute(proj)?;
 
@@ -1320,7 +1337,7 @@ fn plan_expr_select(
                 let mut cols: Vec<_> = schema.iter().collect();
                 cols.sort_by_key(|(_name, idx)| **idx);
                 for (name, _) in cols {
-                    proj_cols.push(g.scan(name));
+                    proj_cols.push(g.scan(name)?);
                     aliases.push(name.clone());
                 }
             }
@@ -1347,6 +1364,8 @@ fn plan_expr_select(
 // Window function stage: execute window functions and append result columns
 // ---------------------------------------------------------------------------
 
+type WindowStageResult = (Table, HashMap<String, usize>, Vec<SelectItem>);
+
 /// Execute window functions and return (updated_table, updated_schema, rewritten_select_items).
 /// Window function calls in SELECT are replaced with identifier references to the new columns.
 fn plan_window_stage(
@@ -1354,94 +1373,121 @@ fn plan_window_stage(
     table: &Table,
     select_items: &[SelectItem],
     schema: &HashMap<String, usize>,
-) -> Result<(Table, HashMap<String, usize>, Vec<SelectItem>), SqlError> {
+) -> Result<WindowStageResult, SqlError> {
     let win_funcs = collect_window_functions(select_items)?;
     if win_funcs.is_empty() {
         // No actual window functions found (shouldn't happen, caller checked)
         let new_schema = schema.clone();
         return Ok((table.clone_ref(), new_schema, select_items.to_vec()));
     }
-
-    // Build a graph for the window operation
-    let mut g = ctx.graph(table);
-    let df_node = g.const_df(table);
-
-    // For each window function, we need partition keys, order keys, and func info.
-    // Group by identical WindowSpec for efficiency, but for simplicity we execute
-    // one OP_WINDOW per unique spec (most queries have one spec).
-
-    // Map: display_name -> column_name_in_result (e.g. "_w0", "_w1")
-    let mut win_col_names: Vec<String> = Vec::new();
-    let mut win_display_names: Vec<String> = Vec::new();
-
-    // Collect all window funcs and build arrays for td_window_op
-    let mut part_key_cols: Vec<Column> = Vec::new();
-    let mut order_key_cols: Vec<Column> = Vec::new();
-    let mut order_descs: Vec<bool> = Vec::new();
-    let mut funcs: Vec<teide::WindowFunc> = Vec::new();
-    let mut func_input_cols: Vec<Column> = Vec::new();
-
-    // Use the spec from the first window function (for now, all must share same spec)
-    let first_spec = &win_funcs[0].1.spec;
-    let (frame_type, frame_start, frame_end) = parse_window_frame(first_spec);
-
-    // Build partition key columns
-    for part_expr in &first_spec.partition_by {
-        let col = plan_expr(&mut g, part_expr, schema)?;
-        part_key_cols.push(col);
-    }
-
-    // Build order key columns
-    for ob in &first_spec.order_by {
-        let col = plan_expr(&mut g, &ob.expr, schema)?;
-        order_key_cols.push(col);
-        order_descs.push(ob.asc == Some(false));
-    }
-
-    // Build function list
-    for (_idx, info) in &win_funcs {
-        funcs.push(info.func);
-
-        // For functions that need an input column
-        let input_col = if let Some(ref input_expr) = info.input_expr {
-            plan_expr(&mut g, input_expr, schema)?
+    // Group window functions by WindowSpec so each spec gets a dedicated OP_WINDOW.
+    // This avoids applying the first spec to all functions when multiple OVER specs
+    // are present in the same SELECT list.
+    let mut spec_groups: Vec<(sqlparser::ast::WindowSpec, Vec<usize>)> = Vec::new();
+    for (func_idx, (_item_idx, info)) in win_funcs.iter().enumerate() {
+        if let Some((_, idxs)) = spec_groups
+            .iter_mut()
+            .find(|(spec, _)| *spec == info.spec)
+        {
+            idxs.push(func_idx);
         } else {
-            // ROW_NUMBER, RANK, etc. don't use input — pass first column as dummy
-            let first_col_name = schema
-                .iter()
-                .min_by_key(|(_, v)| **v)
-                .map(|(k, _)| k.clone())
-                .unwrap_or_default();
-            g.scan(&first_col_name)
-        };
-        func_input_cols.push(input_col);
-
-        let col_name = format!("_w{}", win_col_names.len());
-        win_display_names.push(info.display_name.clone());
-        win_col_names.push(col_name);
+            spec_groups.push((info.spec.clone(), vec![func_idx]));
+        }
     }
 
-    // Execute the window operation
-    let win_node = g.window_op(
-        df_node,
-        &part_key_cols,
-        &order_key_cols,
-        &order_descs,
-        &funcs,
-        &func_input_cols,
-        frame_type,
-        frame_start,
-        frame_end,
-    );
+    let mut current_table = table.clone_ref();
+    let mut current_schema = schema.clone();
+    let mut next_win_col = 0usize;
+    let mut win_col_names: Vec<String> = vec![String::new(); win_funcs.len()];
+    let win_display_names: Vec<String> = win_funcs
+        .iter()
+        .map(|(_, info)| info.display_name.clone())
+        .collect();
 
-    let result = g.execute(win_node)?;
+    for (spec, func_indices) in spec_groups {
+        let stage_result = {
+            let mut g = ctx.graph(&current_table);
+            let df_node = g.const_df(&current_table);
+            let (frame_type, frame_start, frame_end) = parse_window_frame(&spec)?;
 
-    // Build updated schema (original columns + window columns)
-    let mut new_schema = build_schema(&result);
+            let mut part_key_cols: Vec<Column> = Vec::new();
+            for part_expr in &spec.partition_by {
+                part_key_cols.push(plan_expr(&mut g, part_expr, &current_schema)?);
+            }
+
+            let mut order_key_cols: Vec<Column> = Vec::new();
+            let mut order_descs: Vec<bool> = Vec::new();
+            for ob in &spec.order_by {
+                order_key_cols.push(plan_expr(&mut g, &ob.expr, &current_schema)?);
+                order_descs.push(ob.asc == Some(false));
+            }
+
+            let mut funcs: Vec<teide::WindowFunc> = Vec::new();
+            let mut func_input_cols: Vec<Column> = Vec::new();
+            for &func_idx in &func_indices {
+                let info = &win_funcs[func_idx].1;
+                funcs.push(info.func);
+                let input_col = if let Some(ref input_expr) = info.input_expr {
+                    plan_expr(&mut g, input_expr, &current_schema)?
+                } else {
+                    let first_col_name = current_schema
+                        .iter()
+                        .min_by_key(|(_, v)| **v)
+                        .map(|(k, _)| k.clone())
+                        .ok_or_else(|| {
+                            SqlError::Plan(
+                                "Window function requires at least one input column".into(),
+                            )
+                        })?;
+                    g.scan(&first_col_name)?
+                };
+                func_input_cols.push(input_col);
+            }
+
+            let win_node = g.window_op(
+                df_node,
+                &part_key_cols,
+                &order_key_cols,
+                &order_descs,
+                &funcs,
+                &func_input_cols,
+                frame_type,
+                frame_start,
+                frame_end,
+            )?;
+            g.execute(win_node)?
+        };
+
+        // Normalize generated window column names to stable unique names.
+        let prev_ncols = current_table.ncols() as usize;
+        let stage_ncols = stage_result.ncols() as usize;
+        if stage_ncols != prev_ncols + func_indices.len() {
+            return Err(SqlError::Plan(format!(
+                "Window stage produced unexpected column count: expected {}, got {}",
+                prev_ncols + func_indices.len(),
+                stage_ncols
+            )));
+        }
+        let mut renamed_cols: Vec<String> = (0..stage_ncols)
+            .map(|i| stage_result.col_name_str(i).to_string())
+            .collect();
+        for (offset, &func_idx) in func_indices.iter().enumerate() {
+            let col_name = format!("_w{next_win_col}");
+            next_win_col += 1;
+            renamed_cols[prev_ncols + offset] = col_name.clone();
+            win_col_names[func_idx] = col_name;
+        }
+
+        current_table = stage_result.with_column_names(&renamed_cols)?;
+        current_schema = build_schema(&current_table);
+    }
+
+    let mut new_schema = current_schema.clone();
     // Also add display names as aliases (e.g. "row_number()" -> _w0 column index)
     for (i, display) in win_display_names.iter().enumerate() {
-        let col_idx = new_schema.get(&win_col_names[i]).copied().unwrap_or(0);
-        new_schema.entry(display.clone()).or_insert(col_idx);
+        if let Some(col_idx) = new_schema.get(&win_col_names[i]).copied() {
+            new_schema.entry(display.clone()).or_insert(col_idx);
+        }
     }
 
     // Rewrite SELECT items: replace window function calls with identifier refs.
@@ -1452,11 +1498,11 @@ fn plan_window_stage(
     for item in select_items {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
+                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx)?;
                 new_items.push(SelectItem::UnnamedExpr(rewritten));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx);
+                let rewritten = rewrite_window_refs(expr, &win_col_names, &mut win_idx)?;
                 new_items.push(SelectItem::ExprWithAlias {
                     expr: rewritten,
                     alias: alias.clone(),
@@ -1476,42 +1522,48 @@ fn plan_window_stage(
         }
     }
 
-    Ok((result, new_schema, new_items))
+    Ok((current_table, new_schema, new_items))
 }
 
 /// Recursively replace window function calls in an expression with identifier
 /// references to pre-computed window result columns (_w0, _w1, ...).
-fn rewrite_window_refs(expr: &Expr, col_names: &[String], idx: &mut usize) -> Expr {
+fn rewrite_window_refs(
+    expr: &Expr,
+    col_names: &[String],
+    idx: &mut usize,
+) -> Result<Expr, SqlError> {
     match expr {
         Expr::Function(f) if f.over.is_some() => {
-            let col_name = col_names[*idx].clone();
+            let col_name = col_names.get(*idx).cloned().ok_or_else(|| {
+                SqlError::Plan("Window function rewrite mismatch".into())
+            })?;
             *idx += 1;
-            Expr::Identifier(Ident::new(col_name))
+            Ok(Expr::Identifier(Ident::new(col_name)))
         }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(rewrite_window_refs(left, col_names, idx)),
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(rewrite_window_refs(left, col_names, idx)?),
             op: op.clone(),
-            right: Box::new(rewrite_window_refs(right, col_names, idx)),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op: op.clone(),
-            expr: Box::new(rewrite_window_refs(inner, col_names, idx)),
-        },
-        Expr::Nested(inner) => {
-            Expr::Nested(Box::new(rewrite_window_refs(inner, col_names, idx)))
-        }
+            right: Box::new(rewrite_window_refs(right, col_names, idx)?),
+        }),
+        Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_window_refs(inner, col_names, idx)?),
+        }),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(rewrite_window_refs(
+            inner, col_names, idx,
+        )?))),
         Expr::Cast {
             expr: inner,
             data_type,
             format,
             kind,
-        } => Expr::Cast {
-            expr: Box::new(rewrite_window_refs(inner, col_names, idx)),
+        } => Ok(Expr::Cast {
+            expr: Box::new(rewrite_window_refs(inner, col_names, idx)?),
             data_type: data_type.clone(),
             format: format.clone(),
             kind: kind.clone(),
-        },
-        other => other.clone(),
+        }),
+        other => Ok(other.clone()),
     }
 }
 
@@ -1542,69 +1594,128 @@ fn engine_err_from_raw(ptr: *mut teide::td_t) -> SqlError {
     }
 }
 
-fn release_result_and_err(raw: *mut teide::td_t, err: SqlError) -> Result<Table, SqlError> {
-    unsafe { teide::ffi_release(raw) };
-    Err(err)
+struct RawTableBuilder {
+    raw: *mut teide::td_t,
+}
+
+impl RawTableBuilder {
+    fn new(ncols: i64) -> Result<Self, SqlError> {
+        let raw = unsafe { teide::ffi_table_new(ncols) };
+        if raw.is_null() {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(raw) {
+            return Err(engine_err_from_raw(raw));
+        }
+        Ok(Self { raw })
+    }
+
+    fn add_col(&mut self, name_id: i64, col: *mut teide::td_t) -> Result<(), SqlError> {
+        let next = unsafe { teide::ffi_table_add_col(self.raw, name_id, col) };
+        if next.is_null() {
+            return Err(SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(next) {
+            return Err(engine_err_from_raw(next));
+        }
+        self.raw = next;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Table, SqlError> {
+        let raw = self.raw;
+        self.raw = std::ptr::null_mut();
+        unsafe { teide::ffi_retain(raw) };
+        Ok(unsafe { Table::from_raw(raw)? })
+    }
+}
+
+impl Drop for RawTableBuilder {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { teide::ffi_release(self.raw) };
+        }
+    }
+}
+
+fn is_vector_column(col: *mut teide::td_t) -> bool {
+    unsafe { teide::raw::td_type(col) > 0 }
+}
+
+fn ensure_vector_columns(table: &Table, op: &str) -> Result<Table, SqlError> {
+    for c in 0..table.ncols() {
+        let col = table.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("table column missing".into())
+        })?;
+        if !is_vector_column(col) {
+            let col_type = unsafe { teide::raw::td_type(col) };
+            return Err(SqlError::Plan(format!(
+                "{op}: scalar column type {col_type} at index {c} is not supported"
+            )));
+        }
+    }
+    Ok(table.clone_ref())
+}
+
+fn vec_elem_size(col_type: i8, op: &str) -> Result<usize, SqlError> {
+    if col_type <= 0 {
+        return Err(SqlError::Plan(format!(
+            "{op}: expected vector column, got type {col_type}"
+        )));
+    }
+    let sizes = unsafe { &teide::raw::td_type_sizes };
+    sizes
+        .get(col_type as usize)
+        .copied()
+        .map(|v| v as usize)
+        .ok_or_else(|| {
+            SqlError::Plan(format!("{op}: unsupported column type {col_type}"))
+        })
 }
 
 // ---------------------------------------------------------------------------
 // UNION ALL: concatenate two tables
 // ---------------------------------------------------------------------------
 
-fn concat_tables(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+fn concat_tables(ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+    let _ = ctx;
+    let left = ensure_vector_columns(left, "UNION ALL")?;
+    let right = ensure_vector_columns(right, "UNION ALL")?;
+
     let ncols = left.ncols();
     if ncols != right.ncols() {
         return Err(SqlError::Plan("UNION ALL: column count mismatch".into()));
     }
 
-    // Build a new table with concatenated columns
-    let result_raw = unsafe { teide::ffi_table_new(ncols) };
-    if result_raw.is_null() {
-        return Err(SqlError::Engine(teide::Error::Oom));
-    }
-
-    let mut result_raw = result_raw;
+    let mut result = RawTableBuilder::new(ncols)?;
     for c in 0..ncols {
-        let l_col = match left.get_col_idx(c) {
-            Some(col) => col,
-            None => return release_result_and_err(
-                result_raw,
-                SqlError::Plan("UNION ALL: left column missing".into()),
-            ),
-        };
-        let r_col = match right.get_col_idx(c) {
-            Some(col) => col,
-            None => return release_result_and_err(
-                result_raw,
-                SqlError::Plan("UNION ALL: right column missing".into()),
-            ),
-        };
+        let l_col = left.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("UNION ALL: left column missing".into())
+        })?;
+        let r_col = right.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("UNION ALL: right column missing".into())
+        })?;
         let merged = unsafe { teide::ffi_vec_concat(l_col, r_col) };
         if merged.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+            return Err(SqlError::Engine(teide::Error::Oom));
         }
         if teide::ffi_is_err(merged) {
-            return release_result_and_err(result_raw, engine_err_from_raw(merged));
+            return Err(engine_err_from_raw(merged));
         }
         let name_id = left.col_name(c);
-        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, merged) };
+        let add_res = result.add_col(name_id, merged);
         unsafe { teide::ffi_release(merged) };
-        if next.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
-        }
-        if teide::ffi_is_err(next) {
-            return release_result_and_err(result_raw, engine_err_from_raw(next));
-        }
-        result_raw = next;
+        add_res?;
     }
-
-    // Wrap in a Table with proper RAII
-    unsafe { teide::ffi_retain(result_raw) };
-    Ok(unsafe { Table::from_raw(result_raw) })
+    result.finish()
 }
 
 /// Execute a CROSS JOIN (Cartesian product) of two tables.
-fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
+    let _ = ctx;
+    let left = ensure_vector_columns(left, "CROSS JOIN")?;
+    let right = ensure_vector_columns(right, "CROSS JOIN")?;
+
     let l_nrows = left.nrows() as usize;
     let r_nrows = right.nrows() as usize;
     let out_nrows = l_nrows.checked_mul(r_nrows).ok_or_else(|| {
@@ -1613,32 +1724,22 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
     let l_ncols = left.ncols();
     let r_ncols = right.ncols();
 
-    let result_raw = unsafe { teide::ffi_table_new(l_ncols + r_ncols) };
-    if result_raw.is_null() {
-        return Err(SqlError::Engine(teide::Error::Oom));
-    }
-    let mut result_raw = result_raw;
+    let mut result = RawTableBuilder::new(l_ncols + r_ncols)?;
 
     // Left columns: repeat each row r_nrows times
     for c in 0..l_ncols {
-        let col = match left.get_col_idx(c) {
-            Some(col) => col,
-            None => {
-                return release_result_and_err(
-                    result_raw,
-                    SqlError::Plan("CROSS JOIN: left column missing".into()),
-                );
-            }
-        };
+        let col = left.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("CROSS JOIN: left column missing".into())
+        })?;
         let name_id = left.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
-        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let esz = vec_elem_size(col_type, "CROSS JOIN")?;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
         if new_col.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+            return Err(SqlError::Engine(teide::Error::Oom));
         }
         if teide::ffi_is_err(new_col) {
-            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+            return Err(engine_err_from_raw(new_col));
         }
         unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
@@ -1655,37 +1756,25 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
                 }
             }
         }
-        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let add_res = result.add_col(name_id, new_col);
         unsafe { teide::ffi_release(new_col) };
-        if next.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
-        }
-        if teide::ffi_is_err(next) {
-            return release_result_and_err(result_raw, engine_err_from_raw(next));
-        }
-        result_raw = next;
+        add_res?;
     }
 
     // Right columns: tile the entire column l_nrows times
     for c in 0..r_ncols {
-        let col = match right.get_col_idx(c) {
-            Some(col) => col,
-            None => {
-                return release_result_and_err(
-                    result_raw,
-                    SqlError::Plan("CROSS JOIN: right column missing".into()),
-                );
-            }
-        };
+        let col = right.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("CROSS JOIN: right column missing".into())
+        })?;
         let name_id = right.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
-        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let esz = vec_elem_size(col_type, "CROSS JOIN")?;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
         if new_col.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+            return Err(SqlError::Engine(teide::Error::Oom));
         }
         if teide::ffi_is_err(new_col) {
-            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+            return Err(engine_err_from_raw(new_col));
         }
         unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
@@ -1699,38 +1788,34 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
                 );
             }
         }
-        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let add_res = result.add_col(name_id, new_col);
         unsafe { teide::ffi_release(new_col) };
-        if next.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
-        }
-        if teide::ffi_is_err(next) {
-            return release_result_and_err(result_raw, engine_err_from_raw(next));
-        }
-        result_raw = next;
+        add_res?;
     }
-
-    unsafe { teide::ffi_retain(result_raw) };
-    Ok(unsafe { Table::from_raw(result_raw) })
+    result.finish()
 }
 
 /// Execute EXCEPT ALL or INTERSECT ALL between two tables.
 /// `keep_matches = true` → INTERSECT (keep left rows that exist in right).
 /// `keep_matches = false` → EXCEPT (keep left rows that do NOT exist in right).
 fn exec_set_operation(
-    _ctx: &Context,
+    ctx: &Context,
     left: &Table,
     right: &Table,
     keep_matches: bool,
 ) -> Result<Table, SqlError> {
     use std::collections::HashMap as StdMap;
 
+    let _ = ctx;
+    let left = ensure_vector_columns(left, "SET operation")?;
+    let right = ensure_vector_columns(right, "SET operation")?;
+
     let l_nrows = left.nrows() as usize;
     let r_nrows = right.nrows() as usize;
     let ncols = left.ncols();
 
-    let left_cols = collect_setop_columns(left, ncols)?;
-    let right_cols = collect_setop_columns(right, ncols)?;
+    let left_cols = collect_setop_columns(&left, ncols)?;
+    let right_cols = collect_setop_columns(&right, ncols)?;
 
     // Hash all right-side rows into buckets; exact row equality is checked on probe.
     let mut right_buckets: StdMap<u64, Vec<usize>> = StdMap::new();
@@ -1769,33 +1854,22 @@ fn exec_set_operation(
         }
     }
 
-    // Build result table with kept rows
-    let result_raw = unsafe { teide::ffi_table_new(ncols) };
-    if result_raw.is_null() {
-        return Err(SqlError::Engine(teide::Error::Oom));
-    }
-    let mut result_raw = result_raw;
+    let mut result = RawTableBuilder::new(ncols)?;
     let out_nrows = keep_indices.len();
 
     for c in 0..ncols {
-        let col = match left.get_col_idx(c) {
-            Some(col) => col,
-            None => {
-                return release_result_and_err(
-                    result_raw,
-                    SqlError::Plan("SET operation: column missing".into()),
-                );
-            }
-        };
+        let col = left.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("SET operation: column missing".into())
+        })?;
         let name_id = left.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
-        let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let esz = vec_elem_size(col_type, "SET operation")?;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
         if new_col.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+            return Err(SqlError::Engine(teide::Error::Oom));
         }
         if teide::ffi_is_err(new_col) {
-            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+            return Err(engine_err_from_raw(new_col));
         }
         unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
@@ -1809,19 +1883,11 @@ fn exec_set_operation(
                 );
             }
         }
-        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let add_res = result.add_col(name_id, new_col);
         unsafe { teide::ffi_release(new_col) };
-        if next.is_null() {
-            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
-        }
-        if teide::ffi_is_err(next) {
-            return release_result_and_err(result_raw, engine_err_from_raw(next));
-        }
-        result_raw = next;
+        add_res?;
     }
-
-    unsafe { teide::ffi_retain(result_raw) };
-    Ok(unsafe { Table::from_raw(result_raw) })
+    result.finish()
 }
 
 #[derive(Clone, Copy)]
@@ -1838,7 +1904,7 @@ fn collect_setop_columns(table: &Table, ncols: i64) -> Result<Vec<SetOpCol>, Sql
             SqlError::Plan("SET operation: column missing".into())
         })?;
         let col_type = unsafe { teide::raw::td_type(col) };
-        let elem_size = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let elem_size = vec_elem_size(col_type, "SET operation")?;
         let data = unsafe { teide::raw::td_data(col) } as *const u8;
         cols.push(SetOpCol {
             col_type,
@@ -1945,6 +2011,7 @@ fn apply_post_processing(
         }
     };
 
+    validate_result_table(&result_table)?;
     Ok(SqlResult {
         table: result_table,
         columns: result_aliases,
@@ -1954,6 +2021,33 @@ fn apply_post_processing(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn validate_result_table(table: &Table) -> Result<(), SqlError> {
+    let nrows = table.nrows();
+    for col_idx in 0..table.ncols() {
+        let col = table.get_col_idx(col_idx).ok_or_else(|| {
+            SqlError::Plan(format!("Result column at index {col_idx} is missing"))
+        })?;
+        let col_type = unsafe { teide::raw::td_type(col) };
+        if col_type <= 0 {
+            return Err(SqlError::Plan(format!(
+                "Result column '{}' has scalar type {} and is not supported",
+                table.col_name_str(col_idx as usize),
+                col_type
+            )));
+        }
+        let len = unsafe { teide::raw::td_len(col) };
+        if len != nrows {
+            return Err(SqlError::Plan(format!(
+                "Result column '{}' has length {} but table has {} rows",
+                table.col_name_str(col_idx as usize),
+                len,
+                nrows
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Convert ObjectName to a string.
 fn object_name_to_string(name: &ObjectName) -> String {
@@ -2058,7 +2152,7 @@ fn resolve_subqueries(
             right: Box::new(resolve_subqueries(ctx, right, tables)?),
         }),
         Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(resolve_subqueries(ctx, inner, tables)?),
         }),
         Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
@@ -2237,7 +2331,9 @@ fn inject_predicates_into_query(query: &Query, preds: &[Expr]) -> Query {
     if preds.is_empty() {
         return q;
     }
-    let new_pred = join_conjunction(preds.to_vec()).unwrap();
+    let Some(new_pred) = join_conjunction(preds.to_vec()) else {
+        return q;
+    };
     if let SetExpr::Select(ref mut select) = *q.body {
         select.selection = Some(match select.selection.take() {
             Some(existing) => Expr::BinaryOp {
@@ -2343,7 +2439,7 @@ fn extract_projection_aliases(
 enum OrderByItem {
     Name(String),
     Position(usize), // 1-based index
-    Expression(Expr),
+    Expression(Box<Expr>),
 }
 
 /// Extract ORDER BY items from the query.
@@ -2366,7 +2462,7 @@ fn extract_order_by(query: &Query) -> Result<Vec<(OrderByItem, bool, Option<bool
                         }
                         OrderByItem::Position(pos)
                     }
-                    other => OrderByItem::Expression(other.clone()),
+                    other => OrderByItem::Expression(Box::new(other.clone())),
                 };
                 let desc = ob.asc.map(|asc| !asc).unwrap_or(false);
                 // ob.nulls_first: Some(true)=NULLS FIRST, Some(false)=NULLS LAST, None=default
@@ -2409,7 +2505,7 @@ fn plan_order_by(
                     ))
                 })?;
                 // Use actual table column name, not the SQL alias
-                g.scan(&table_col_names[idx])
+                g.scan(&table_col_names[idx])?
             }
             OrderByItem::Position(pos) => {
                 if *pos > result_aliases.len() {
@@ -2419,9 +2515,9 @@ fn plan_order_by(
                         result_aliases.len()
                     )));
                 }
-                g.scan(&table_col_names[*pos - 1])
+                g.scan(&table_col_names[*pos - 1])?
             }
-            OrderByItem::Expression(expr) => plan_expr(g, expr, &schema)?,
+            OrderByItem::Expression(expr) => plan_expr(g, expr.as_ref(), &schema)?,
         };
         sort_keys.push(key);
         descs.push(*desc);
@@ -2437,7 +2533,7 @@ fn plan_order_by(
     } else {
         None // let C-side apply defaults
     };
-    Ok(g.sort(input, &sort_keys, &descs, nf))
+    Ok(g.sort(input, &sort_keys, &descs, nf)?)
 }
 
 /// Extract LIMIT value.

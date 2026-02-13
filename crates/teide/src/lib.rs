@@ -24,7 +24,7 @@ mod ffi {
 // Public API types
 // ---------------------------------------------------------------------------
 
-/// Error codes returned by the Teide engine.
+/// Error values returned by the Teide engine or by wrapper-level input/runtime checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Oom,
@@ -37,6 +37,8 @@ pub enum Error {
     Io,
     Schema,
     Corrupt,
+    InvalidInput,
+    RuntimeUnavailable,
 }
 
 impl Error {
@@ -70,6 +72,8 @@ impl std::fmt::Display for Error {
             Error::Io => "I/O error",
             Error::Schema => "schema error",
             Error::Corrupt => "corrupt data",
+            Error::InvalidInput => "invalid input",
+            Error::RuntimeUnavailable => "engine runtime is not available",
         };
         f.write_str(s)
     }
@@ -253,6 +257,11 @@ fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
     }
 }
 
+fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
+    let lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
+    lock.upgrade().ok_or(Error::RuntimeUnavailable)
+}
+
 // ---------------------------------------------------------------------------
 // Context — manages global engine state (arena, sym table, thread pool)
 // ---------------------------------------------------------------------------
@@ -285,7 +294,7 @@ impl Context {
 
     /// Read a CSV file into a `Table`.
     pub fn read_csv(&self, path: &str) -> Result<Table> {
-        let c_path = CString::new(path).map_err(|_| Error::Io)?;
+        let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
         let ptr = unsafe { ffi::td_csv_read(c_path.as_ptr()) };
         let ptr = check_ptr(ptr)?;
         Ok(Table {
@@ -297,7 +306,7 @@ impl Context {
 
     /// Read a CSV file with custom options.
     pub fn read_csv_opts(&self, path: &str, delimiter: char, header: bool) -> Result<Table> {
-        let c_path = CString::new(path).map_err(|_| Error::Io)?;
+        let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
         let ptr = unsafe {
             ffi::td_csv_read_opts(c_path.as_ptr(), delimiter as std::os::raw::c_char, header)
         };
@@ -339,13 +348,18 @@ impl Table {
     /// # Safety
     /// `raw` must be a valid Teide `td_t*` table pointer obtained from the same
     /// initialized engine runtime.
-    pub unsafe fn from_raw(raw: *mut ffi::td_t) -> Self {
-        let engine = acquire_engine_guard().expect("engine runtime is not available");
-        Table {
+    ///
+    /// Returns `Error::RuntimeUnavailable` if no active engine runtime exists.
+    pub unsafe fn from_raw(raw: *mut ffi::td_t) -> Result<Self> {
+        if raw.is_null() {
+            return Err(Error::Corrupt);
+        }
+        let engine = acquire_existing_engine_guard()?;
+        Ok(Table {
             raw,
             engine,
             _not_send_sync: PhantomData,
-        }
+        })
     }
 
     /// Create a shared reference to this table by incrementing the C ref count.
@@ -403,16 +417,43 @@ impl Table {
 
     /// Create a new table with the same column data but renamed columns.
     /// `names` must have exactly `ncols()` entries.
-    pub fn with_column_names(&self, names: &[String]) -> Self {
+    pub fn with_column_names(&self, names: &[String]) -> Result<Self> {
         let nc = self.ncols() as usize;
-        assert_eq!(names.len(), nc);
+        if names.len() != nc {
+            return Err(Error::Length);
+        }
         unsafe {
             let mut new_raw = ffi::td_table_new(nc as i64);
+            if new_raw.is_null() {
+                return Err(Error::Oom);
+            }
+            if ffi::td_is_err(new_raw) {
+                return Err(Error::from_code(ffi::td_err_code(new_raw)));
+            }
             for (i, name) in names.iter().enumerate().take(nc) {
                 let col = ffi::td_table_get_col_idx(self.raw, i as i64);
+                if col.is_null() {
+                    ffi::td_release(new_raw);
+                    return Err(Error::Corrupt);
+                }
+                if ffi::td_is_err(col) {
+                    let err = Error::from_code(ffi::td_err_code(col));
+                    ffi::td_release(new_raw);
+                    return Err(err);
+                }
                 let name_id = sym_intern(name);
                 ffi::td_retain(col);
-                new_raw = ffi::td_table_add_col(new_raw, name_id, col);
+                let next_raw = ffi::td_table_add_col(new_raw, name_id, col);
+                if next_raw.is_null() {
+                    ffi::td_release(new_raw);
+                    return Err(Error::Oom);
+                }
+                if ffi::td_is_err(next_raw) {
+                    let err = Error::from_code(ffi::td_err_code(next_raw));
+                    ffi::td_release(new_raw);
+                    return Err(err);
+                }
+                new_raw = next_raw;
             }
             Table::from_raw(new_raw)
         }
@@ -570,10 +611,11 @@ impl Graph<'_> {
     // ---- Source ops -------------------------------------------------------
 
     /// Scan a column by name from the bound table.
-    pub fn scan(&self, col_name: &str) -> Column {
-        let c_name = CString::new(col_name).expect("column name must not contain NUL");
+    /// Returns `Error::InvalidInput` when `col_name` contains interior NUL bytes.
+    pub fn scan(&self, col_name: &str) -> Result<Column> {
+        let c_name = CString::new(col_name).map_err(|_| Error::InvalidInput)?;
         let raw = unsafe { ffi::td_scan(self.raw, c_name.as_ptr()) };
-        Column { raw }
+        Ok(Column { raw })
     }
 
     /// Create a constant f64 node.
@@ -598,11 +640,12 @@ impl Graph<'_> {
     }
 
     /// Create a constant string node.
-    pub fn const_str(&self, val: &str) -> Column {
-        let c_val = CString::new(val).expect("string must not contain NUL");
-        Column {
+    /// Returns `Error::InvalidInput` when `val` contains interior NUL bytes.
+    pub fn const_str(&self, val: &str) -> Result<Column> {
+        let c_val = CString::new(val).map_err(|_| Error::InvalidInput)?;
+        Ok(Column {
             raw: unsafe { ffi::td_const_str(self.raw, c_val.as_ptr()) },
-        }
+        })
     }
 
     /// Create a constant DataFrame node referencing a table.
@@ -853,12 +896,10 @@ impl Graph<'_> {
         keys: &[Column],
         agg_ops: &[AggOp],
         agg_inputs: &[Column],
-    ) -> Column {
-        assert_eq!(
-            agg_ops.len(),
-            agg_inputs.len(),
-            "agg_ops and agg_inputs must have the same length"
-        );
+    ) -> Result<Column> {
+        if agg_ops.len() != agg_inputs.len() {
+            return Err(Error::Length);
+        }
 
         let mut key_ptrs: Vec<*mut ffi::td_op_t> = keys.iter().map(|c| c.raw).collect();
         let mut ops: Vec<u16> = agg_ops.iter().map(|op| op.to_opcode()).collect();
@@ -878,7 +919,7 @@ impl Graph<'_> {
         self._pinned.push(Box::new(key_ptrs));
         self._pinned.push(Box::new(ops));
         self._pinned.push(Box::new(input_ptrs));
-        Column { raw }
+        Ok(Column { raw })
     }
 
     /// Hash join.
@@ -889,8 +930,10 @@ impl Graph<'_> {
         right_df: Column,
         right_keys: &[Column],
         join_type: u8,
-    ) -> Column {
-        assert_eq!(left_keys.len(), right_keys.len(), "join key count must match");
+    ) -> Result<Column> {
+        if left_keys.len() != right_keys.len() {
+            return Err(Error::Length);
+        }
         let mut lk: Vec<*mut ffi::td_op_t> = left_keys.iter().map(|c| c.raw).collect();
         let mut rk: Vec<*mut ffi::td_op_t> = right_keys.iter().map(|c| c.raw).collect();
         let raw = unsafe {
@@ -906,7 +949,7 @@ impl Graph<'_> {
         };
         self._pinned.push(Box::new(lk));
         self._pinned.push(Box::new(rk));
-        Column { raw }
+        Ok(Column { raw })
     }
 
     /// Multi-column sort.
@@ -916,18 +959,18 @@ impl Graph<'_> {
         keys: &[Column],
         descs: &[bool],
         nulls_first: Option<&[bool]>,
-    ) -> Column {
-        assert_eq!(
-            keys.len(),
-            descs.len(),
-            "keys and descs must have the same length"
-        );
+    ) -> Result<Column> {
+        if keys.len() != descs.len() {
+            return Err(Error::Length);
+        }
 
         let mut key_ptrs: Vec<*mut ffi::td_op_t> = keys.iter().map(|c| c.raw).collect();
         let mut desc_u8: Vec<u8> = descs.iter().map(|&d| d as u8).collect();
 
         let nf_ptr = if let Some(nf) = nulls_first {
-            assert_eq!(keys.len(), nf.len(), "nulls_first must match keys length");
+            if keys.len() != nf.len() {
+                return Err(Error::Length);
+            }
             let mut nf_u8: Vec<u8> = nf.iter().map(|&n| n as u8).collect();
             let ptr = nf_u8.as_mut_ptr();
             self._pinned.push(Box::new(nf_u8));
@@ -949,7 +992,7 @@ impl Graph<'_> {
         // Pin arrays — td_sort_op stores pointers to them
         self._pinned.push(Box::new(key_ptrs));
         self._pinned.push(Box::new(desc_u8));
-        Column { raw }
+        Ok(Column { raw })
     }
 
     /// Window function computation.
@@ -970,17 +1013,13 @@ impl Graph<'_> {
         frame_type: FrameType,
         frame_start: FrameBound,
         frame_end: FrameBound,
-    ) -> Column {
-        assert_eq!(
-            order_keys.len(),
-            order_descs.len(),
-            "order_keys and order_descs must have the same length"
-        );
-        assert_eq!(
-            funcs.len(),
-            func_inputs.len(),
-            "funcs and func_inputs must have the same length"
-        );
+    ) -> Result<Column> {
+        if order_keys.len() != order_descs.len() {
+            return Err(Error::Length);
+        }
+        if funcs.len() != func_inputs.len() {
+            return Err(Error::Length);
+        }
 
         let mut pk_ptrs: Vec<*mut ffi::td_op_t> = part_keys.iter().map(|c| c.raw).collect();
         let mut ok_ptrs: Vec<*mut ffi::td_op_t> = order_keys.iter().map(|c| c.raw).collect();
@@ -1016,7 +1055,7 @@ impl Graph<'_> {
         self._pinned.push(Box::new(kinds));
         self._pinned.push(Box::new(fi_ptrs));
         self._pinned.push(Box::new(params));
-        Column { raw }
+        Ok(Column { raw })
     }
 
     /// Project (select) specific columns from a DataFrame node.
@@ -1061,11 +1100,12 @@ impl Graph<'_> {
     }
 
     /// Rename/alias a column.
-    pub fn alias(&self, input: Column, name: &str) -> Column {
-        let c_name = CString::new(name).expect("alias name must not contain NUL");
-        Column {
+    /// Returns `Error::InvalidInput` when `name` contains interior NUL bytes.
+    pub fn alias(&self, input: Column, name: &str) -> Result<Column> {
+        let c_name = CString::new(name).map_err(|_| Error::InvalidInput)?;
+        Ok(Column {
             raw: unsafe { ffi::td_alias(self.raw, input.raw, c_name.as_ptr()) },
-        }
+        })
     }
 
     // ---- Execute ----------------------------------------------------------

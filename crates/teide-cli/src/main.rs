@@ -56,7 +56,13 @@ fn main() {
 }
 
 fn run_single_query(sql: &str) {
-    let ctx = teide::Context::new().expect("Failed to init Teide engine");
+    let ctx = match teide::Context::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            std::process::exit(1);
+        }
+    };
     match teide_sql::execute_sql(&ctx, sql) {
         Ok(result) => print_result(&result, &OutputFormat::Table),
         Err(e) => {
@@ -71,7 +77,13 @@ fn run_sql_file(path: &PathBuf) {
         eprintln!("Error reading {}: {e}", path.display());
         std::process::exit(1);
     });
-    let mut session = teide_sql::Session::new().expect("Failed to init Teide engine");
+    let mut session = match teide_sql::Session::new() {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            std::process::exit(1);
+        }
+    };
     for stmt in contents.split(';') {
         let sql = stmt.trim();
         if sql.is_empty() {
@@ -90,7 +102,13 @@ fn run_sql_file(path: &PathBuf) {
 }
 
 fn run_repl(preload_csv: Option<&str>) {
-    let mut session = teide_sql::Session::new().expect("Failed to init Teide engine");
+    let mut session = match teide_sql::Session::new() {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            return;
+        }
+    };
 
     print_banner();
 
@@ -143,18 +161,33 @@ fn run_repl(preload_csv: Option<&str>) {
 
     // --- History ---
     let history_path = dirs_or_home().join(".teide_history");
-    let history = FileBackedHistory::with_file(1000, history_path.clone())
-        .expect("Failed to create history file");
+    let history = match FileBackedHistory::with_file(1000, history_path.clone()) {
+        Ok(history) => Some(history),
+        Err(e) => {
+            eprintln!(
+                "{}Warning: history disabled ({}): {}{}",
+                theme::ERROR,
+                history_path.display(),
+                e,
+                theme::R
+            );
+            None
+        }
+    };
 
     // --- Assemble editor ---
-    let mut editor = Reedline::create()
+    let editor = Reedline::create()
         .with_completer(Box::new(completer))
         .with_highlighter(Box::new(SqlHighlighter))
         .with_validator(Box::new(SqlValidator))
         .with_hinter(Box::new(hinter))
-        .with_history(Box::new(history))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(ide_menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
+    let mut editor = if let Some(history) = history {
+        editor.with_history(Box::new(history))
+    } else {
+        editor
+    };
 
     let prompt = SqlPrompt;
     let mut format = OutputFormat::Table;
@@ -251,7 +284,7 @@ fn update_tables(updater: &CompletionUpdater, session: &teide_sql::Session) {
             session.table_info(name).map(|(nrows, ncols)| TableInfo {
                 name: name.to_string(),
                 nrows: nrows as usize,
-                ncols: ncols as usize,
+                ncols,
             })
         })
         .collect();
@@ -600,7 +633,7 @@ fn print_json(result: &teide_sql::SqlResult) {
 fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
-        4 | 5 | 6 => match table.get_i64(col, row) {
+        4..=6 => match table.get_i64(col, row) {
             Some(v) => format!("{v}"),
             None => "NULL".to_string(),
         },
@@ -637,7 +670,7 @@ fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
 fn format_json_value(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
-        4 | 5 | 6 => match table.get_i64(col, row) {
+        4..=6 => match table.get_i64(col, row) {
             Some(v) => format!("{v}"),
             None => "null".to_string(),
         },
@@ -755,7 +788,7 @@ fn print_banner() {
     let tag_w = tag.chars().count();
     let help_w = help.chars().count();
     let w = tag_w.max(help_w);
-    let fill = if w > 11 { w - 11 } else { 0 };
+    let fill = w.saturating_sub(11);
     println!(
         "{BAN_BORDER}\u{256d}\u{2500} {BOLD}{BAN_TITLE}Teide SQL{R}{BAN_BORDER} \u{2500}{}\u{256e}{R}",
         "\u{2500}".repeat(fill)

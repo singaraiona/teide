@@ -112,6 +112,18 @@ fn select_columns() {
 }
 
 #[test]
+fn select_literal_scalar_rejected() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let err = match session.execute("SELECT 'x' as s FROM csv") {
+        Ok(_) => panic!("expected scalar literal projection to be rejected"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("scalar type"));
+}
+
+#[test]
 fn where_clause() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();
@@ -313,6 +325,19 @@ fn like_filter() {
 }
 
 #[test]
+fn ilike_filter() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT * FROM csv WHERE id1 ILIKE 'ID001'")
+            .unwrap(),
+    );
+    // Case-insensitive exact match: still 4 rows where id1='id001'
+    assert_eq!(r.table.nrows(), 4);
+}
+
+#[test]
 fn join_inner_sql() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (_left_file, left_path) = create_test_csv();
@@ -386,6 +411,54 @@ fn union_all() {
     );
     // v1=1 → 2 rows (rows 0,10); v1=2 → 2 rows (rows 1,11); total = 4
     assert_eq!(r.table.nrows(), 4);
+}
+
+#[test]
+fn union_all_literal_column_from_table() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let err = match session.execute(
+        "SELECT 'x' AS s FROM csv \
+         UNION ALL \
+         SELECT 'x' AS s FROM csv",
+    ) {
+        Ok(_) => panic!("expected UNION ALL literal-column rejection"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("scalar type"));
+}
+
+#[test]
+fn intersect_all_literal_column_from_table() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let err = match session.execute(
+        "SELECT 'x' AS s FROM csv \
+         INTERSECT ALL \
+         SELECT 'x' AS s FROM csv",
+    ) {
+        Ok(_) => panic!("expected INTERSECT ALL literal-column rejection"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("scalar type"));
+}
+
+#[test]
+fn except_all_literal_column_from_table() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let err = match session.execute(
+        "SELECT 'x' AS s FROM csv \
+         EXCEPT ALL \
+         SELECT 'x' AS s FROM csv",
+    ) {
+        Ok(_) => panic!("expected EXCEPT ALL literal-column rejection"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("scalar type"));
 }
 
 #[test]
@@ -889,7 +962,7 @@ fn window_row_number_sql() {
     // Each id1 partition (5 groups × 4 rows) → rn ∈ {1,2,3,4}
     for row in 0..r.table.nrows() as usize {
         let rn = r.table.get_i64(2, row).unwrap();
-        assert!(rn >= 1 && rn <= 4, "ROW_NUMBER should be 1..4, got {rn}");
+        assert!((1..=4).contains(&rn), "ROW_NUMBER should be 1..4, got {rn}");
     }
 }
 
@@ -923,7 +996,10 @@ fn window_dense_rank_sql() {
     assert_eq!(r.columns[2], "dr");
     for row in 0..r.table.nrows() as usize {
         let dr = r.table.get_i64(2, row).unwrap();
-        assert!(dr >= 1 && dr <= 3, "DENSE_RANK should be 1..3 (3 distinct id4 values), got {dr}");
+        assert!(
+            (1..=3).contains(&dr),
+            "DENSE_RANK should be 1..3 (3 distinct id4 values), got {dr}"
+        );
     }
 }
 
@@ -974,6 +1050,39 @@ fn window_no_partition_sql() {
     let mut rns: Vec<i64> = (0..20).map(|i| r.table.get_i64(1, i).unwrap()).collect();
     rns.sort();
     assert_eq!(rns, (1..=20).collect::<Vec<_>>());
+}
+
+#[test]
+fn window_mixed_specs_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1, id3, \
+                 ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY id3) as rn_part, \
+                 ROW_NUMBER() OVER (ORDER BY id3) as rn_all \
+                 FROM csv ORDER BY id3",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns.len(), 4);
+
+    let mut per_id1_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in 0..r.table.nrows() as usize {
+        let id1 = r.table.get_str(0, row).unwrap().to_string();
+        let rn_part = r.table.get_i64(2, row).unwrap();
+        let rn_all = r.table.get_i64(3, row).unwrap();
+
+        // ORDER BY id3 over full table: row_number must be strictly 1..20.
+        assert_eq!(rn_all, row as i64 + 1, "global row number mismatch at row {row}");
+
+        // PARTITION BY id1: row_number must increment per id1 partition.
+        let next = per_id1_counts.entry(id1).or_insert(0);
+        *next += 1;
+        assert_eq!(rn_part, *next, "partition row number mismatch at row {row}");
+    }
 }
 
 #[test]
@@ -1031,7 +1140,7 @@ fn window_ntile_sql() {
     // NTILE(4) over 20 rows → 5 per tile, tiles 1-4
     for row in 0..r.table.nrows() as usize {
         let tile = r.table.get_i64(1, row).unwrap();
-        assert!(tile >= 1 && tile <= 4, "NTILE(4) should be 1..4, got {tile}");
+        assert!((1..=4).contains(&tile), "NTILE(4) should be 1..4, got {tile}");
     }
 }
 

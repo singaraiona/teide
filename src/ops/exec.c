@@ -2888,6 +2888,78 @@ static inline void da_read_val(const void* ptr, int8_t type, int64_t r,
     }
 }
 
+/* ---- Scalar aggregate (n_keys==0): one flat scan, no GID, no hash ---- */
+typedef struct {
+    void**         agg_ptrs;
+    int8_t*        agg_types;
+    uint16_t*      agg_ops;
+    uint8_t        n_aggs;
+    uint8_t        need_flags;
+    const uint8_t* mask;
+    /* per-worker accumulators (1 slot each) */
+    da_accum_t*    accums;
+    uint32_t       n_accums;
+} scalar_ctx_t;
+
+/* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask) */
+static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    da_accum_t* acc = &c->accums[worker_id];
+    const int64_t* data = (const int64_t*)c->agg_ptrs[0];
+    int64_t sum = 0;
+    for (int64_t r = start; r < end; r++)
+        sum += data[r];
+    acc->i64[0] += sum;
+    acc->f64[0] += (double)sum;
+    acc->count[0] += end - start;
+}
+
+/* Tight SIMD-friendly loop for single SUM/AVG on f64 (no mask) */
+static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    da_accum_t* acc = &c->accums[worker_id];
+    const double* data = (const double*)c->agg_ptrs[0];
+    double sum = 0.0;
+    for (int64_t r = start; r < end; r++)
+        sum += data[r];
+    acc->f64[0] += sum;
+    acc->i64[0] += (int64_t)sum;
+    acc->count[0] += end - start;
+}
+
+/* Generic scalar accumulation: handles all ops, all types, mask */
+static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    da_accum_t* acc = &c->accums[worker_id];
+    uint8_t n_aggs = c->n_aggs;
+    const uint8_t* mask = c->mask;
+
+    for (int64_t r = start; r < end; r++) {
+        if (mask && !mask[r]) continue;
+        acc->count[0]++;
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            if (!c->agg_ptrs[a]) continue;
+            double fv; int64_t iv;
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+            uint16_t op = c->agg_ops[a];
+            if (op == OP_SUM || op == OP_AVG) {
+                acc->f64[a] += fv;
+                acc->i64[a] += iv;
+            } else if (op == OP_FIRST) {
+                if (acc->count[0] == 1) { acc->f64[a] = fv; acc->i64[a] = iv; }
+            } else if (op == OP_LAST) {
+                acc->f64[a] = fv; acc->i64[a] = iv;
+            } else if (op == OP_MIN) {
+                if (fv < acc->min_f64[a]) acc->min_f64[a] = fv;
+                if (iv < acc->min_i64[a]) acc->min_i64[a] = iv;
+            } else if (op == OP_MAX) {
+                if (fv > acc->max_f64[a]) acc->max_f64[a] = fv;
+                if (iv > acc->max_i64[a]) acc->max_i64[a] = iv;
+            }
+        }
+    }
+}
+
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     da_ctx_t* c = (da_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
@@ -3048,6 +3120,155 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         }
     }
 
+    /* ---- Scalar aggregate fast path (n_keys == 0): flat vector scan ---- */
+    if (n_keys == 0 && nrows > 0) {
+        uint8_t need_flags = DA_NEED_COUNT;
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            uint16_t op = ext->agg_ops[a];
+            if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST)
+                need_flags |= DA_NEED_SUM;
+            else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
+            else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
+        }
+
+        void* agg_ptrs[n_aggs];
+        int8_t agg_types[n_aggs];
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            if (agg_vecs[a]) {
+                agg_ptrs[a]  = td_data(agg_vecs[a]);
+                agg_types[a] = agg_vecs[a]->type;
+            } else {
+                agg_ptrs[a]  = NULL;
+                agg_types[a] = 0;
+            }
+        }
+
+        td_pool_t* sc_pool = td_pool_get();
+        uint32_t sc_n = (sc_pool && nrows >= TD_PARALLEL_THRESHOLD)
+                        ? td_pool_total_workers(sc_pool) : 1;
+
+        td_t* sc_hdr;
+        da_accum_t* sc_acc = (da_accum_t*)scratch_calloc(&sc_hdr,
+            sc_n * sizeof(da_accum_t));
+        if (!sc_acc) goto da_path;
+
+        /* Allocate 1-slot accumulators per worker (n_aggs entries) */
+        bool alloc_ok = true;
+        for (uint32_t w = 0; w < sc_n; w++) {
+            if (need_flags & DA_NEED_SUM) {
+                sc_acc[w].f64 = (double*)scratch_calloc(&sc_acc[w]._h_f64,
+                    n_aggs * sizeof(double));
+                sc_acc[w].i64 = (int64_t*)scratch_calloc(&sc_acc[w]._h_i64,
+                    n_aggs * sizeof(int64_t));
+                if (!sc_acc[w].f64 || !sc_acc[w].i64) { alloc_ok = false; break; }
+            }
+            if (need_flags & DA_NEED_MIN) {
+                sc_acc[w].min_f64 = (double*)scratch_alloc(&sc_acc[w]._h_min_f64,
+                    n_aggs * sizeof(double));
+                sc_acc[w].min_i64 = (int64_t*)scratch_alloc(&sc_acc[w]._h_min_i64,
+                    n_aggs * sizeof(int64_t));
+                if (!sc_acc[w].min_f64 || !sc_acc[w].min_i64) { alloc_ok = false; break; }
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    sc_acc[w].min_f64[a] = DBL_MAX;
+                    sc_acc[w].min_i64[a] = INT64_MAX;
+                }
+            }
+            if (need_flags & DA_NEED_MAX) {
+                sc_acc[w].max_f64 = (double*)scratch_alloc(&sc_acc[w]._h_max_f64,
+                    n_aggs * sizeof(double));
+                sc_acc[w].max_i64 = (int64_t*)scratch_alloc(&sc_acc[w]._h_max_i64,
+                    n_aggs * sizeof(int64_t));
+                if (!sc_acc[w].max_f64 || !sc_acc[w].max_i64) { alloc_ok = false; break; }
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    sc_acc[w].max_f64[a] = -DBL_MAX;
+                    sc_acc[w].max_i64[a] = INT64_MIN;
+                }
+            }
+            sc_acc[w].count = (int64_t*)scratch_calloc(&sc_acc[w]._h_count,
+                1 * sizeof(int64_t));
+            if (!sc_acc[w].count) { alloc_ok = false; break; }
+        }
+        if (!alloc_ok) {
+            for (uint32_t w = 0; w < sc_n; w++) da_accum_free(&sc_acc[w]);
+            scratch_free(sc_hdr);
+            goto da_path;
+        }
+
+        scalar_ctx_t sc_ctx = {
+            .agg_ptrs   = agg_ptrs,
+            .agg_types  = agg_types,
+            .agg_ops    = ext->agg_ops,
+            .n_aggs     = n_aggs,
+            .need_flags = need_flags,
+            .mask       = mask,
+            .accums     = sc_acc,
+            .n_accums   = sc_n,
+        };
+
+        /* Pick specialized tight loop when possible, else generic */
+        typedef void (*scalar_fn_t)(void*, uint32_t, int64_t, int64_t);
+        scalar_fn_t sc_fn = scalar_accum_fn;
+        if (n_aggs == 1 && !mask && agg_ptrs[0] != NULL) {
+            uint16_t op0 = ext->agg_ops[0];
+            int8_t   t0  = agg_types[0];
+            if ((op0 == OP_SUM || op0 == OP_AVG) &&
+                (t0 == TD_I64 || t0 == TD_SYM || t0 == TD_TIMESTAMP))
+                sc_fn = scalar_sum_i64_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == TD_F64)
+                sc_fn = scalar_sum_f64_fn;
+        }
+
+        if (sc_n > 1)
+            td_pool_dispatch(sc_pool, sc_fn, &sc_ctx, nrows);
+        else
+            sc_fn(&sc_ctx, 0, 0, nrows);
+
+        /* Merge per-worker accumulators into sc_acc[0] */
+        da_accum_t* m = &sc_acc[0];
+        for (uint32_t w = 1; w < sc_n; w++) {
+            da_accum_t* wa = &sc_acc[w];
+            if (need_flags & DA_NEED_SUM) {
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    m->f64[a] += wa->f64[a];
+                    m->i64[a] += wa->i64[a];
+                }
+            }
+            if (need_flags & DA_NEED_MIN) {
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    if (wa->min_f64[a] < m->min_f64[a]) m->min_f64[a] = wa->min_f64[a];
+                    if (wa->min_i64[a] < m->min_i64[a]) m->min_i64[a] = wa->min_i64[a];
+                }
+            }
+            if (need_flags & DA_NEED_MAX) {
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    if (wa->max_f64[a] > m->max_f64[a]) m->max_f64[a] = wa->max_f64[a];
+                    if (wa->max_i64[a] > m->max_i64[a]) m->max_i64[a] = wa->max_i64[a];
+                }
+            }
+            m->count[0] += wa->count[0];
+        }
+        for (uint32_t w = 1; w < sc_n; w++) da_accum_free(&sc_acc[w]);
+
+        /* Emit 1-row result with no key columns */
+        td_t* result = td_table_new(n_aggs);
+        if (!result || TD_IS_ERR(result)) {
+            da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
+            return result ? result : TD_ERR_PTR(TD_ERR_OOM);
+        }
+
+        emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
+                         m->f64, m->i64, m->min_f64, m->max_f64,
+                         m->min_i64, m->max_i64, m->count);
+
+        da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
+        for (uint8_t a = 0; a < n_aggs; a++)
+            if (agg_owned[a] && agg_vecs[a]) td_release(agg_vecs[a]);
+        for (uint8_t k = 0; k < n_keys; k++)
+            if (key_owned[k] && key_vecs[k]) td_release(key_vecs[k]);
+        return result;
+    }
+
+da_path:;
     /* ---- Direct-array fast path for low-cardinality integer keys ---- */
     /* Supports multi-key via composite index: product of ranges <= MAX */
     #define DA_MAX_COMPOSITE_SLOTS 262144  /* 256K slots max */

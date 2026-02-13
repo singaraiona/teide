@@ -183,25 +183,27 @@ fn run_repl(preload_csv: Option<&str>) {
                 let start = std::time::Instant::now();
                 match session.execute(sql) {
                     Ok(teide_sql::ExecResult::Query(result)) => {
+                        let elapsed = start.elapsed();
                         update_columns(&comp_updater, &result);
                         print_result(&result, &format);
                         if show_timer {
                             eprintln!(
                                 "{}Run Time: {:.3}s{}",
                                 theme::TIMER,
-                                start.elapsed().as_secs_f64(),
+                                elapsed.as_secs_f64(),
                                 theme::R
                             );
                         }
                     }
                     Ok(teide_sql::ExecResult::Ddl(msg)) => {
+                        let elapsed = start.elapsed();
                         println!("{}{msg}{}", theme::SUCCESS, theme::R);
                         update_tables(&comp_updater, &session);
                         if show_timer {
                             eprintln!(
                                 "{}Run Time: {:.3}s{}",
                                 theme::TIMER,
-                                start.elapsed().as_secs_f64(),
+                                elapsed.as_secs_f64(),
                                 theme::R
                             );
                         }
@@ -319,7 +321,9 @@ fn type_name(typ: i8) -> &'static str {
 
 fn print_table(result: &teide_sql::SqlResult) {
     use std::fmt::Write;
+    use std::io::Write as IoWrite;
     use theme::*;
+    let mut out = String::with_capacity(4096);
 
     let table = &result.table;
     let nrows = table.nrows() as usize;
@@ -433,7 +437,7 @@ fn print_table(result: &teide_sql::SqlResult) {
             }
             buf.push($right);
             buf.push_str(R);
-            println!("{buf}");
+            let _ = writeln!(out, "{buf}");
         }};
     }
 
@@ -454,7 +458,7 @@ fn print_table(result: &teide_sql::SqlResult) {
     buf.push_str(BORDER);
     buf.push('\u{2502}');
     buf.push_str(R);
-    println!("{buf}");
+    let _ = writeln!(out, "{buf}");
 
     buf.clear();
     for c in 0..ncols {
@@ -471,7 +475,7 @@ fn print_table(result: &teide_sql::SqlResult) {
     buf.push_str(BORDER);
     buf.push('\u{2502}');
     buf.push_str(R);
-    println!("{buf}");
+    let _ = writeln!(out, "{buf}");
 
     hline!('\u{251c}', '\u{253c}', '\u{2524}');
 
@@ -501,7 +505,7 @@ fn print_table(result: &teide_sql::SqlResult) {
         buf.push_str(BORDER);
         buf.push('\u{2502}');
         buf.push_str(R);
-        println!("{buf}");
+        let _ = writeln!(out, "{buf}");
     }
 
     hline!('\u{251c}', '\u{2534}', '\u{2524}');
@@ -513,7 +517,7 @@ fn print_table(result: &teide_sql::SqlResult) {
         "{BORDER}\u{2502}{R} {FOOTER}{footer_left}{:pad$}{footer_right}{R} {BORDER}\u{2502}{R}",
         ""
     );
-    println!("{buf}");
+    let _ = writeln!(out, "{buf}");
 
     buf.clear();
     buf.push_str(BORDER);
@@ -523,7 +527,12 @@ fn print_table(result: &teide_sql::SqlResult) {
     }
     buf.push('\u{2518}');
     buf.push_str(R);
-    println!("{buf}");
+    let _ = writeln!(out, "{buf}");
+
+    // Single write to stdout — avoids per-line flush overhead on terminals
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(out.as_bytes());
 }
 
 fn print_csv(result: &teide_sql::SqlResult) {
@@ -723,7 +732,7 @@ fn handle_dot_command(
             }
         }
         ".help" => print_help(),
-        ".quit" | ".exit" => std::process::exit(0),
+        ".quit" => std::process::exit(0),
         _ => println!(
             "{ERROR}Unknown command: {}. Type .help for commands.{R}",
             parts[0]

@@ -810,7 +810,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                                         &row_offsets, &row_offsets_hdr);
 
     if (n_rows == 0) {
-        /* Empty file → empty DataFrame */
+        /* Empty file → empty table */
         td_t* df = td_table_new(ncols);
         if (!df || TD_IS_ERR(df)) goto fail_unmap;
         for (int c = 0; c < ncols; c++) {
@@ -928,7 +928,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
         }
     }
 
-    /* ---- 11. Build DataFrame ---- */
+    /* ---- 11. Build table ---- */
     {
         td_t* df = td_table_new(ncols);
         if (!df || TD_IS_ERR(df)) {

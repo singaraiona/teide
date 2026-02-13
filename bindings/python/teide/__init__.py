@@ -166,7 +166,7 @@ class TeideLib:
         lib.td_str_len.argtypes = [c_td_p]
         lib.td_str_len.restype = ctypes.c_size_t
 
-        # ===== DataFrame API =====
+        # ===== Table API =====
         lib.td_table_new.argtypes = [ctypes.c_int64]
         lib.td_table_new.restype = c_td_p
 
@@ -211,8 +211,8 @@ class TeideLib:
         lib.td_const_vec.argtypes = [c_graph_p, c_td_p]
         lib.td_const_vec.restype = c_op_p
 
-        lib.td_const_df.argtypes = [c_graph_p, c_td_p]
-        lib.td_const_df.restype = c_op_p
+        lib.td_const_table.argtypes = [c_graph_p, c_td_p]
+        lib.td_const_table.restype = c_op_p
 
         # ===== Element-wise Ops =====
         for name in ['td_add', 'td_sub', 'td_mul', 'td_div', 'td_mod',
@@ -239,7 +239,7 @@ class TeideLib:
         lib.td_filter.argtypes = [c_graph_p, c_op_p, c_op_p]
         lib.td_filter.restype = c_op_p
 
-        # Sort: (graph, df_node, keys**, descs*, nulls_first*, n_cols)
+        # Sort: (graph, table_node, keys**, descs*, nulls_first*, n_cols)
         lib.td_sort_op.argtypes = [c_graph_p, c_op_p,
                                     ctypes.POINTER(c_op_p),
                                     ctypes.POINTER(ctypes.c_uint8),
@@ -335,8 +335,8 @@ class TeideLib:
     def const_vec(self, g, vec):
         return self._lib.td_const_vec(g, vec)
 
-    def const_df(self, g, df):
-        return self._lib.td_const_df(g, df)
+    def const_table(self, g, df):
+        return self._lib.td_const_table(g, df)
 
     def add(self, g, a, b):  return self._lib.td_add(g, a, b)
     def sub(self, g, a, b):  return self._lib.td_sub(g, a, b)
@@ -363,12 +363,12 @@ class TeideLib:
     def filter(self, g, input_op, pred):
         return self._lib.td_filter(g, input_op, pred)
 
-    def sort_op(self, g, df_node, keys, descs, nulls_first=None):
+    def sort_op(self, g, table_node, keys, descs, nulls_first=None):
         n = len(keys)
         keys_arr = (c_op_p * n)(*keys)
         descs_arr = (ctypes.c_uint8 * n)(*descs)
         nf = (ctypes.c_uint8 * n)(*nulls_first) if nulls_first else None
-        return self._lib.td_sort_op(g, df_node, keys_arr, descs_arr, nf, n)
+        return self._lib.td_sort_op(g, table_node, keys_arr, descs_arr, nf, n)
 
     def group(self, g, keys, agg_ops, agg_ins):
         n_keys = len(keys)
@@ -378,11 +378,11 @@ class TeideLib:
         ins_arr = (c_op_p * n_aggs)(*agg_ins)
         return self._lib.td_group(g, keys_arr, n_keys, ops_arr, ins_arr, n_aggs)
 
-    def join(self, g, left_df, left_keys, right_df, right_keys, join_type=0):
+    def join(self, g, left_table, left_keys, right_table, right_keys, join_type=0):
         n = len(left_keys)
         lk = (c_op_p * n)(*left_keys)
         rk = (c_op_p * n)(*right_keys)
-        return self._lib.td_join(g, left_df, lk, right_df, rk, n, join_type)
+        return self._lib.td_join(g, left_table, lk, right_table, rk, n, join_type)
 
     def head(self, g, input_op, n):
         return self._lib.td_head(g, input_op, n)

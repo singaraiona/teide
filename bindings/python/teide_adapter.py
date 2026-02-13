@@ -47,11 +47,11 @@ class AdapterResult:
 
 
 def const_col(lib, g, df_ptr, name):
-    """Extract a column from a DataFrame and wrap as td_const_vec node."""
+    """Extract a column from a table and wrap as td_const_vec node."""
     name_id = lib.sym_intern(name)
     col_vec = lib._lib.td_table_get_col(df_ptr, name_id)
     if not col_vec:
-        raise ValueError(f"Column '{name}' not found in DataFrame")
+        raise ValueError(f"Column '{name}' not found in table")
     return lib.const_vec(g, col_vec)
 
 
@@ -297,8 +297,8 @@ class TeideAdapter:
 
         g = lib.graph_new(left_ptr)
         try:
-            left_df_node = lib.const_df(g, left_ptr)
-            right_df_node = lib.const_df(g, right_ptr)
+            left_table_node = lib.const_table(g, left_ptr)
+            right_table_node = lib.const_table(g, right_ptr)
 
             left_keys = [lib.scan(g, "id1"), lib.scan(g, "id2")]
             right_keys = [
@@ -310,8 +310,8 @@ class TeideAdapter:
             lk_arr = (ctypes.c_void_p * n_keys)(*left_keys)
             rk_arr = (ctypes.c_void_p * n_keys)(*right_keys)
 
-            root = lib._lib.td_join(g, left_df_node, lk_arr,
-                                    right_df_node, rk_arr, n_keys, join_type)
+            root = lib._lib.td_join(g, left_table_node, lk_arr,
+                                    right_table_node, rk_arr, n_keys, join_type)
             root = lib.optimize(g, root)
             result = lib.execute(g, root)
             if not result or result < 32:
@@ -345,14 +345,14 @@ class TeideAdapter:
 
         g = lib.graph_new(df_ptr)
         try:
-            df_node = lib.const_df(g, df_ptr)
+            table_node = lib.const_table(g, df_ptr)
             n_cols = len(col_names)
             keys = [lib.scan(g, name) for name in col_names]
 
             keys_arr = (ctypes.c_void_p * n_cols)(*keys)
             descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])
 
-            root = lib._lib.td_sort_op(g, df_node, keys_arr, descs_arr, n_cols)
+            root = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, n_cols)
             root = lib.optimize(g, root)
             result = lib.execute(g, root)
             if not result or result < 32:

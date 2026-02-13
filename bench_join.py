@@ -40,14 +40,14 @@ X_CSV = os.path.join(JOIN_DIR, "J1_1e7_NA_0_0.csv")
 Y_CSV = os.path.join(JOIN_DIR, "J1_1e7_1e7_0_0.csv")
 
 
-def run_join(lib, left_df, right_df, label, key_names, join_type):
+def run_join(lib, left_table, right_table, label, key_names, join_type):
     """Run a join benchmark.
     join_type: 0=INNER, 1=LEFT
     """
-    g = lib.graph_new(left_df)
+    g = lib.graph_new(left_table)
     try:
-        left_node = lib.const_df(g, left_df)
-        right_node = lib.const_df(g, right_df)
+        left_node = lib.const_table(g, left_table)
+        right_node = lib.const_table(g, right_table)
 
         left_keys = [lib.scan(g, k) for k in key_names]
 
@@ -55,7 +55,7 @@ def run_join(lib, left_df, right_df, label, key_names, join_type):
         right_keys = []
         for k in key_names:
             name_id = lib.sym_intern(k)
-            col_vec = lib._lib.td_table_get_col(right_df, name_id)
+            col_vec = lib._lib.td_table_get_col(right_table, name_id)
             right_keys.append(lib.const_vec(g, col_vec))
 
         root = lib.join(g, left_node, left_keys, right_node, right_keys, join_type)

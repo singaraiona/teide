@@ -40,152 +40,152 @@ static void table_teardown(void* fixture) {
     td_arena_destroy_all();
 }
 
-/* ---- df_new ------------------------------------------------------------ */
+/* ---- table_new ------------------------------------------------------------ */
 
 static MunitResult test_table_new(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
-    munit_assert_ptr_not_null(df);
-    munit_assert_false(TD_IS_ERR(df));
-    munit_assert_int(df->type, ==, TD_TABLE);
-    munit_assert_int(td_table_ncols(df), ==, 0);
+    td_t* tbl = td_table_new(4);
+    munit_assert_ptr_not_null(tbl);
+    munit_assert_false(TD_IS_ERR(tbl));
+    munit_assert_int(tbl->type, ==, TD_TABLE);
+    munit_assert_int(td_table_ncols(tbl), ==, 0);
 
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_add_col -------------------------------------------------------- */
+/* ---- table_add_col -------------------------------------------------------- */
 
 static MunitResult test_table_add_col(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
-    munit_assert_ptr_not_null(df);
+    td_t* tbl = td_table_new(4);
+    munit_assert_ptr_not_null(tbl);
 
     int64_t name_id = td_sym_intern("x", 1);
     int64_t raw[] = {10, 20, 30};
     td_t* col = td_vec_from_raw(TD_I64, raw, 3);
     munit_assert_ptr_not_null(col);
 
-    df = td_table_add_col(df, name_id, col);
-    munit_assert_false(TD_IS_ERR(df));
-    munit_assert_int(td_table_ncols(df), ==, 1);
+    tbl = td_table_add_col(tbl, name_id, col);
+    munit_assert_false(TD_IS_ERR(tbl));
+    munit_assert_int(td_table_ncols(tbl), ==, 1);
 
     td_release(col);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_get_col_by_name ------------------------------------------------ */
+/* ---- table_get_col_by_name ------------------------------------------------ */
 
 static MunitResult test_table_get_col_by_name(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
+    td_t* tbl = td_table_new(4);
     int64_t name_id = td_sym_intern("price", 5);
     double raw[] = {1.5, 2.5, 3.5};
     td_t* col = td_vec_from_raw(TD_F64, raw, 3);
 
-    df = td_table_add_col(df, name_id, col);
-    munit_assert_false(TD_IS_ERR(df));
+    tbl = td_table_add_col(tbl, name_id, col);
+    munit_assert_false(TD_IS_ERR(tbl));
 
-    td_t* got = td_table_get_col(df, name_id);
+    td_t* got = td_table_get_col(tbl, name_id);
     munit_assert_ptr_not_null(got);
     munit_assert_ptr_equal(got, col);
 
     /* Non-existent column returns NULL */
     int64_t other_id = td_sym_intern("missing", 7);
-    td_t* missing = td_table_get_col(df, other_id);
+    td_t* missing = td_table_get_col(tbl, other_id);
     munit_assert_null(missing);
 
     td_release(col);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_get_col_by_idx ------------------------------------------------- */
+/* ---- table_get_col_by_idx ------------------------------------------------- */
 
 static MunitResult test_table_get_col_by_idx(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
+    td_t* tbl = td_table_new(4);
     int64_t name_id = td_sym_intern("val", 3);
     int64_t raw[] = {100, 200};
     td_t* col = td_vec_from_raw(TD_I64, raw, 2);
 
-    df = td_table_add_col(df, name_id, col);
+    tbl = td_table_add_col(tbl, name_id, col);
 
-    td_t* got = td_table_get_col_idx(df, 0);
+    td_t* got = td_table_get_col_idx(tbl, 0);
     munit_assert_ptr_not_null(got);
     munit_assert_ptr_equal(got, col);
 
     /* Out of range */
-    td_t* oob = td_table_get_col_idx(df, 1);
+    td_t* oob = td_table_get_col_idx(tbl, 1);
     munit_assert_null(oob);
-    oob = td_table_get_col_idx(df, -1);
+    oob = td_table_get_col_idx(tbl, -1);
     munit_assert_null(oob);
 
     td_release(col);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_col_name ------------------------------------------------------- */
+/* ---- table_col_name ------------------------------------------------------- */
 
 static MunitResult test_table_col_name(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
+    td_t* tbl = td_table_new(4);
     int64_t id_a = td_sym_intern("alpha", 5);
     int64_t id_b = td_sym_intern("beta", 4);
     int64_t raw[] = {1, 2, 3};
     td_t* col_a = td_vec_from_raw(TD_I64, raw, 3);
     td_t* col_b = td_vec_from_raw(TD_I64, raw, 3);
 
-    df = td_table_add_col(df, id_a, col_a);
-    df = td_table_add_col(df, id_b, col_b);
+    tbl = td_table_add_col(tbl, id_a, col_a);
+    tbl = td_table_add_col(tbl, id_b, col_b);
 
-    munit_assert_int(td_table_col_name(df, 0), ==, id_a);
-    munit_assert_int(td_table_col_name(df, 1), ==, id_b);
+    munit_assert_int(td_table_col_name(tbl, 0), ==, id_a);
+    munit_assert_int(td_table_col_name(tbl, 1), ==, id_b);
 
     /* Out of range */
-    munit_assert_int(td_table_col_name(df, 2), ==, -1);
+    munit_assert_int(td_table_col_name(tbl, 2), ==, -1);
 
     td_release(col_a);
     td_release(col_b);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_nrows ---------------------------------------------------------- */
+/* ---- table_nrows ---------------------------------------------------------- */
 
 static MunitResult test_table_nrows(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
-    /* Empty df has 0 rows */
-    munit_assert_int(td_table_nrows(df), ==, 0);
+    td_t* tbl = td_table_new(4);
+    /* Empty tbl has 0 rows */
+    munit_assert_int(td_table_nrows(tbl), ==, 0);
 
     int64_t name_id = td_sym_intern("col1", 4);
     int64_t raw[] = {10, 20, 30, 40, 50};
     td_t* col = td_vec_from_raw(TD_I64, raw, 5);
 
-    df = td_table_add_col(df, name_id, col);
-    munit_assert_int(td_table_nrows(df), ==, 5);
+    tbl = td_table_add_col(tbl, name_id, col);
+    munit_assert_int(td_table_nrows(tbl), ==, 5);
 
     td_release(col);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_schema --------------------------------------------------------- */
+/* ---- table_schema --------------------------------------------------------- */
 
 static MunitResult test_table_schema(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(4);
-    td_t* schema = td_table_schema(df);
+    td_t* tbl = td_table_new(4);
+    td_t* schema = td_table_schema(tbl);
     munit_assert_ptr_not_null(schema);
     munit_assert_int(schema->type, ==, TD_I64);
     munit_assert_int(schema->len, ==, 0);  /* no columns yet */
@@ -193,24 +193,24 @@ static MunitResult test_table_schema(const void* params, void* fixture) {
     int64_t id_x = td_sym_intern("x", 1);
     int64_t raw[] = {1};
     td_t* col = td_vec_from_raw(TD_I64, raw, 1);
-    df = td_table_add_col(df, id_x, col);
+    tbl = td_table_add_col(tbl, id_x, col);
 
-    schema = td_table_schema(df);
+    schema = td_table_schema(tbl);
     munit_assert_int(schema->len, ==, 1);
     int64_t* ids = (int64_t*)td_data(schema);
     munit_assert_int(ids[0], ==, id_x);
 
     td_release(col);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 
-/* ---- df_multiple_cols -------------------------------------------------- */
+/* ---- table_multiple_cols -------------------------------------------------- */
 
 static MunitResult test_table_multiple_cols(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    td_t* df = td_table_new(8);
+    td_t* tbl = td_table_new(8);
 
     int64_t id_a = td_sym_intern("a", 1);
     int64_t id_b = td_sym_intern("b", 1);
@@ -224,33 +224,33 @@ static MunitResult test_table_multiple_cols(const void* params, void* fixture) {
     td_t* col_b = td_vec_from_raw(TD_F64, raw_b, 3);
     td_t* col_c = td_vec_from_raw(TD_BOOL, raw_c, 3);
 
-    df = td_table_add_col(df, id_a, col_a);
-    munit_assert_false(TD_IS_ERR(df));
-    df = td_table_add_col(df, id_b, col_b);
-    munit_assert_false(TD_IS_ERR(df));
-    df = td_table_add_col(df, id_c, col_c);
-    munit_assert_false(TD_IS_ERR(df));
+    tbl = td_table_add_col(tbl, id_a, col_a);
+    munit_assert_false(TD_IS_ERR(tbl));
+    tbl = td_table_add_col(tbl, id_b, col_b);
+    munit_assert_false(TD_IS_ERR(tbl));
+    tbl = td_table_add_col(tbl, id_c, col_c);
+    munit_assert_false(TD_IS_ERR(tbl));
 
-    munit_assert_int(td_table_ncols(df), ==, 3);
-    munit_assert_int(td_table_nrows(df), ==, 3);
+    munit_assert_int(td_table_ncols(tbl), ==, 3);
+    munit_assert_int(td_table_nrows(tbl), ==, 3);
 
     /* Verify by name */
-    munit_assert_ptr_equal(td_table_get_col(df, id_a), col_a);
-    munit_assert_ptr_equal(td_table_get_col(df, id_b), col_b);
-    munit_assert_ptr_equal(td_table_get_col(df, id_c), col_c);
+    munit_assert_ptr_equal(td_table_get_col(tbl, id_a), col_a);
+    munit_assert_ptr_equal(td_table_get_col(tbl, id_b), col_b);
+    munit_assert_ptr_equal(td_table_get_col(tbl, id_c), col_c);
 
     /* Verify by index */
-    munit_assert_ptr_equal(td_table_get_col_idx(df, 0), col_a);
-    munit_assert_ptr_equal(td_table_get_col_idx(df, 1), col_b);
-    munit_assert_ptr_equal(td_table_get_col_idx(df, 2), col_c);
+    munit_assert_ptr_equal(td_table_get_col_idx(tbl, 0), col_a);
+    munit_assert_ptr_equal(td_table_get_col_idx(tbl, 1), col_b);
+    munit_assert_ptr_equal(td_table_get_col_idx(tbl, 2), col_c);
 
     /* Verify column names */
-    munit_assert_int(td_table_col_name(df, 0), ==, id_a);
-    munit_assert_int(td_table_col_name(df, 1), ==, id_b);
-    munit_assert_int(td_table_col_name(df, 2), ==, id_c);
+    munit_assert_int(td_table_col_name(tbl, 0), ==, id_a);
+    munit_assert_int(td_table_col_name(tbl, 1), ==, id_b);
+    munit_assert_int(td_table_col_name(tbl, 2), ==, id_c);
 
     /* Verify schema */
-    td_t* schema = td_table_schema(df);
+    td_t* schema = td_table_schema(tbl);
     munit_assert_int(schema->len, ==, 3);
     int64_t* ids = (int64_t*)td_data(schema);
     munit_assert_int(ids[0], ==, id_a);
@@ -268,7 +268,7 @@ static MunitResult test_table_multiple_cols(const void* params, void* fixture) {
     td_release(col_a);
     td_release(col_b);
     td_release(col_c);
-    td_release(df);
+    td_release(tbl);
     return MUNIT_OK;
 }
 

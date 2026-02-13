@@ -27,10 +27,10 @@
 #include <math.h>
 
 /* --------------------------------------------------------------------------
- * Helper: create a test DataFrame with columns id1(I64), v1(I64), v3(F64)
+ * Helper: create a test table with columns id1(I64), v1(I64), v3(F64)
  * -------------------------------------------------------------------------- */
 
-static td_t* make_test_df(void) {
+static td_t* make_test_table(void) {
     td_sym_init();
 
     int64_t n = 10;
@@ -46,16 +46,16 @@ static td_t* make_test_df(void) {
     int64_t name_v1  = td_sym_intern("v1", 2);
     int64_t name_v3  = td_sym_intern("v3", 2);
 
-    td_t* df = td_table_new(3);
-    df = td_table_add_col(df, name_id1, id1_vec);
-    df = td_table_add_col(df, name_v1, v1_vec);
-    df = td_table_add_col(df, name_v3, v3_vec);
+    td_t* tbl = td_table_new(3);
+    tbl = td_table_add_col(tbl, name_id1, id1_vec);
+    tbl = td_table_add_col(tbl, name_v1, v1_vec);
+    tbl = td_table_add_col(tbl, name_v3, v3_vec);
 
     td_release(id1_vec);
     td_release(v1_vec);
     td_release(v3_vec);
 
-    return df;
+    return tbl;
 }
 
 /* --------------------------------------------------------------------------
@@ -66,10 +66,10 @@ static MunitResult test_scan_sum(const void* params, void* data) {
     (void)params; (void)data;
     td_arena_init();
 
-    td_t* df = make_test_df();
-    munit_assert_ptr_not_null(df);
+    td_t* tbl = make_test_table();
+    munit_assert_ptr_not_null(tbl);
 
-    td_graph_t* g = td_graph_new(df);
+    td_graph_t* g = td_graph_new(tbl);
     munit_assert_ptr_not_null(g);
 
     td_op_t* v1 = td_scan(g, "v1");
@@ -83,7 +83,7 @@ static MunitResult test_scan_sum(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -97,8 +97,8 @@ static MunitResult test_filter_count(const void* params, void* data) {
     (void)params; (void)data;
     td_arena_init();
 
-    td_t* df = make_test_df();
-    td_graph_t* g = td_graph_new(df);
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
 
     td_op_t* v1 = td_scan(g, "v1");
     td_op_t* threshold = td_const_i64(g, 50);
@@ -112,7 +112,7 @@ static MunitResult test_filter_count(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -126,8 +126,8 @@ static MunitResult test_arithmetic(const void* params, void* data) {
     (void)params; (void)data;
     td_arena_init();
 
-    td_t* df = make_test_df();
-    td_graph_t* g = td_graph_new(df);
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
 
     td_op_t* v3 = td_scan(g, "v3");
     td_op_t* two = td_const_f64(g, 2.0);
@@ -141,7 +141,7 @@ static MunitResult test_arithmetic(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -155,8 +155,8 @@ static MunitResult test_group_sum(const void* params, void* data) {
     (void)params; (void)data;
     td_arena_init();
 
-    td_t* df = make_test_df();
-    td_graph_t* g = td_graph_new(df);
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
 
     td_op_t* key = td_scan(g, "id1");
     td_op_t* val = td_scan(g, "v1");
@@ -194,7 +194,7 @@ static MunitResult test_group_sum(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -208,8 +208,8 @@ static MunitResult test_graph_lifecycle(const void* params, void* data) {
     (void)params; (void)data;
     td_arena_init();
 
-    td_t* df = make_test_df();
-    td_graph_t* g = td_graph_new(df);
+    td_t* tbl = make_test_table();
+    td_graph_t* g = td_graph_new(tbl);
     munit_assert_ptr_not_null(g);
     munit_assert_uint(g->node_count, ==, 0);
 
@@ -219,7 +219,7 @@ static MunitResult test_graph_lifecycle(const void* params, void* data) {
     munit_assert_uint(g->node_count, ==, 1);
 
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -288,11 +288,11 @@ static MunitResult test_optimizer_filter_const_predicate(const void* params, voi
     td_arena_init();
     td_sym_init();
 
-    td_t* df = make_test_df();
-    munit_assert_ptr_not_null(df);
+    td_t* tbl = make_test_table();
+    munit_assert_ptr_not_null(tbl);
 
     /* FILTER(..., true) -> pass-through */
-    td_graph_t* g_true = td_graph_new(df);
+    td_graph_t* g_true = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_true);
     td_op_t* v1_true = td_scan(g_true, "v1");
     td_op_t* pred_true = td_const_bool(g_true, true);
@@ -308,7 +308,7 @@ static MunitResult test_optimizer_filter_const_predicate(const void* params, voi
     td_graph_free(g_true);
 
     /* FILTER(..., false) -> empty via HEAD 0 */
-    td_graph_t* g_false = td_graph_new(df);
+    td_graph_t* g_false = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_false);
     td_op_t* v1_false = td_scan(g_false, "v1");
     td_op_t* pred_false = td_const_bool(g_false, false);
@@ -323,7 +323,7 @@ static MunitResult test_optimizer_filter_const_predicate(const void* params, voi
     td_release(out_false);
     td_graph_free(g_false);
 
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;
@@ -338,11 +338,11 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_arena_init();
     td_sym_init();
 
-    td_t* df = make_test_df();
-    munit_assert_ptr_not_null(df);
+    td_t* tbl = make_test_table();
+    munit_assert_ptr_not_null(tbl);
 
     /* Scalar aggregate: SUM(v1 + 1), AVG(v1 + 1) */
-    td_graph_t* g_scalar = td_graph_new(df);
+    td_graph_t* g_scalar = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_scalar);
     td_op_t* v1_scalar = td_scan(g_scalar, "v1");
     td_op_t* one_scalar = td_const_i64(g_scalar, 1);
@@ -366,7 +366,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_scalar);
 
     /* Scalar variants: SUM(1 + v1), SUM(v1 - 1) */
-    td_graph_t* g_scalar2 = td_graph_new(df);
+    td_graph_t* g_scalar2 = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_scalar2);
     td_op_t* v1_s2 = td_scan(g_scalar2, "v1");
     td_op_t* one_s2a = td_const_i64(g_scalar2, 1);
@@ -390,7 +390,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_scalar2);
 
     /* Nested scalar expression in agg input: SUM(v1 + (2 * 1)) */
-    td_graph_t* g_nested = td_graph_new(df);
+    td_graph_t* g_nested = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_nested);
     td_op_t* v1_nested = td_scan(g_nested, "v1");
     td_op_t* c2_nested = td_const_i64(g_nested, 2);
@@ -410,7 +410,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_nested);
 
     /* Nested constants on both sides: SUM((2*1) + v1), SUM(v1 - (2*1)) */
-    td_graph_t* g_nested2 = td_graph_new(df);
+    td_graph_t* g_nested2 = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_nested2);
     td_op_t* v1_nested2 = td_scan(g_nested2, "v1");
     td_op_t* c2_nested2 = td_const_i64(g_nested2, 2);
@@ -434,7 +434,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_nested2);
 
     /* Generic linear forms: SUM((v1 + 1) * 2), AVG(v1 + id1 + 1) */
-    td_graph_t* g_linear = td_graph_new(df);
+    td_graph_t* g_linear = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_linear);
     td_op_t* v1_linear = td_scan(g_linear, "v1");
     td_op_t* id1_linear = td_scan(g_linear, "id1");
@@ -460,7 +460,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_linear);
 
     /* Pure constant agg input should broadcast per row: SUM(2 * 1) */
-    td_graph_t* g_const = td_graph_new(df);
+    td_graph_t* g_const = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_const);
     td_op_t* c2 = td_const_i64(g_const, 2);
     td_op_t* c1 = td_const_i64(g_const, 1);
@@ -478,7 +478,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_const);
 
     /* Grouped aggregate: id1, SUM(v1 + 1) */
-    td_graph_t* g_group = td_graph_new(df);
+    td_graph_t* g_group = td_graph_new(tbl);
     munit_assert_ptr_not_null(g_group);
     td_op_t* key = td_scan(g_group, "id1");
     td_op_t* v1_group = td_scan(g_group, "v1");
@@ -512,7 +512,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
 
     td_release(out_group);
     td_graph_free(g_group);
-    td_release(df);
+    td_release(tbl);
     td_sym_destroy();
     td_arena_destroy_all();
     return MUNIT_OK;

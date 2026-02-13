@@ -156,7 +156,7 @@ static td_op_ext_t* graph_alloc_ext_node(td_graph_t* g) {
  * td_graph_new / td_graph_free
  * -------------------------------------------------------------------------- */
 
-td_graph_t* td_graph_new(td_t* df) {
+td_graph_t* td_graph_new(td_t* tbl) {
     td_graph_t* g = (td_graph_t*)calloc(1, sizeof(td_graph_t));
     if (!g) return NULL;
 
@@ -164,8 +164,8 @@ td_graph_t* td_graph_new(td_t* df) {
     if (!g->nodes) { free(g); return NULL; }
     g->node_cap = GRAPH_INIT_CAP;
     g->node_count = 0;
-    g->df = df;
-    if (df) td_retain(df);
+    g->table = tbl;
+    if (tbl) td_retain(tbl);
 
     g->ext_nodes = NULL;
     g->ext_count = 0;
@@ -185,7 +185,7 @@ void td_graph_free(td_graph_t* g) {
     free(g->ext_nodes);
 
     free(g->nodes);
-    if (g->df) td_release(g->df);
+    if (g->table) td_release(g->table);
     if (g->filter_mask) td_release(g->filter_mask);
     free(g);
 }
@@ -206,8 +206,8 @@ td_op_t* td_scan(td_graph_t* g, const char* col_name) {
     ext->sym = sym_id;
 
     /* Infer output type from the bound table */
-    if (g->df) {
-        td_t* col = td_table_get_col(g->df, sym_id);
+    if (g->table) {
+        td_t* col = td_table_get_col(g->table, sym_id);
         if (col) {
             ext->base.out_type = col->type;
             ext->base.est_rows = (uint32_t)col->len;
@@ -286,15 +286,15 @@ td_op_t* td_const_vec(td_graph_t* g, td_t* vec) {
     return &g->nodes[ext->base.id];
 }
 
-td_op_t* td_const_df(td_graph_t* g, td_t* df) {
+td_op_t* td_const_table(td_graph_t* g, td_t* tbl) {
     td_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
 
     ext->base.opcode = OP_CONST;
     ext->base.arity = 0;
     ext->base.out_type = TD_TABLE;
-    ext->literal = df;
-    td_retain(df);
+    ext->literal = tbl;
+    td_retain(tbl);
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -558,10 +558,10 @@ td_op_t* td_filter(td_graph_t* g, td_op_t* input, td_op_t* predicate) {
     return n;
 }
 
-td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
+td_op_t* td_sort_op(td_graph_t* g, td_op_t* table_node,
                      td_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
                      uint8_t n_cols) {
-    uint32_t df_id = df_node->id;
+    uint32_t table_id = table_node->id;
     uint32_t key_ids[256];
     for (uint8_t i = 0; i < n_cols; i++) key_ids[i] = keys[i]->id;
 
@@ -571,13 +571,13 @@ td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
     td_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz + descs_sz + nf_sz);
     if (!ext) return NULL;
 
-    df_node = &g->nodes[df_id];
+    table_node = &g->nodes[table_id];
 
     ext->base.opcode = OP_SORT;
     ext->base.arity = 1;
-    ext->base.inputs[0] = df_node;
+    ext->base.inputs[0] = table_node;
     ext->base.out_type = TD_TABLE;
-    ext->base.est_rows = df_node->est_rows;
+    ext->base.est_rows = table_node->est_rows;
 
     /* Arrays embedded in trailing space — freed with ext node */
     char* trail = EXT_TRAIL(ext);
@@ -643,11 +643,11 @@ td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
 }
 
 td_op_t* td_join(td_graph_t* g,
-                  td_op_t* left_df, td_op_t** left_keys,
-                  td_op_t* right_df, td_op_t** right_keys,
+                  td_op_t* left_table, td_op_t** left_keys,
+                  td_op_t* right_table, td_op_t** right_keys,
                   uint8_t n_keys, uint8_t join_type) {
-    uint32_t left_df_id = left_df->id;
-    uint32_t right_df_id = right_df->id;
+    uint32_t left_table_id = left_table->id;
+    uint32_t right_table_id = right_table->id;
     uint32_t lkey_ids[256];
     uint32_t rkey_ids[256];
     for (uint8_t i = 0; i < n_keys; i++) {
@@ -659,15 +659,15 @@ td_op_t* td_join(td_graph_t* g,
     td_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz * 2);
     if (!ext) return NULL;
 
-    left_df = &g->nodes[left_df_id];
-    right_df = &g->nodes[right_df_id];
+    left_table = &g->nodes[left_table_id];
+    right_table = &g->nodes[right_table_id];
 
     ext->base.opcode = OP_JOIN;
     ext->base.arity = 2;
-    ext->base.inputs[0] = left_df;
-    ext->base.inputs[1] = right_df;
+    ext->base.inputs[0] = left_table;
+    ext->base.inputs[1] = right_table;
     ext->base.out_type = TD_TABLE;
-    ext->base.est_rows = left_df->est_rows;
+    ext->base.est_rows = left_table->est_rows;
 
     /* Arrays embedded in trailing space — freed with ext node */
     char* trail = EXT_TRAIL(ext);
@@ -685,13 +685,13 @@ td_op_t* td_join(td_graph_t* g,
 }
 
 td_op_t* td_window_join(td_graph_t* g,
-                         td_op_t* left_df, td_op_t* right_df,
+                         td_op_t* left_table, td_op_t* right_table,
                          td_op_t* time_key, td_op_t* sym_key,
                          int64_t window_lo, int64_t window_hi,
                          uint16_t* agg_ops, td_op_t** agg_ins,
                          uint8_t n_aggs) {
-    uint32_t left_df_id = left_df->id;
-    uint32_t right_df_id = right_df->id;
+    uint32_t left_table_id = left_table->id;
+    uint32_t right_table_id = right_table->id;
     uint32_t agg_ids[256];
     for (uint8_t i = 0; i < n_aggs; i++) agg_ids[i] = agg_ins[i]->id;
 
@@ -703,15 +703,15 @@ td_op_t* td_window_join(td_graph_t* g,
     td_op_ext_t* ext = graph_alloc_ext_node_ex(g, ins_sz);
     if (!ext) return NULL;
 
-    left_df = &g->nodes[left_df_id];
-    right_df = &g->nodes[right_df_id];
+    left_table = &g->nodes[left_table_id];
+    right_table = &g->nodes[right_table_id];
 
     ext->base.opcode = OP_WINDOW_JOIN;
     ext->base.arity = 2;
-    ext->base.inputs[0] = left_df;
-    ext->base.inputs[1] = right_df;
+    ext->base.inputs[0] = left_table;
+    ext->base.inputs[1] = right_table;
     ext->base.out_type = TD_TABLE;
-    ext->base.est_rows = left_df->est_rows;
+    ext->base.est_rows = left_table->est_rows;
 
     /* Array embedded in trailing space — freed with ext node */
     ext->join.n_join_keys = n_aggs;
@@ -725,7 +725,7 @@ td_op_t* td_window_join(td_graph_t* g,
     return &g->nodes[ext->base.id];
 }
 
-td_op_t* td_window_op(td_graph_t* g, td_op_t* df_node,
+td_op_t* td_window_op(td_graph_t* g, td_op_t* table_node,
                        td_op_t** part_keys, uint8_t n_part,
                        td_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
                        uint8_t* func_kinds, td_op_t** func_inputs,
@@ -762,18 +762,18 @@ td_op_t* td_window_op(td_graph_t* g, td_op_t* df_node,
     size_t total    = fp_off + fp_sz;
 
     /* Save IDs before alloc — realloc may invalidate pointers */
-    uint32_t df_id = df_node->id;
-    uint32_t est   = df_node->est_rows;
+    uint32_t table_id = table_node->id;
+    uint32_t est   = table_node->est_rows;
 
     td_op_ext_t* ext = graph_alloc_ext_node_ex(g, total);
     if (!ext) return NULL;
 
-    /* Re-resolve df_node after potential realloc */
-    df_node = &g->nodes[df_id];
+    /* Re-resolve table_node after potential realloc */
+    table_node = &g->nodes[table_id];
 
     ext->base.opcode   = OP_WINDOW;
     ext->base.arity    = 1;
-    ext->base.inputs[0] = df_node;
+    ext->base.inputs[0] = table_node;
     ext->base.out_type = TD_TABLE;
     ext->base.est_rows = est;  /* window preserves row count */
 

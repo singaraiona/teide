@@ -140,7 +140,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         }
     }
 
-    /* Build combined DataFrame by concatenating columns */
+    /* Build combined table by concatenating columns */
     td_t* result = td_table_new(ncols);
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = td_table_col_name(first, c);

@@ -410,7 +410,7 @@ pub struct td_graph_t {
     pub nodes: *mut td_op_t,
     pub node_count: u32,
     pub node_cap: u32,
-    pub df: *mut td_t,
+    pub table: *mut td_t,
     pub ext_nodes: *mut *mut td_op_ext_t,
     pub ext_count: u32,
     pub ext_cap: u32,
@@ -614,7 +614,7 @@ extern "C" {
     pub fn td_const_bool(g: *mut td_graph_t, val: bool) -> *mut td_op_t;
     pub fn td_const_str(g: *mut td_graph_t, s: *const c_char) -> *mut td_op_t;
     pub fn td_const_vec(g: *mut td_graph_t, vec: *mut td_t) -> *mut td_op_t;
-    pub fn td_const_df(g: *mut td_graph_t, df: *mut td_t) -> *mut td_op_t;
+    pub fn td_const_table(g: *mut td_graph_t, table: *mut td_t) -> *mut td_op_t;
 
     // Unary element-wise ops
     pub fn td_neg(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;

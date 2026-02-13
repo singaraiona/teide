@@ -255,7 +255,7 @@ class Series:
 
 
 class Table:
-    """Materialized dataframe backed by a C td_t (type=TD_TABLE)."""
+    """Materialized table backed by a C td_t (type=TD_TABLE)."""
 
     def __init__(self, lib, df_ptr):
         self._lib = lib
@@ -349,11 +349,11 @@ class Table:
         lib = self._lib
         g = lib.graph_new(self._ptr)
         try:
-            left_df = lib.const_df(g, self._ptr)
-            right_df = lib.const_df(g, right._ptr)
+            left_table = lib.const_table(g, self._ptr)
+            right_table = lib.const_table(g, right._ptr)
             left_keys = [lib.scan(g, k) for k in on]
             right_keys = [lib.const_vec(g, right[k]._ptr) for k in on]
-            result_node = lib.join(g, left_df, left_keys, right_df, right_keys, join_type)
+            result_node = lib.join(g, left_table, left_keys, right_table, right_keys, join_type)
             root = lib.optimize(g, result_node)
             result_ptr = lib.execute(g, root)
             if not result_ptr or result_ptr < 32:
@@ -532,7 +532,7 @@ class Query:
         """
         lib = self._lib
         current = None  # pipeline state
-        filter_pred = None  # pending DataFrame-level filter predicate
+        filter_pred = None  # pending Table-level filter predicate
         pinned = []  # prevent GC of ctypes arrays passed to C
 
         for op in self._ops:
@@ -540,7 +540,7 @@ class Query:
                 expr = op[1]
                 pred_node = _emit_expr(lib, g, expr)
                 if current is None:
-                    # DataFrame-level filter: store predicate to apply to
+                    # Table-level filter: store predicate to apply to
                     # downstream scan nodes (group-by keys, agg inputs, etc.)
                     filter_pred = pred_node
                 else:
@@ -584,11 +584,11 @@ class Query:
                 col_names, descs = op[1], op[2]
                 n_cols = len(col_names)
 
-                # Sort needs a df_node — use td_const_df if we have a result, else use bound df
+                # Sort needs a table_node — use const_table if we have a result, else use bound table
                 if current is not None:
-                    df_node = current
+                    table_node = current
                 else:
-                    df_node = lib.const_df(g, self._ptr)
+                    table_node = lib.const_table(g, self._ptr)
 
                 key_nodes = []
                 for name in col_names:
@@ -602,12 +602,12 @@ class Query:
                 keys_arr = (ctypes.c_void_p * n_cols)(*key_nodes)
                 descs_arr = (ctypes.c_uint8 * n_cols)(*[1 if d else 0 for d in descs])
                 pinned.extend([keys_arr, descs_arr])
-                current = lib._lib.td_sort_op(g, df_node, keys_arr, descs_arr, n_cols)
+                current = lib._lib.td_sort_op(g, table_node, keys_arr, descs_arr, n_cols)
 
             elif op[0] == "head":
                 n = op[1]
                 if current is None:
-                    current = lib.const_df(g, self._ptr)
+                    current = lib.const_table(g, self._ptr)
                 current = lib.head(g, current, n)
 
             elif op[0] == "select":
@@ -617,8 +617,8 @@ class Query:
                 )
 
         if current is None:
-            # No ops — just return the bound df
-            current = lib.const_df(g, self._ptr)
+            # No ops — just return the bound table
+            current = lib.const_table(g, self._ptr)
 
         return current, pinned
 

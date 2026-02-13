@@ -681,9 +681,9 @@ impl Graph<'_> {
     }
 
     /// Create a constant DataFrame node referencing a table.
-    pub fn const_df(&self, table: &Table) -> Column {
+    pub fn const_table(&self, table: &Table) -> Column {
         Column {
-            raw: unsafe { ffi::td_const_df(self.raw, table.raw) },
+            raw: unsafe { ffi::td_const_table(self.raw, table.raw) },
         }
     }
 
@@ -957,9 +957,9 @@ impl Graph<'_> {
     /// Hash join.
     pub fn join(
         &mut self,
-        left_df: Column,
+        left_table: Column,
         left_keys: &[Column],
-        right_df: Column,
+        right_table: Column,
         right_keys: &[Column],
         join_type: u8,
     ) -> Result<Column> {
@@ -971,9 +971,9 @@ impl Graph<'_> {
         let raw = unsafe {
             ffi::td_join(
                 self.raw,
-                left_df.raw,
+                left_table.raw,
                 lk.as_mut_ptr(),
-                right_df.raw,
+                right_table.raw,
                 rk.as_mut_ptr(),
                 to_u8(left_keys.len())?,
                 join_type,
@@ -987,7 +987,7 @@ impl Graph<'_> {
     /// Multi-column sort.
     pub fn sort(
         &mut self,
-        df_node: Column,
+        table_node: Column,
         keys: &[Column],
         descs: &[bool],
         nulls_first: Option<&[bool]>,
@@ -1014,7 +1014,7 @@ impl Graph<'_> {
         let raw = unsafe {
             ffi::td_sort_op(
                 self.raw,
-                df_node.raw,
+                table_node.raw,
                 key_ptrs.as_mut_ptr(),
                 desc_u8.as_mut_ptr(),
                 nf_ptr,
@@ -1036,7 +1036,7 @@ impl Graph<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn window_op(
         &mut self,
-        df_node: Column,
+        table_node: Column,
         part_keys: &[Column],
         order_keys: &[Column],
         order_descs: &[bool],
@@ -1063,7 +1063,7 @@ impl Graph<'_> {
         let raw = unsafe {
             ffi::td_window_op(
                 self.raw,
-                df_node.raw,
+                table_node.raw,
                 pk_ptrs.as_mut_ptr(),
                 to_u8(part_keys.len())?,
                 ok_ptrs.as_mut_ptr(),

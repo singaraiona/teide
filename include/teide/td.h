@@ -377,7 +377,7 @@ typedef struct td_graph {
     td_op_t*       nodes;       /* array of op nodes (malloc'd) */
     uint32_t       node_count;  /* number of nodes */
     uint32_t       node_cap;    /* allocated capacity */
-    td_t*          df;          /* bound table (provides columns for OP_SCAN) */
+    td_t*          table;       /* bound table (provides columns for OP_SCAN) */
     td_op_ext_t**  ext_nodes;   /* tracked extended nodes for cleanup */
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
@@ -530,13 +530,13 @@ uint32_t td_sym_count(void);
 /* ===== Table API ===== */
 
 td_t*       td_table_new(int64_t ncols);
-td_t*       td_table_add_col(td_t* df, int64_t name_id, td_t* col_vec);
-td_t*       td_table_get_col(td_t* df, int64_t name_id);
-td_t*       td_table_get_col_idx(td_t* df, int64_t idx);
-int64_t     td_table_col_name(td_t* df, int64_t idx);
-int64_t     td_table_ncols(td_t* df);
-int64_t     td_table_nrows(td_t* df);
-td_t*       td_table_schema(td_t* df);
+td_t*       td_table_add_col(td_t* tbl, int64_t name_id, td_t* col_vec);
+td_t*       td_table_get_col(td_t* tbl, int64_t name_id);
+td_t*       td_table_get_col_idx(td_t* tbl, int64_t idx);
+int64_t     td_table_col_name(td_t* tbl, int64_t idx);
+int64_t     td_table_ncols(td_t* tbl);
+int64_t     td_table_nrows(td_t* tbl);
+td_t*       td_table_schema(td_t* tbl);
 
 /* ===== Morsel Iterator API ===== */
 
@@ -546,7 +546,7 @@ bool td_morsel_next(td_morsel_t* m);
 
 /* ===== Operation Graph API ===== */
 
-td_graph_t* td_graph_new(td_t* df);
+td_graph_t* td_graph_new(td_t* tbl);
 void        td_graph_free(td_graph_t* g);
 
 /* Source ops */
@@ -556,7 +556,7 @@ td_op_t* td_const_i64(td_graph_t* g, int64_t val);
 td_op_t* td_const_bool(td_graph_t* g, bool val);
 td_op_t* td_const_str(td_graph_t* g, const char* s);
 td_op_t* td_const_vec(td_graph_t* g, td_t* vec);
-td_op_t* td_const_df(td_graph_t* g, td_t* df);
+td_op_t* td_const_table(td_graph_t* g, td_t* table);
 
 /* Unary element-wise ops */
 td_op_t* td_neg(td_graph_t* g, td_op_t* a);
@@ -613,22 +613,22 @@ td_op_t* td_count_distinct(td_graph_t* g, td_op_t* a);
 
 /* Structural ops */
 td_op_t* td_filter(td_graph_t* g, td_op_t* input, td_op_t* predicate);
-td_op_t* td_sort_op(td_graph_t* g, td_op_t* df_node,
+td_op_t* td_sort_op(td_graph_t* g, td_op_t* table_node,
                      td_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
                      uint8_t n_cols);
 td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
                    uint16_t* agg_ops, td_op_t** agg_ins, uint8_t n_aggs);
 td_op_t* td_join(td_graph_t* g,
-                  td_op_t* left_df, td_op_t** left_keys,
-                  td_op_t* right_df, td_op_t** right_keys,
+                  td_op_t* left_table, td_op_t** left_keys,
+                  td_op_t* right_table, td_op_t** right_keys,
                   uint8_t n_keys, uint8_t join_type);
 td_op_t* td_window_join(td_graph_t* g,
-                         td_op_t* left_df, td_op_t* right_df,
+                         td_op_t* left_table, td_op_t* right_table,
                          td_op_t* time_key, td_op_t* sym_key,
                          int64_t window_lo, int64_t window_hi,
                          uint16_t* agg_ops, td_op_t** agg_ins,
                          uint8_t n_aggs);
-td_op_t* td_window_op(td_graph_t* g, td_op_t* df_node,
+td_op_t* td_window_op(td_graph_t* g, td_op_t* table_node,
                        td_op_t** part_keys, uint8_t n_part,
                        td_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
                        uint8_t* func_kinds, td_op_t** func_inputs,
@@ -660,7 +660,7 @@ td_err_t td_col_save(td_t* vec, const char* path);
 td_t*    td_col_load(const char* path);
 
 /* Splayed table I/O */
-td_err_t td_splay_save(td_t* df, const char* dir);
+td_err_t td_splay_save(td_t* tbl, const char* dir);
 td_t*    td_splay_load(const char* dir);
 
 /* Partitioned table */

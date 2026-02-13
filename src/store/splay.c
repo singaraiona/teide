@@ -38,20 +38,20 @@
  * -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------
- * td_splay_save — save a DataFrame to a splayed table directory
+ * td_splay_save — save a table to a splayed table directory
  * -------------------------------------------------------------------------- */
 
-td_err_t td_splay_save(td_t* df, const char* dir) {
-    if (!df || TD_IS_ERR(df)) return TD_ERR_TYPE;
+td_err_t td_splay_save(td_t* tbl, const char* dir) {
+    if (!tbl || TD_IS_ERR(tbl)) return TD_ERR_TYPE;
     if (!dir) return TD_ERR_IO;
 
     /* Create directory */
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return TD_ERR_IO;
 
-    int64_t ncols = td_table_ncols(df);
+    int64_t ncols = td_table_ncols(tbl);
 
     /* Save .d schema file */
-    td_t* schema = td_table_schema(df);
+    td_t* schema = td_table_schema(tbl);
     if (schema) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/.d", dir);
@@ -61,8 +61,8 @@ td_err_t td_splay_save(td_t* df, const char* dir) {
 
     /* Save each column */
     for (int64_t c = 0; c < ncols; c++) {
-        td_t* col = td_table_get_col_idx(df, c);
-        int64_t name_id = td_table_col_name(df, c);
+        td_t* col = td_table_get_col_idx(tbl, c);
+        int64_t name_id = td_table_col_name(tbl, c);
         if (!col) continue;
 
         /* Get column name string */
@@ -105,10 +105,10 @@ td_t* td_splay_load(const char* dir) {
     int64_t ncols = schema->len;
     int64_t* name_ids = (int64_t*)td_data(schema);
 
-    td_t* df = td_table_new(ncols);
-    if (!df || TD_IS_ERR(df)) {
+    td_t* tbl = td_table_new(ncols);
+    if (!tbl || TD_IS_ERR(tbl)) {
         td_release(schema);
-        return df;
+        return tbl;
     }
 
     /* Load each column */
@@ -132,11 +132,11 @@ td_t* td_splay_load(const char* dir) {
         td_t* col = td_col_load(path);
         if (!col || TD_IS_ERR(col)) continue;
 
-        td_t* new_df = td_table_add_col(df, name_id, col);
+        td_t* new_df = td_table_add_col(tbl, name_id, col);
         if (!new_df || TD_IS_ERR(new_df)) continue;
-        df = new_df;
+        tbl = new_df;
     }
 
     td_release(schema);
-    return df;
+    return tbl;
 }

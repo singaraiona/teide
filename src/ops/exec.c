@@ -359,9 +359,9 @@ static bool parse_linear_i64_expr(td_graph_t* g, td_op_t* op, linear_expr_i64_t*
 
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
-static bool try_linear_sumavg_input_i64(td_graph_t* g, td_t* df, td_op_t* input_op,
+static bool try_linear_sumavg_input_i64(td_graph_t* g, td_t* tbl, td_op_t* input_op,
                                         agg_linear_t* out_plan) {
-    if (!g || !df || !input_op || !out_plan) return false;
+    if (!g || !tbl || !input_op || !out_plan) return false;
     linear_expr_i64_t lin;
     if (!parse_linear_i64_expr(g, input_op, &lin)) return false;
 
@@ -369,7 +369,7 @@ static bool try_linear_sumavg_input_i64(td_graph_t* g, td_t* df, td_op_t* input_
     out_plan->n_terms = lin.n_terms;
     out_plan->bias_i64 = lin.bias_i64;
     for (uint8_t i = 0; i < lin.n_terms; i++) {
-        td_t* col = td_table_get_col(df, lin.syms[i]);
+        td_t* col = td_table_get_col(tbl, lin.syms[i]);
         if (!col || !type_is_linear_i64_col(col->type)) return false;
         out_plan->term_ptrs[i] = td_data(col);
         out_plan->term_types[i] = col->type;
@@ -381,9 +381,9 @@ static bool try_linear_sumavg_input_i64(td_graph_t* g, td_t* df, td_op_t* input_
 
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
  * plus the additive bias so we can adjust results from (sum,count) directly. */
-static bool try_affine_sumavg_input(td_graph_t* g, td_t* df, td_op_t* input_op,
+static bool try_affine_sumavg_input(td_graph_t* g, td_t* tbl, td_op_t* input_op,
                                     td_t** out_vec, agg_affine_t* out_affine) {
-    if (!g || !df || !input_op || !out_vec || !out_affine) return false;
+    if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
     if (input_op->opcode != OP_ADD && input_op->opcode != OP_SUB) return false;
     if (input_op->arity != 2 || !input_op->inputs[0] || !input_op->inputs[1]) return false;
 
@@ -428,7 +428,7 @@ static bool try_affine_sumavg_input(td_graph_t* g, td_t* df, td_op_t* input_op,
 
     td_op_ext_t* base_ext = find_ext(g, base_op->id);
     if (!base_ext || base_ext->base.opcode != OP_SCAN) return false;
-    td_t* base_vec = td_table_get_col(df, base_ext->sym);
+    td_t* base_vec = td_table_get_col(tbl, base_ext->sym);
     if (!base_vec) return false;
 
     int8_t bt = base_vec->type;
@@ -523,9 +523,9 @@ static uint8_t expr_ensure_type(td_expr_t* out, uint8_t src, int8_t target) {
 
 /* Compile expression DAG into flat instruction array.
  * Returns true on success. Only compiles element-wise subtrees. */
-static bool expr_compile(td_graph_t* g, td_t* df, td_op_t* root, td_expr_t* out) {
+static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out) {
     memset(out, 0, sizeof(*out));
-    if (!root || !g || !df) return false;
+    if (!root || !g || !tbl) return false;
     if (root->opcode == OP_SCAN || root->opcode == OP_CONST) return false;
     if (!expr_is_elementwise(root->opcode)) return false;
 
@@ -563,7 +563,7 @@ static bool expr_compile(td_graph_t* g, td_t* df, td_op_t* root, td_expr_t* out)
             if (node->opcode == OP_SCAN) {
                 td_op_ext_t* ext = find_ext(g, node->id);
                 if (!ext) return false;
-                td_t* col = td_table_get_col(df, ext->sym);
+                td_t* col = td_table_get_col(tbl, ext->sym);
                 if (!col) return false;
                 out->regs[r].kind = REG_SCAN;
                 out->regs[r].col_type = col->type;
@@ -1531,7 +1531,7 @@ static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
     return result;
 }
 
-/* Sequential DataFrame filter fallback (small tables or alloc failure). */
+/* Sequential table filter fallback (small tables or alloc failure). */
 static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
                              int64_t pass_count) {
     td_t* tbl = td_table_new(ncols);
@@ -1570,7 +1570,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     if (input->type != TD_TABLE)
         return exec_filter_vec(input, pred, pass_count);
 
-    /* DataFrame filter: parallel gather using compact match index */
+    /* table filter: parallel gather using compact match index */
     int64_t ncols = td_table_ncols(input);
 
     /* For small pass counts, fall back to sequential */
@@ -2521,14 +2521,14 @@ static int64_t topn_merge(topn_ctx_t* ctx, uint32_t n_workers,
 
 #define TOPN_MAX 1024  /* max limit for heap-based top-N */
 
-static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df, int64_t limit) {
-    if (!df || TD_IS_ERR(df)) return df;
+static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
+    if (!tbl || TD_IS_ERR(tbl)) return tbl;
 
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t nrows = td_table_nrows(df);
-    int64_t ncols = td_table_ncols(df);
+    int64_t nrows = td_table_nrows(tbl);
+    int64_t ncols = td_table_ncols(tbl);
     uint8_t n_sort = ext->sort.n_cols;
 
     /* Allocate index array */
@@ -2547,12 +2547,12 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df, int64_t limit) {
         td_op_t* key_op = ext->sort.columns[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            sort_vecs[k] = td_table_get_col(df, key_ext->sym);
+            sort_vecs[k] = td_table_get_col(tbl, key_ext->sym);
         } else {
-            td_t* saved = g->df;
-            g->df = df;
+            td_t* saved = g->table;
+            g->table = tbl;
             sort_vecs[k] = exec_node(g, key_op);
-            g->df = saved;
+            g->table = saved;
             sort_owned[k] = 1;
         }
     }
@@ -2902,8 +2902,8 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df, int64_t limit) {
     int64_t valid_ncols = 0;
 
     for (int64_t c = 0; c < ncols; c++) {
-        td_t* col = td_table_get_col_idx(df, c);
-        col_names[c] = td_table_col_name(df, c);
+        td_t* col = td_table_get_col_idx(tbl, c);
+        col_names[c] = td_table_col_name(tbl, c);
         if (!col) { new_cols[c] = NULL; continue; }
         td_t* nc = td_vec_new(col->type, gather_rows);
         if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
@@ -2917,7 +2917,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df, int64_t limit) {
         multi_gather_ctx_t mgctx = { .idx = sorted_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
-            td_t* col = td_table_get_col_idx(df, c);
+            td_t* col = td_table_get_col_idx(tbl, c);
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)td_data(col);
             mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
@@ -2928,7 +2928,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* df, int64_t limit) {
     } else {
         /* Fallback: per-column gather */
         for (int64_t c = 0; c < ncols; c++) {
-            td_t* col = td_table_get_col_idx(df, c);
+            td_t* col = td_table_get_col_idx(tbl, c);
             if (!col || !new_cols[c]) continue;
             if (gather_pool) {
                 gather_ctx_t gctx = {
@@ -4141,13 +4141,13 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     }
 }
 
-static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
-    if (!df || TD_IS_ERR(df)) return df;
+static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
+    if (!tbl || TD_IS_ERR(tbl)) return tbl;
 
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t nrows = td_table_nrows(df);
+    int64_t nrows = td_table_nrows(tbl);
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
@@ -4169,13 +4169,13 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         td_op_t* key_op = ext->keys[k];
         td_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
-            key_vecs[k] = td_table_get_col(df, key_ext->sym);
+            key_vecs[k] = td_table_get_col(tbl, key_ext->sym);
         } else {
-            /* Expression key (CASE WHEN etc) — evaluate against current df */
-            td_t* saved_df = g->df;
-            g->df = df;
+            /* Expression key (CASE WHEN etc) — evaluate against current tbl */
+            td_t* saved_table = g->table;
+            g->table = tbl;
             td_t* vec = exec_node(g, key_op);
-            g->df = saved_df;
+            g->table = saved_table;
             if (vec && !TD_IS_ERR(vec)) {
                 key_vecs[k] = vec;
                 key_owned[k] = 1;
@@ -4200,7 +4200,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, df, agg_input_op, &agg_vecs[a], &agg_affine[a])) {
+            try_affine_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a], &agg_affine[a])) {
             continue;
         }
 
@@ -4208,18 +4208,18 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
          * without materializing the expression vector. */
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_linear_sumavg_input_i64(g, df, agg_input_op, &agg_linear[a])) {
+            try_linear_sumavg_input_i64(g, tbl, agg_input_op, &agg_linear[a])) {
             continue;
         }
 
         if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
-            agg_vecs[a] = td_table_get_col(df, agg_ext->sym);
+            agg_vecs[a] = td_table_get_col(tbl, agg_ext->sym);
         } else if (agg_ext && agg_ext->base.opcode == OP_CONST && agg_ext->literal) {
             agg_vecs[a] = agg_ext->literal;
         } else {
             /* Expression node (ADD/MUL etc) — try compiled expression first */
             td_expr_t agg_expr;
-            if (expr_compile(g, df, agg_input_op, &agg_expr)) {
+            if (expr_compile(g, tbl, agg_input_op, &agg_expr)) {
                 td_t* vec = expr_eval_full(&agg_expr, nrows);
                 if (vec && !TD_IS_ERR(vec)) {
                     agg_vecs[a] = vec;
@@ -4228,10 +4228,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 }
             }
             /* Fallback: full recursive evaluation */
-            td_t* saved_df = g->df;
-            g->df = df;
+            td_t* saved_table = g->table;
+            g->table = tbl;
             td_t* vec = exec_node(g, agg_input_op);
-            g->df = saved_df;
+            g->table = saved_table;
             if (vec && !TD_IS_ERR(vec)) {
                 agg_vecs[a] = vec;
                 agg_owned[a] = 1;
@@ -5327,15 +5327,15 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
     }
 }
 
-static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df) {
-    if (!left_df || TD_IS_ERR(left_df)) return left_df;
-    if (!right_df || TD_IS_ERR(right_df)) return right_df;
+static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right_table) {
+    if (!left_table || TD_IS_ERR(left_table)) return left_table;
+    if (!right_table || TD_IS_ERR(right_table)) return right_table;
 
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t left_rows = td_table_nrows(left_df);
-    int64_t right_rows = td_table_nrows(right_df);
+    int64_t left_rows = td_table_nrows(left_table);
+    int64_t right_rows = td_table_nrows(right_table);
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
@@ -5348,9 +5348,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
         td_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
         td_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
         if (lk && lk->base.opcode == OP_SCAN)
-            l_key_vecs[k] = td_table_get_col(left_df, lk->sym);
+            l_key_vecs[k] = td_table_get_col(left_table, lk->sym);
         if (rk && rk->base.opcode == OP_SCAN)
-            r_key_vecs[k] = td_table_get_col(right_df, rk->sym);
+            r_key_vecs[k] = td_table_get_col(right_table, rk->sym);
         if (rk && rk->base.opcode == OP_CONST && rk->literal)
             r_key_vecs[k] = rk->literal;
     }
@@ -5453,15 +5453,15 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
                 join_fill_fn(&probe_ctx, 0, t, t + 1);
     }
 
-    /* Phase 3: Build result DataFrame with parallel column gather */
-    int64_t left_ncols = td_table_ncols(left_df);
-    int64_t right_ncols = td_table_ncols(right_df);
+    /* Phase 3: Build result table with parallel column gather */
+    int64_t left_ncols = td_table_ncols(left_table);
+    int64_t right_ncols = td_table_ncols(right_table);
     result = td_table_new(left_ncols + right_ncols);
     if (!result || TD_IS_ERR(result)) goto join_cleanup;
 
     for (int64_t c = 0; c < left_ncols; c++) {
-        td_t* col = td_table_get_col_idx(left_df, c);
-        int64_t name_id = td_table_col_name(left_df, c);
+        td_t* col = td_table_get_col_idx(left_table, c);
+        int64_t name_id = td_table_col_name(left_table, c);
         if (!col) continue;
 
         td_t* new_col = td_vec_new(col->type, pair_count);
@@ -5483,8 +5483,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_df, td_t* right_df
     }
 
     for (int64_t c = 0; c < right_ncols; c++) {
-        td_t* col = td_table_get_col_idx(right_df, c);
-        int64_t name_id = td_table_col_name(right_df, c);
+        td_t* col = td_table_get_col_idx(right_table, c);
+        int64_t name_id = td_table_col_name(right_table, c);
         if (!col) continue;
 
         bool is_key = false;
@@ -6278,19 +6278,19 @@ static inline int64_t win_read_i64(td_t* col, int64_t row) {
     }
 }
 
-/* Resolve a graph op node to a column vector from df */
-static td_t* win_resolve_vec(td_graph_t* g, td_op_t* key_op, td_t* df,
+/* Resolve a graph op node to a column vector from tbl */
+static td_t* win_resolve_vec(td_graph_t* g, td_op_t* key_op, td_t* tbl,
                               uint8_t* owned) {
     td_op_ext_t* key_ext = find_ext(g, key_op->id);
     if (key_ext && key_ext->base.opcode == OP_SCAN) {
         *owned = 0;
-        return td_table_get_col(df, key_ext->sym);
+        return td_table_get_col(tbl, key_ext->sym);
     }
     *owned = 1;
-    td_t* saved = g->df;
-    g->df = df;
+    td_t* saved = g->table;
+    g->table = tbl;
     td_t* v = exec_node(g, key_op);
-    g->df = saved;
+    g->table = saved;
     return v;
 }
 
@@ -6684,22 +6684,22 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
     }
 }
 
-static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* df) {
-    if (!df || TD_IS_ERR(df)) return df;
+static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
+    if (!tbl || TD_IS_ERR(tbl)) return tbl;
 
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
 
-    int64_t nrows = td_table_nrows(df);
-    int64_t ncols = td_table_ncols(df);
+    int64_t nrows = td_table_nrows(tbl);
+    int64_t ncols = td_table_ncols(tbl);
     uint8_t n_part  = ext->window.n_part_keys;
     uint8_t n_order = ext->window.n_order_keys;
     uint8_t n_funcs = ext->window.n_funcs;
     uint8_t n_sort  = n_part + n_order;
 
     if (nrows == 0 || n_funcs == 0) {
-        td_retain(df);
-        return df;
+        td_retain(tbl);
+        return tbl;
     }
 
     /* --- Phase 0: Resolve key and func_input vectors --- */
@@ -6710,13 +6710,13 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* df) {
     memset(sort_descs, 0, sizeof(sort_descs));
 
     for (uint8_t k = 0; k < n_part; k++) {
-        sort_vecs[k] = win_resolve_vec(g, ext->window.part_keys[k], df,
+        sort_vecs[k] = win_resolve_vec(g, ext->window.part_keys[k], tbl,
                                         &sort_owned[k]);
         sort_descs[k] = 0;  /* partition keys always ASC */
     }
     for (uint8_t k = 0; k < n_order; k++) {
         sort_vecs[n_part + k] = win_resolve_vec(g, ext->window.order_keys[k],
-                                                 df, &sort_owned[n_part + k]);
+                                                 tbl, &sort_owned[n_part + k]);
         sort_descs[n_part + k] = ext->window.order_descs[k];
     }
 
@@ -6729,7 +6729,7 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* df) {
     for (uint8_t f = 0; f < n_funcs; f++) {
         td_op_t* fi = ext->window.func_inputs[f];
         if (fi)
-            func_vecs[f] = win_resolve_vec(g, fi, df, &func_owned[f]);
+            func_vecs[f] = win_resolve_vec(g, fi, tbl, &func_owned[f]);
         else
             func_vecs[f] = NULL;
     }
@@ -7109,8 +7109,8 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* df) {
 
     /* Pass-through original columns */
     for (int64_t c = 0; c < ncols; c++) {
-        td_t* col = td_table_get_col_idx(df, c);
-        int64_t name_id = td_table_col_name(df, c);
+        td_t* col = td_table_get_col_idx(tbl, c);
+        int64_t name_id = td_table_col_name(tbl, c);
         td_retain(col);
         result = td_table_add_col(result, name_id, col);
         td_release(col);
@@ -7171,8 +7171,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_SCAN: {
             td_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
-            if (!g->df) return TD_ERR_PTR(TD_ERR_SCHEMA);
-            td_t* col = td_table_get_col(g->df, ext->sym);
+            if (!g->table) return TD_ERR_PTR(TD_ERR_SCHEMA);
+            td_t* col = td_table_get_col(g->table, ext->sym);
             if (!col) return TD_ERR_PTR(TD_ERR_SCHEMA);
             td_retain(col);
             return col;
@@ -7195,11 +7195,11 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: {
             /* Try compiled expression first (fuses entire subtree) */
-            if (g->df) {
-                int64_t nr = td_table_nrows(g->df);
+            if (g->table) {
+                int64_t nr = td_table_nrows(g->table);
                 if (nr > 0) {
                     td_expr_t ex;
-                    if (expr_compile(g, g->df, op, &ex)) {
+                    if (expr_compile(g, g->table, op, &ex)) {
                         td_t* vec = expr_eval_full(&ex, nr);
                         if (vec && !TD_IS_ERR(vec)) return vec;
                     }
@@ -7248,14 +7248,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_SORT: {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
-            td_t* df = (input->type == TD_TABLE) ? input : g->df;
-            td_t* result = exec_sort(g, op, df, 0);
-            if (input != g->df) td_release(input);
+            td_t* tbl = (input->type == TD_TABLE) ? input : g->table;
+            td_t* result = exec_sort(g, op, tbl, 0);
+            if (input != g->table) td_release(input);
             return result;
         }
 
         case OP_GROUP: {
-            td_t* result = exec_group(g, op, g->df);
+            td_t* result = exec_group(g, op, g->table);
             return result;
         }
 
@@ -7273,9 +7273,9 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         case OP_WINDOW: {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
-            td_t* wdf = (input->type == TD_TABLE) ? input : g->df;
+            td_t* wdf = (input->type == TD_TABLE) ? input : g->table;
             td_t* result = exec_window(g, op, wdf);
-            if (input != g->df) td_release(input);
+            if (input != g->table) td_release(input);
             return result;
         }
 
@@ -7288,9 +7288,9 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             if (child_op && child_op->opcode == OP_SORT) {
                 td_t* sort_input = exec_node(g, child_op->inputs[0]);
                 if (!sort_input || TD_IS_ERR(sort_input)) return sort_input;
-                td_t* df = (sort_input->type == TD_TABLE) ? sort_input : g->df;
-                td_t* result = exec_sort(g, child_op, df, n);
-                if (sort_input != g->df) td_release(sort_input);
+                td_t* tbl = (sort_input->type == TD_TABLE) ? sort_input : g->table;
+                td_t* result = exec_sort(g, child_op, tbl, n);
+                if (sort_input != g->table) td_release(sort_input);
                 return result;
             }
 
@@ -7426,9 +7426,9 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_op_t** columns = ext->sort.columns;
             td_t* result = td_table_new(n_cols);
 
-            /* Set g->df so SCAN nodes inside expressions resolve correctly */
-            td_t* saved_df = g->df;
-            g->df = input;
+            /* Set g->table so SCAN nodes inside expressions resolve correctly */
+            td_t* saved_table = g->table;
+            g->table = input;
 
             for (uint8_t c = 0; c < n_cols; c++) {
                 if (columns[c]->opcode == OP_SCAN) {
@@ -7458,7 +7458,7 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 }
             }
 
-            g->df = saved_df;
+            g->table = saved_table;
             td_release(input);
             return result;
         }

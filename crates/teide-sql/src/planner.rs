@@ -439,9 +439,9 @@ fn plan_query(
             } else {
                 // Non-GROUP BY: materialize as before
                 let mut g = ctx.graph(&table)?;
-                let df_node = g.const_df(&table);
+                let table_node = g.const_table(&table);
                 let pred = plan_expr(&mut g, &resolved, &schema)?;
-                let filtered = g.filter(df_node, pred);
+                let filtered = g.filter(table_node, pred);
                 (g.execute(filtered)?, None)
             }
         } else {
@@ -505,9 +505,9 @@ fn plan_query(
             having_schema.entry(alias.clone()).or_insert(i);
         }
         let mut g = ctx.graph(&result_table)?;
-        let df_node = g.const_df(&result_table);
+        let table_node = g.const_table(&result_table);
         let pred = plan_having_expr(&mut g, having_expr, &having_schema, &schema)?;
-        let filtered = g.filter(df_node, pred);
+        let filtered = g.filter(table_node, pred);
         g.execute(filtered)?
     } else {
         result_table
@@ -523,8 +523,8 @@ fn plan_query(
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table)?;
-        let df_node = g.const_df(&result_table);
-        let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+        let table_node = g.const_table(&result_table);
+        let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
         // Fuse LIMIT into HEAD(SORT) so the engine only gathers N rows
         let total_limit = match (offset_val, limit_val) {
@@ -552,16 +552,16 @@ fn plan_query(
             (Some(off), Some(lim)) => {
                 let total = off + lim;
                 let g = ctx.graph(&result_table)?;
-                let df_node = g.const_df(&result_table);
-                let head_node = g.head(df_node, total);
+                let table_node = g.const_table(&result_table);
+                let head_node = g.head(table_node, total);
                 let trimmed = g.execute(head_node)?;
                 skip_rows(ctx, &trimmed, off)?
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
                 let g = ctx.graph(&result_table)?;
-                let df_node = g.const_df(&result_table);
-                let root = g.head(df_node, lim);
+                let table_node = g.const_table(&result_table);
+                let root = g.head(table_node, lim);
                 g.execute(root)?
             }
             (None, None) => result_table,
@@ -772,8 +772,8 @@ fn resolve_from(
         // Build join graph (scoped to avoid borrow conflict)
         let result = {
             let mut g = ctx.graph(&al_table)?;
-            let left_df_node = g.const_df(&al_table);
-            let right_df_node = g.const_df(&ar_table);
+            let left_table_node = g.const_table(&al_table);
+            let right_table_node = g.const_table(&ar_table);
 
             let left_key_nodes: Vec<teide::Column> = join_keys
                 .iter()
@@ -796,9 +796,9 @@ fn resolve_from(
             }
 
             let joined = g.join(
-                left_df_node,
+                left_table_node,
                 &left_key_nodes,
-                right_df_node,
+                right_table_node,
                 &right_key_nodes,
                 join_type,
             )?;
@@ -1064,7 +1064,7 @@ fn plan_group_select(
     }
 
     let mut pg = ctx.graph(&group_result)?;
-    let df_node = pg.const_df(&group_result);
+    let table_node = pg.const_table(&group_result);
 
     let mut proj_cols = Vec::new();
     let mut proj_aliases = Vec::new();
@@ -1090,7 +1090,7 @@ fn plan_group_select(
         }
     }
 
-    let proj = pg.select(df_node, &proj_cols)?;
+    let proj = pg.select(table_node, &proj_cols)?;
     let result = pg.execute(proj)?;
 
     Ok((result, final_aliases))
@@ -1332,12 +1332,12 @@ fn plan_distinct(
     // The result has keys + 1 COUNT column. We only want the keys.
     // Build a SELECT projection to drop the count column.
     let pg = ctx.graph(&group_result)?;
-    let df_node = pg.const_df(&group_result);
+    let table_node = pg.const_table(&group_result);
     let proj_cols: Vec<Column> = col_names
         .iter()
         .map(|k| pg.scan(k))
         .collect::<teide::Result<Vec<_>>>()?;
-    let proj = pg.select(df_node, &proj_cols)?;
+    let proj = pg.select(table_node, &proj_cols)?;
     let result = pg.execute(proj)?;
 
     Ok((result, col_names.to_vec()))
@@ -1354,7 +1354,7 @@ fn plan_expr_select(
     schema: &HashMap<String, usize>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     let mut g = ctx.graph(working_table)?;
-    let df_node = g.const_df(working_table);
+    let table_node = g.const_table(working_table);
 
     let mut proj_cols = Vec::new();
     let mut aliases = Vec::new();
@@ -1383,7 +1383,7 @@ fn plan_expr_select(
         }
     }
 
-    let proj = g.select(df_node, &proj_cols)?;
+    let proj = g.select(table_node, &proj_cols)?;
     let result = g.execute(proj)?;
     Ok((result, aliases))
 }
@@ -1435,7 +1435,7 @@ fn plan_window_stage(
     for (spec, func_indices) in spec_groups {
         let stage_result = {
             let mut g = ctx.graph(&current_table)?;
-            let df_node = g.const_df(&current_table);
+            let table_node = g.const_table(&current_table);
             let (frame_type, frame_start, frame_end) = parse_window_frame(&spec)?;
 
             let mut part_key_cols: Vec<Column> = Vec::new();
@@ -1473,7 +1473,7 @@ fn plan_window_stage(
             }
 
             let win_node = g.window_op(
-                df_node,
+                table_node,
                 &part_key_cols,
                 &order_key_cols,
                 &order_descs,
@@ -1603,15 +1603,15 @@ fn skip_rows(ctx: &Context, table: &Table, offset: i64) -> Result<Table, SqlErro
     let nrows = table.nrows();
     if offset >= nrows {
         let g = ctx.graph(table)?;
-        let df_node = g.const_df(table);
-        let root = g.head(df_node, 0);
+        let table_node = g.const_table(table);
+        let root = g.head(table_node, 0);
         return Ok(g.execute(root)?);
     }
     // td_tail takes the last N rows — exactly what we need after skipping offset
     let keep = nrows - offset;
     let g = ctx.graph(table)?;
-    let df_node = g.const_df(table);
-    let root = g.tail(df_node, keep);
+    let table_node = g.const_table(table);
+    let root = g.tail(table_node, keep);
     Ok(g.execute(root)?)
 }
 
@@ -1995,8 +1995,8 @@ fn apply_post_processing(
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table)?;
-        let df_node = g.const_df(&result_table);
-        let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+        let table_node = g.const_table(&result_table);
+        let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
         let total_limit = match (offset_val, limit_val) {
             (Some(off), Some(lim)) => Some(off + lim),
@@ -2023,16 +2023,16 @@ fn apply_post_processing(
             (Some(off), Some(lim)) => {
                 let total = off + lim;
                 let g = ctx.graph(&result_table)?;
-                let df_node = g.const_df(&result_table);
-                let head_node = g.head(df_node, total);
+                let table_node = g.const_table(&result_table);
+                let head_node = g.head(table_node, total);
                 let trimmed = g.execute(head_node)?;
                 skip_rows(ctx, &trimmed, off)?
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
                 let g = ctx.graph(&result_table)?;
-                let df_node = g.const_df(&result_table);
-                let root = g.head(df_node, lim);
+                let table_node = g.const_table(&result_table);
+                let root = g.head(table_node, lim);
                 g.execute(root)?
             }
             (None, None) => result_table,

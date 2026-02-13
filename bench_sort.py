@@ -42,10 +42,10 @@ CSV_PATH = os.path.join(os.path.dirname(__file__),
 def run_sort(lib, df, label, col_names, descs):
     g = lib.graph_new(df)
     try:
-        df_node = lib.const_df(g, df)
+        table_node = lib.const_table(g, df)
         keys = [lib.scan(g, c) for c in col_names]
 
-        root = lib.sort_op(g, df_node, keys, descs)
+        root = lib.sort_op(g, table_node, keys, descs)
         root = lib.optimize(g, root)
 
         times = []

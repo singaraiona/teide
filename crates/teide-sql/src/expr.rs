@@ -740,6 +740,9 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
         | DataType::DoublePrecision
         | DataType::Real => Ok(teide::types::F64),
         DataType::Varchar(_) | DataType::Text | DataType::String(_) => Ok(teide::types::STR),
+        DataType::Date => Ok(teide::types::DATE),
+        DataType::Time(_, _) => Ok(teide::types::TIME),
+        DataType::Timestamp(_, _) => Ok(teide::types::TIMESTAMP),
         _ => Err(SqlError::Plan(format!("Unsupported CAST target type: {dt}"))),
     }
 }

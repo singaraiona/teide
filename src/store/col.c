@@ -41,6 +41,9 @@
 td_err_t td_col_save(td_t* vec, const char* path) {
     if (!vec || TD_IS_ERR(vec)) return TD_ERR_TYPE;
     if (!path) return TD_ERR_IO;
+    /* Pointer-bearing types can't be serialized as raw bytes */
+    if (vec->type == TD_STR || vec->type == TD_LIST || vec->type == TD_TABLE)
+        return TD_ERR_NYI;
 
     FILE* f = fopen(path, "wb");
     if (!f) return TD_ERR_IO;
@@ -103,6 +106,10 @@ td_t* td_col_load(const char* path) {
     td_t* tmp = (td_t*)ptr;
 
     /* Validate type from untrusted file data */
+    if (tmp->type == TD_STR || tmp->type == TD_LIST || tmp->type == TD_TABLE) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_NYI);
+    }
     if (tmp->type <= 0 || tmp->type >= TD_TYPE_COUNT) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_CORRUPT);

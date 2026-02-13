@@ -398,11 +398,18 @@ fn plan_scalar_function(
                 return Err(SqlError::Plan("ROUND takes 1 or 2 arguments".into()));
             }
             let a = plan_expr(g, &args[0], schema)?;
-            if args.len() == 1 {
-                // ROUND(x) → FLOOR(x + 0.5)
+            // Helper: round_val = IF(val >= 0, FLOOR(val + 0.5), CEIL(val - 0.5))
+            // This handles negative numbers correctly (banker's-style half-away-from-zero)
+            let build_round = |g: &mut teide::Graph, val: teide::Column| {
+                let zero = g.const_f64(0.0);
                 let half = g.const_f64(0.5);
-                let shifted = g.add(a, half);
-                Ok(g.floor(shifted))
+                let cond = g.ge(val, zero);
+                let pos = g.floor(g.add(val, half));
+                let neg = g.ceil(g.sub(val, half));
+                g.if_then_else(cond, pos, neg)
+            };
+            if args.len() == 1 {
+                Ok(build_round(g, a))
             } else {
                 // ROUND(x, n): extract n as integer constant
                 let n = match &args[1] {
@@ -428,15 +435,13 @@ fn plan_scalar_function(
                         ))
                     }
                 };
-                // ROUND(x, n) → FLOOR(x * scale + 0.5) / scale
+                // ROUND(x, n) → round(x * scale) / scale
                 let scale = 10.0_f64.powi(n);
                 let scale_node = g.const_f64(scale);
-                let half = g.const_f64(0.5);
                 let scaled = g.mul(a, scale_node);
-                let shifted = g.add(scaled, half);
-                let floored = g.floor(shifted);
+                let rounded = build_round(g, scaled);
                 let inv_scale = g.const_f64(1.0 / scale);
-                Ok(g.mul(floored, inv_scale))
+                Ok(g.mul(rounded, inv_scale))
             }
         }
 
@@ -837,6 +842,37 @@ fn collect_aggregates_inner<'a>(expr: &'a Expr, aggs: &mut Vec<(&'a Expr, String
         Expr::UnaryOp { expr, .. } => collect_aggregates_inner(expr, aggs),
         Expr::Nested(inner) => collect_aggregates_inner(inner, aggs),
         Expr::Cast { expr, .. } => collect_aggregates_inner(expr, aggs),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_aggregates_inner(op, aggs);
+            }
+            for c in conditions {
+                collect_aggregates_inner(c, aggs);
+            }
+            for r in results {
+                collect_aggregates_inner(r, aggs);
+            }
+            if let Some(e) = else_result {
+                collect_aggregates_inner(e, aggs);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_aggregates_inner(expr, aggs);
+            collect_aggregates_inner(low, aggs);
+            collect_aggregates_inner(high, aggs);
+        }
+        Expr::IsFalse(e)
+        | Expr::IsTrue(e)
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e) => collect_aggregates_inner(e, aggs),
         _ => {}
     }
 }
@@ -1381,6 +1417,27 @@ fn collect_win_funcs_inner(
         Expr::UnaryOp { expr, .. } => collect_win_funcs_inner(expr, item_idx, out),
         Expr::Nested(inner) => collect_win_funcs_inner(inner, item_idx, out),
         Expr::Cast { expr, .. } => collect_win_funcs_inner(expr, item_idx, out),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_win_funcs_inner(op, item_idx, out)?;
+            }
+            for c in conditions {
+                collect_win_funcs_inner(c, item_idx, out)?;
+            }
+            for r in results {
+                collect_win_funcs_inner(r, item_idx, out)?;
+            }
+            if let Some(e) = else_result {
+                collect_win_funcs_inner(e, item_idx, out)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

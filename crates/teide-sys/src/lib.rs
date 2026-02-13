@@ -66,10 +66,6 @@ pub const TD_ATOM_ENUM: i8 = -TD_ENUM;
 
 // ===== Attribute Flags =====
 
-pub const TD_ATTR_SORTED: u8 = 0x01;
-pub const TD_ATTR_UNIQUE: u8 = 0x02;
-pub const TD_ATTR_PARTITIONED: u8 = 0x04;
-pub const TD_ATTR_GROUPED: u8 = 0x08;
 pub const TD_ATTR_SLICE: u8 = 0x10;
 pub const TD_ATTR_NULLMAP_EXT: u8 = 0x20;
 pub const TD_ATTR_HAS_NULLS: u8 = 0x40;
@@ -77,7 +73,6 @@ pub const TD_ATTR_HAS_NULLS: u8 = 0x40;
 // ===== Morsel Constants =====
 
 pub const TD_MORSEL_ELEMS: i64 = 1024;
-pub const TD_MORSEL_REGS: usize = 8;
 
 // ===== Slab Cache Constants =====
 
@@ -93,10 +88,6 @@ pub const TD_ORDER_MAX: u32 = 30;
 
 pub const TD_PARALLEL_THRESHOLD: i64 = 64 * TD_MORSEL_ELEMS;
 pub const TD_DISPATCH_MORSELS: u32 = 8;
-
-// ===== Spill Threshold =====
-
-pub const TD_SPILL_THRESHOLD_RATIO: f64 = 0.25;
 
 // ===== Opcode Constants =====
 
@@ -212,7 +203,6 @@ pub const TD_BOUND_UNBOUNDED_FOLLOWING: u8 = 4;
 // Op flags
 pub const OP_FLAG_FUSED: u8 = 0x01;
 pub const OP_FLAG_DEAD: u8 = 0x02;
-pub const OP_FLAG_MATERIALIZED: u8 = 0x04;
 
 // ===== Error Handling =====
 
@@ -329,7 +319,8 @@ pub struct td_t {
     pub type_: i8,
     /// Byte 19
     pub attrs: u8,
-    /// Bytes 20-23: atomic reference count
+    /// Bytes 20-23: reference count (C: `_Atomic(uint32_t)`).
+    /// Layout-compatible with u32 on all targets; all atomic ops go through C FFI.
     pub rc: u32,
     /// Bytes 24-31
     pub val: td_t_val,
@@ -406,10 +397,10 @@ pub struct td_op_t {
     pub inputs: [*mut td_op_t; 2],
 }
 
-// Extended op node — opaque (64 bytes, complex unions)
+// Extended op node — opaque (104 bytes, complex unions)
 #[repr(C)]
 pub struct td_op_ext_t {
-    _opaque: [u8; 64],
+    _opaque: [u8; 104],
 }
 
 // ===== Operation Graph =====
@@ -810,4 +801,6 @@ extern "C" {
 const _: () = {
     assert!(std::mem::size_of::<td_t>() == 32);
     assert!(std::mem::size_of::<td_op_t>() == 32);
+    assert!(std::mem::size_of::<td_op_ext_t>() == 104);
+    assert!(std::mem::size_of::<td_graph_t>() == 48);
 };

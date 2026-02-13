@@ -104,6 +104,11 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Convert usize to u8, returning Error::Length on overflow.
+fn to_u8(n: usize) -> Result<u8> {
+    u8::try_from(n).map_err(|_| Error::Length)
+}
+
 /// Aggregation operation variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggOp {
@@ -256,26 +261,24 @@ fn engine_slot() -> &'static Mutex<Weak<EngineGuard>> {
 }
 
 fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
-    let lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
+    let mut lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
     if let Some(existing) = lock.upgrade() {
         return Ok(existing);
     }
-    drop(lock);
 
+    // Hold the lock across init to prevent double-initialization race
     unsafe {
         ffi::td_arena_init();
         ffi::td_sym_init();
-        ffi::td_pool_init(0);
+        let err = ffi::td_pool_init(0);
+        if err != ffi::td_err_t::TD_OK {
+            return Err(Error::from_code(err));
+        }
     }
 
     let guard = Arc::new(EngineGuard);
-    let mut lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
-    if let Some(existing) = lock.upgrade() {
-        Ok(existing)
-    } else {
-        *lock = Arc::downgrade(&guard);
-        Ok(guard)
-    }
+    *lock = Arc::downgrade(&guard);
+    Ok(guard)
 }
 
 fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
@@ -288,7 +291,12 @@ fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
 // ---------------------------------------------------------------------------
 
 /// Intern a string into the global symbol table. Returns a stable i64 ID.
+///
+/// # Panics
+/// Panics if the engine runtime has not been initialized (no `Context` exists).
 pub fn sym_intern(s: &str) -> i64 {
+    acquire_existing_engine_guard()
+        .expect("sym_intern called before engine initialization (no Context exists)");
     unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) }
 }
 
@@ -340,14 +348,17 @@ impl Context {
     }
 
     /// Create a new operation graph bound to a table.
-    pub fn graph<'a>(&self, table: &'a Table) -> Graph<'a> {
+    pub fn graph<'a>(&self, table: &'a Table) -> Result<Graph<'a>> {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
-        Graph {
+        if raw.is_null() {
+            return Err(Error::Oom);
+        }
+        Ok(Graph {
             raw,
             engine: table.engine.clone(),
             _table: PhantomData,
             _pinned: Vec::new(),
-        }
+        })
     }
 }
 
@@ -425,7 +436,7 @@ impl Table {
             let ptr = ffi::td_str_ptr(atom);
             let len = ffi::td_str_len(atom);
             let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-            std::str::from_utf8_unchecked(slice)
+            std::str::from_utf8(slice).unwrap_or("")
         }
     }
 
@@ -574,7 +585,7 @@ impl Table {
             let ptr = ffi::td_str_ptr(atom);
             let slen = ffi::td_str_len(atom);
             let slice = std::slice::from_raw_parts(ptr as *const u8, slen);
-            Some(std::str::from_utf8_unchecked(slice))
+            std::str::from_utf8(slice).ok()
         }
     }
 }
@@ -930,10 +941,10 @@ impl Graph<'_> {
             ffi::td_group(
                 self.raw,
                 key_ptrs.as_mut_ptr(),
-                keys.len() as u8,
+                to_u8(keys.len())?,
                 ops.as_mut_ptr(),
                 input_ptrs.as_mut_ptr(),
-                agg_ops.len() as u8,
+                to_u8(agg_ops.len())?,
             )
         };
         // Pin arrays — td_group stores pointers to them
@@ -964,7 +975,7 @@ impl Graph<'_> {
                 lk.as_mut_ptr(),
                 right_df.raw,
                 rk.as_mut_ptr(),
-                left_keys.len() as u8,
+                to_u8(left_keys.len())?,
                 join_type,
             )
         };
@@ -1007,7 +1018,7 @@ impl Graph<'_> {
                 key_ptrs.as_mut_ptr(),
                 desc_u8.as_mut_ptr(),
                 nf_ptr,
-                keys.len() as u8,
+                to_u8(keys.len())?,
             )
         };
         // Pin arrays — td_sort_op stores pointers to them
@@ -1054,14 +1065,14 @@ impl Graph<'_> {
                 self.raw,
                 df_node.raw,
                 pk_ptrs.as_mut_ptr(),
-                part_keys.len() as u8,
+                to_u8(part_keys.len())?,
                 ok_ptrs.as_mut_ptr(),
                 od_u8.as_mut_ptr(),
-                order_keys.len() as u8,
+                to_u8(order_keys.len())?,
                 kinds.as_mut_ptr(),
                 fi_ptrs.as_mut_ptr(),
                 params.as_mut_ptr(),
-                funcs.len() as u8,
+                to_u8(funcs.len())?,
                 frame_type.to_code(),
                 frame_start.to_code(),
                 frame_end.to_code(),
@@ -1080,23 +1091,23 @@ impl Graph<'_> {
     }
 
     /// Project (select) specific columns from a DataFrame node.
-    pub fn project(&self, input: Column, cols: &[Column]) -> Column {
+    pub fn project(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
-        Column {
+        Ok(Column {
             raw: unsafe {
-                ffi::td_project(self.raw, input.raw, col_ptrs.as_mut_ptr(), cols.len() as u8)
+                ffi::td_project(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
             },
-        }
+        })
     }
 
     /// Select specific columns from a DataFrame node (alias for project).
-    pub fn select(&self, input: Column, cols: &[Column]) -> Column {
+    pub fn select(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
-        Column {
+        Ok(Column {
             raw: unsafe {
-                ffi::td_select(self.raw, input.raw, col_ptrs.as_mut_ptr(), cols.len() as u8)
+                ffi::td_select(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
             },
-        }
+        })
     }
 
     /// Filter rows by a boolean predicate column.

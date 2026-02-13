@@ -51,6 +51,8 @@ td_t* td_vec_new(int8_t type, int64_t capacity) {
 
     uint8_t esz = td_elem_size(type);
     size_t data_size = (size_t)capacity * esz;
+    if (esz > 1 && data_size / esz != (size_t)capacity)
+        return TD_ERR_PTR(TD_ERR_OOM);
 
     td_t* v = td_alloc(data_size);
     if (!v || TD_IS_ERR(v)) return v;

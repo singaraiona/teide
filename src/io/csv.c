@@ -387,16 +387,19 @@ TD_INLINE int64_t fast_i64(const char* p, size_t len) {
     if (TD_UNLIKELY(len == 0)) return 0;
 
     const char* end = p + len;
-    int64_t sign = 1;
-    if (*p == '-') { sign = -1; p++; }
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; }
     else if (*p == '+') { p++; }
 
     uint64_t val = 0;
     while (p < end) {
-        val = val * 10 + (uint64_t)((unsigned char)*p - '0');
+        unsigned d = (unsigned char)*p - '0';
+        if (d > 9) break; /* stop on non-digit */
+        val = val * 10 + d;
         p++;
     }
-    return sign * (int64_t)val;
+    /* Negate in unsigned to avoid signed overflow UB */
+    return neg ? (int64_t)(~val + 1u) : (int64_t)val;
 }
 
 /* --------------------------------------------------------------------------
@@ -580,8 +583,8 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
         if (col_types[c] != CSV_TYPE_STR) continue;
 
         /* Build per-worker mappings: local_id → global sym_id (VLA) */
-        int64_t* mappings[CSV_MAX_COLS]; /* reuse for n_workers, which is < 256 */
-        td_t* map_hdrs[CSV_MAX_COLS];
+        int64_t* mappings[n_workers];
+        td_t* map_hdrs[n_workers];
         for (uint32_t w = 0; w < n_workers; w++) {
             mappings[w] = NULL;
             map_hdrs[w] = NULL;

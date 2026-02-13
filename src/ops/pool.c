@@ -207,6 +207,12 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
         }
     }
 
+    /* Clamp n_tasks to task_cap to prevent ring overflow */
+    if (n_tasks > pool->task_cap) {
+        n_tasks = pool->task_cap;
+        grain = (total_elems + n_tasks - 1) / n_tasks;
+    }
+
     /* Fill task ring */
     for (uint32_t i = 0; i < n_tasks; i++) {
         int64_t start = (int64_t)i * grain;
@@ -270,6 +276,9 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
             }
         }
     }
+
+    /* Clamp n_tasks to task_cap to prevent ring overflow */
+    if (n_tasks > pool->task_cap) n_tasks = pool->task_cap;
 
     /* Fill task ring: one task per partition */
     for (uint32_t i = 0; i < n_tasks; i++) {

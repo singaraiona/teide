@@ -112,10 +112,6 @@ extern "C" {
 
 /* ===== Attribute Flags ===== */
 
-#define TD_ATTR_SORTED       0x01
-#define TD_ATTR_UNIQUE       0x02
-#define TD_ATTR_PARTITIONED  0x04
-#define TD_ATTR_GROUPED      0x08
 #define TD_ATTR_SLICE        0x10
 #define TD_ATTR_NULLMAP_EXT  0x20
 #define TD_ATTR_HAS_NULLS    0x40
@@ -123,7 +119,6 @@ extern "C" {
 /* ===== Morsel Constants ===== */
 
 #define TD_MORSEL_ELEMS  1024
-#define TD_MORSEL_REGS   8
 
 /* ===== Slab Cache Constants ===== */
 
@@ -139,10 +134,6 @@ extern "C" {
 
 #define TD_PARALLEL_THRESHOLD  (64 * TD_MORSEL_ELEMS)
 #define TD_DISPATCH_MORSELS    8
-
-/* ===== Spill Threshold ===== */
-
-#define TD_SPILL_THRESHOLD_RATIO  0.25
 
 /* ===== Error Handling ===== */
 
@@ -324,13 +315,12 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 /* Op flags */
 #define OP_FLAG_FUSED        0x01
 #define OP_FLAG_DEAD         0x02
-#define OP_FLAG_MATERIALIZED 0x04
 
 /* Operation node (32 bytes, fits one cache line) */
 typedef struct td_op {
     uint16_t       opcode;     /* OP_ADD, OP_SCAN, OP_FILTER, etc. */
     uint8_t        arity;      /* 0, 1, or 2 */
-    uint8_t        flags;      /* FUSED, DEAD, MATERIALIZED */
+    uint8_t        flags;      /* FUSED, DEAD */
     int8_t         out_type;   /* inferred output type */
     uint8_t        pad[3];
     uint32_t       id;         /* unique node ID */

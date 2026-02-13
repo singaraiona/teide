@@ -307,7 +307,7 @@ void td_free(td_t* v) {
 
                 td_t* tracker_block = (td_t*)((uint8_t*)db - 32);
                 td_arena_t* ta = td_arena_find(tracker_block);
-                if (ta) td_buddy_free(&ta->buddy, tracker_block, TD_ORDER_MIN);
+                if (ta) td_buddy_free(&ta->buddy, tracker_block, TD_ORDER_MIN + 1);
 
                 td_tl_stats.free_count++;
                 td_tl_stats.bytes_allocated -= sz;

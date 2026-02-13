@@ -44,8 +44,11 @@
 
 static int8_t promote_type(int8_t a, int8_t b) {
     if (a == TD_F64 || b == TD_F64) return TD_F64;
-    if (a == TD_I64 || b == TD_I64) return TD_I64;
-    if (a == TD_I32 || b == TD_I32) return TD_I32;
+    /* Treat SYM/ENUM/TIMESTAMP/DATE/TIME as integer-class types */
+    if (a == TD_I64 || b == TD_I64 || a == TD_SYM || b == TD_SYM ||
+        a == TD_TIMESTAMP || b == TD_TIMESTAMP) return TD_I64;
+    if (a == TD_I32 || b == TD_I32 || a == TD_ENUM || b == TD_ENUM ||
+        a == TD_DATE || b == TD_DATE || a == TD_TIME || b == TD_TIME) return TD_I32;
     if (a == TD_I16 || b == TD_I16) return TD_I16;
     if (a == TD_U8 || b == TD_U8) return TD_U8;
     return TD_BOOL;

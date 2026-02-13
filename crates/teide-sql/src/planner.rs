@@ -431,14 +431,14 @@ fn plan_query(
             if has_group_by || has_aggregates {
                 // Evaluate predicate only — pass as mask to GROUP BY
                 let mask_ptr = {
-                    let mut g = ctx.graph(&table);
+                    let mut g = ctx.graph(&table)?;
                     let pred = plan_expr(&mut g, &resolved, &schema)?;
                     g.execute_raw(pred)?
                 };
                 (table, Some(mask_ptr))
             } else {
                 // Non-GROUP BY: materialize as before
-                let mut g = ctx.graph(&table);
+                let mut g = ctx.graph(&table)?;
                 let df_node = g.const_df(&table);
                 let pred = plan_expr(&mut g, &resolved, &schema)?;
                 let filtered = g.filter(df_node, pred);
@@ -504,7 +504,7 @@ fn plan_query(
         for (i, alias) in result_aliases.iter().enumerate() {
             having_schema.entry(alias.clone()).or_insert(i);
         }
-        let mut g = ctx.graph(&result_table);
+        let mut g = ctx.graph(&result_table)?;
         let df_node = g.const_df(&result_table);
         let pred = plan_having_expr(&mut g, having_expr, &having_schema, &schema)?;
         let filtered = g.filter(df_node, pred);
@@ -522,7 +522,7 @@ fn plan_query(
         let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
-        let mut g = ctx.graph(&result_table);
+        let mut g = ctx.graph(&result_table)?;
         let df_node = g.const_df(&result_table);
         let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
@@ -551,7 +551,7 @@ fn plan_query(
         match (offset_val, limit_val) {
             (Some(off), Some(lim)) => {
                 let total = off + lim;
-                let g = ctx.graph(&result_table);
+                let g = ctx.graph(&result_table)?;
                 let df_node = g.const_df(&result_table);
                 let head_node = g.head(df_node, total);
                 let trimmed = g.execute(head_node)?;
@@ -559,7 +559,7 @@ fn plan_query(
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
-                let g = ctx.graph(&result_table);
+                let g = ctx.graph(&result_table)?;
                 let df_node = g.const_df(&result_table);
                 let root = g.head(df_node, lim);
                 g.execute(root)?
@@ -771,7 +771,7 @@ fn resolve_from(
 
         // Build join graph (scoped to avoid borrow conflict)
         let result = {
-            let mut g = ctx.graph(&al_table);
+            let mut g = ctx.graph(&al_table)?;
             let left_df_node = g.const_df(&al_table);
             let right_df_node = g.const_df(&ar_table);
 
@@ -993,7 +993,7 @@ fn plan_group_select(
     }
 
     // Phase 2: Execute GROUP BY with keys + all unique aggregates
-    let mut g = ctx.graph(working_table);
+    let mut g = ctx.graph(working_table)?;
 
     let mut key_nodes: Vec<Column> = Vec::new();
     for k in &key_names {
@@ -1063,7 +1063,7 @@ fn plan_group_select(
         alias_to_native.insert(agg.alias.clone(), native.to_string());
     }
 
-    let mut pg = ctx.graph(&group_result);
+    let mut pg = ctx.graph(&group_result)?;
     let df_node = pg.const_df(&group_result);
 
     let mut proj_cols = Vec::new();
@@ -1090,7 +1090,7 @@ fn plan_group_select(
         }
     }
 
-    let proj = pg.select(df_node, &proj_cols);
+    let proj = pg.select(df_node, &proj_cols)?;
     let result = pg.execute(proj)?;
 
     Ok((result, final_aliases))
@@ -1180,7 +1180,7 @@ fn plan_count_distinct_group(
         }
     }
 
-    let mut g = ctx.graph(working_table);
+    let mut g = ctx.graph(working_table)?;
     let mut key_nodes: Vec<Column> = Vec::new();
     for k in &phase1_keys {
         if let Some(expr) = alias_exprs.get(k) {
@@ -1216,7 +1216,7 @@ fn plan_count_distinct_group(
 
     // Phase 2: GROUP BY [original_keys] with COUNT(*) for each distinct col
     // and FIRST for each regular aggregate
-    let mut g2 = ctx.graph(&phase1_result);
+    let mut g2 = ctx.graph(&phase1_result)?;
     let phase2_keys: Vec<Column> = key_names
         .iter()
         .map(|k| g2.scan(k))
@@ -1229,7 +1229,7 @@ fn plan_count_distinct_group(
         // Phase 1 grouped by distinct_cols → nrows = unique count.
         // Use a scalar GROUP BY (no keys) with COUNT(*) to produce a 1-row table.
         let first_col_name = phase1_result.col_name_str(0).to_string();
-        let mut g2 = ctx.graph(&phase1_result);
+        let mut g2 = ctx.graph(&phase1_result)?;
         let count_input = g2.scan(&first_col_name)?;
         let group_node = g2.group_by(&[], &[teide::AggOp::Count], &[count_input])?;
         let result = g2.execute(group_node)?;
@@ -1313,7 +1313,7 @@ fn plan_distinct(
     schema: &HashMap<String, usize>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     // GROUP BY all selected columns with a dummy COUNT(*) aggregate
-    let mut g = ctx.graph(working_table);
+    let mut g = ctx.graph(working_table)?;
     let key_nodes: Vec<Column> = col_names
         .iter()
         .map(|k| g.scan(k))
@@ -1331,13 +1331,13 @@ fn plan_distinct(
 
     // The result has keys + 1 COUNT column. We only want the keys.
     // Build a SELECT projection to drop the count column.
-    let pg = ctx.graph(&group_result);
+    let pg = ctx.graph(&group_result)?;
     let df_node = pg.const_df(&group_result);
     let proj_cols: Vec<Column> = col_names
         .iter()
         .map(|k| pg.scan(k))
         .collect::<teide::Result<Vec<_>>>()?;
-    let proj = pg.select(df_node, &proj_cols);
+    let proj = pg.select(df_node, &proj_cols)?;
     let result = pg.execute(proj)?;
 
     Ok((result, col_names.to_vec()))
@@ -1353,7 +1353,7 @@ fn plan_expr_select(
     select_items: &[SelectItem],
     schema: &HashMap<String, usize>,
 ) -> Result<(Table, Vec<String>), SqlError> {
-    let mut g = ctx.graph(working_table);
+    let mut g = ctx.graph(working_table)?;
     let df_node = g.const_df(working_table);
 
     let mut proj_cols = Vec::new();
@@ -1383,7 +1383,7 @@ fn plan_expr_select(
         }
     }
 
-    let proj = g.select(df_node, &proj_cols);
+    let proj = g.select(df_node, &proj_cols)?;
     let result = g.execute(proj)?;
     Ok((result, aliases))
 }
@@ -1434,7 +1434,7 @@ fn plan_window_stage(
 
     for (spec, func_indices) in spec_groups {
         let stage_result = {
-            let mut g = ctx.graph(&current_table);
+            let mut g = ctx.graph(&current_table)?;
             let df_node = g.const_df(&current_table);
             let (frame_type, frame_start, frame_end) = parse_window_frame(&spec)?;
 
@@ -1602,14 +1602,14 @@ fn rewrite_window_refs(
 fn skip_rows(ctx: &Context, table: &Table, offset: i64) -> Result<Table, SqlError> {
     let nrows = table.nrows();
     if offset >= nrows {
-        let g = ctx.graph(table);
+        let g = ctx.graph(table)?;
         let df_node = g.const_df(table);
         let root = g.head(df_node, 0);
         return Ok(g.execute(root)?);
     }
     // td_tail takes the last N rows — exactly what we need after skipping offset
     let keep = nrows - offset;
-    let g = ctx.graph(table);
+    let g = ctx.graph(table)?;
     let df_node = g.const_df(table);
     let root = g.tail(df_node, keep);
     Ok(g.execute(root)?)
@@ -1994,7 +1994,7 @@ fn apply_post_processing(
         let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
-        let mut g = ctx.graph(&result_table);
+        let mut g = ctx.graph(&result_table)?;
         let df_node = g.const_df(&result_table);
         let sort_node = plan_order_by(&mut g, df_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
@@ -2022,7 +2022,7 @@ fn apply_post_processing(
         match (offset_val, limit_val) {
             (Some(off), Some(lim)) => {
                 let total = off + lim;
-                let g = ctx.graph(&result_table);
+                let g = ctx.graph(&result_table)?;
                 let df_node = g.const_df(&result_table);
                 let head_node = g.head(df_node, total);
                 let trimmed = g.execute(head_node)?;
@@ -2030,7 +2030,7 @@ fn apply_post_processing(
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
-                let g = ctx.graph(&result_table);
+                let g = ctx.graph(&result_table)?;
                 let df_node = g.const_df(&result_table);
                 let root = g.head(df_node, lim);
                 g.execute(root)?

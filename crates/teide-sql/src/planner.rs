@@ -1535,6 +1535,18 @@ fn skip_rows(ctx: &Context, table: &Table, offset: i64) -> Result<Table, SqlErro
     Ok(g.execute(root)?)
 }
 
+fn engine_err_from_raw(ptr: *mut teide::td_t) -> SqlError {
+    match teide::ffi_error_from_ptr(ptr) {
+        Some(err) => SqlError::Engine(err),
+        None => SqlError::Engine(teide::Error::Oom),
+    }
+}
+
+fn release_result_and_err(raw: *mut teide::td_t, err: SqlError) -> Result<Table, SqlError> {
+    unsafe { teide::ffi_release(raw) };
+    Err(err)
+}
+
 // ---------------------------------------------------------------------------
 // UNION ALL: concatenate two tables
 // ---------------------------------------------------------------------------
@@ -1553,19 +1565,37 @@ fn concat_tables(_ctx: &Context, left: &Table, right: &Table) -> Result<Table, S
 
     let mut result_raw = result_raw;
     for c in 0..ncols {
-        let l_col = left.get_col_idx(c).ok_or(SqlError::Plan(
-            "UNION ALL: left column missing".into(),
-        ))?;
-        let r_col = right.get_col_idx(c).ok_or(SqlError::Plan(
-            "UNION ALL: right column missing".into(),
-        ))?;
+        let l_col = match left.get_col_idx(c) {
+            Some(col) => col,
+            None => return release_result_and_err(
+                result_raw,
+                SqlError::Plan("UNION ALL: left column missing".into()),
+            ),
+        };
+        let r_col = match right.get_col_idx(c) {
+            Some(col) => col,
+            None => return release_result_and_err(
+                result_raw,
+                SqlError::Plan("UNION ALL: right column missing".into()),
+            ),
+        };
         let merged = unsafe { teide::ffi_vec_concat(l_col, r_col) };
-        if merged.is_null() || teide::ffi_is_err(merged) {
-            return Err(SqlError::Engine(teide::Error::Oom));
+        if merged.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(merged) {
+            return release_result_and_err(result_raw, engine_err_from_raw(merged));
         }
         let name_id = left.col_name(c);
-        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, merged) };
+        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, merged) };
         unsafe { teide::ffi_release(merged) };
+        if next.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(next) {
+            return release_result_and_err(result_raw, engine_err_from_raw(next));
+        }
+        result_raw = next;
     }
 
     // Wrap in a Table with proper RAII
@@ -1591,17 +1621,26 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
 
     // Left columns: repeat each row r_nrows times
     for c in 0..l_ncols {
-        let col = left.get_col_idx(c).ok_or(SqlError::Plan(
-            "CROSS JOIN: left column missing".into(),
-        ))?;
+        let col = match left.get_col_idx(c) {
+            Some(col) => col,
+            None => {
+                return release_result_and_err(
+                    result_raw,
+                    SqlError::Plan("CROSS JOIN: left column missing".into()),
+                );
+            }
+        };
         let name_id = left.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
         let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
-        if new_col.is_null() || teide::ffi_is_err(new_col) {
-            return Err(SqlError::Engine(teide::Error::Oom));
+        if new_col.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
         }
-        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        if teide::ffi_is_err(new_col) {
+            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+        }
+        unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
         let dst = unsafe { teide::raw::td_data(new_col) };
         for lr in 0..l_nrows {
@@ -1616,23 +1655,39 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
                 }
             }
         }
-        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
         unsafe { teide::ffi_release(new_col) };
+        if next.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(next) {
+            return release_result_and_err(result_raw, engine_err_from_raw(next));
+        }
+        result_raw = next;
     }
 
     // Right columns: tile the entire column l_nrows times
     for c in 0..r_ncols {
-        let col = right.get_col_idx(c).ok_or(SqlError::Plan(
-            "CROSS JOIN: right column missing".into(),
-        ))?;
+        let col = match right.get_col_idx(c) {
+            Some(col) => col,
+            None => {
+                return release_result_and_err(
+                    result_raw,
+                    SqlError::Plan("CROSS JOIN: right column missing".into()),
+                );
+            }
+        };
         let name_id = right.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
         let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
-        if new_col.is_null() || teide::ffi_is_err(new_col) {
-            return Err(SqlError::Engine(teide::Error::Oom));
+        if new_col.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
         }
-        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        if teide::ffi_is_err(new_col) {
+            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+        }
+        unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
         let dst = unsafe { teide::raw::td_data(new_col) };
         for lr in 0..l_nrows {
@@ -1644,8 +1699,15 @@ fn exec_cross_join(_ctx: &Context, left: &Table, right: &Table) -> Result<Table,
                 );
             }
         }
-        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
         unsafe { teide::ffi_release(new_col) };
+        if next.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(next) {
+            return release_result_and_err(result_raw, engine_err_from_raw(next));
+        }
+        result_raw = next;
     }
 
     unsafe { teide::ffi_retain(result_raw) };
@@ -1667,29 +1729,40 @@ fn exec_set_operation(
     let r_nrows = right.nrows() as usize;
     let ncols = left.ncols();
 
-    // Hash all right-side rows
-    let mut right_counts: StdMap<u64, usize> = StdMap::new();
+    let left_cols = collect_setop_columns(left, ncols)?;
+    let right_cols = collect_setop_columns(right, ncols)?;
+
+    // Hash all right-side rows into buckets; exact row equality is checked on probe.
+    let mut right_buckets: StdMap<u64, Vec<usize>> = StdMap::new();
     for r in 0..r_nrows {
-        let h = hash_table_row(right, r, ncols as usize);
-        *right_counts.entry(h).or_insert(0) += 1;
+        let h = hash_setop_row(&right_cols, r);
+        right_buckets.entry(h).or_default().push(r);
     }
 
     // Probe with left-side rows, collect indices to keep
     let mut keep_indices: Vec<usize> = Vec::new();
-    let mut remaining = right_counts.clone();
+    let mut remaining = vec![1usize; r_nrows];
     for r in 0..l_nrows {
-        let h = hash_table_row(left, r, ncols as usize);
-        let in_right = remaining.get(&h).copied().unwrap_or(0) > 0;
+        let h = hash_setop_row(&left_cols, r);
+        let matched_right_row = right_buckets
+            .get(&h)
+            .and_then(|candidates| {
+                candidates.iter().copied().find(|&rr| {
+                    remaining[rr] > 0
+                        && setop_rows_equal(&left_cols, r, &right_cols, rr)
+                })
+            });
+
         if keep_matches {
             // INTERSECT: keep if in right
-            if in_right {
+            if let Some(rr) = matched_right_row {
                 keep_indices.push(r);
-                *remaining.get_mut(&h).unwrap() -= 1;
+                remaining[rr] -= 1;
             }
         } else {
             // EXCEPT: keep if NOT in right
-            if in_right {
-                *remaining.get_mut(&h).unwrap() -= 1;
+            if let Some(rr) = matched_right_row {
+                remaining[rr] -= 1;
             } else {
                 keep_indices.push(r);
             }
@@ -1705,17 +1778,26 @@ fn exec_set_operation(
     let out_nrows = keep_indices.len();
 
     for c in 0..ncols {
-        let col = left.get_col_idx(c).ok_or(SqlError::Plan(
-            "SET operation: column missing".into(),
-        ))?;
+        let col = match left.get_col_idx(c) {
+            Some(col) => col,
+            None => {
+                return release_result_and_err(
+                    result_raw,
+                    SqlError::Plan("SET operation: column missing".into()),
+                );
+            }
+        };
         let name_id = left.col_name(c);
         let col_type = unsafe { teide::raw::td_type(col) };
         let esz = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
         let new_col = unsafe { teide::raw::td_vec_new(col_type, out_nrows as i64) };
-        if new_col.is_null() || teide::ffi_is_err(new_col) {
-            return Err(SqlError::Engine(teide::Error::Oom));
+        if new_col.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
         }
-        unsafe { *((*new_col).val.as_mut_ptr() as *mut i64) = out_nrows as i64 };
+        if teide::ffi_is_err(new_col) {
+            return release_result_and_err(result_raw, engine_err_from_raw(new_col));
+        }
+        unsafe { teide::raw::td_set_len(new_col, out_nrows as i64) };
         let src = unsafe { teide::raw::td_data(col) };
         let dst = unsafe { teide::raw::td_data(new_col) };
         for (out_row, &in_row) in keep_indices.iter().enumerate() {
@@ -1727,54 +1809,78 @@ fn exec_set_operation(
                 );
             }
         }
-        result_raw = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
+        let next = unsafe { teide::ffi_table_add_col(result_raw, name_id, new_col) };
         unsafe { teide::ffi_release(new_col) };
+        if next.is_null() {
+            return release_result_and_err(result_raw, SqlError::Engine(teide::Error::Oom));
+        }
+        if teide::ffi_is_err(next) {
+            return release_result_and_err(result_raw, engine_err_from_raw(next));
+        }
+        result_raw = next;
     }
 
     unsafe { teide::ffi_retain(result_raw) };
     Ok(unsafe { Table::from_raw(result_raw) })
 }
 
-/// Hash a table row across all columns for set operations.
-fn hash_table_row(table: &Table, row: usize, ncols: usize) -> u64 {
-    let mut h: u64 = 0;
+#[derive(Clone, Copy)]
+struct SetOpCol {
+    col_type: i8,
+    elem_size: usize,
+    data: *const u8,
+}
+
+fn collect_setop_columns(table: &Table, ncols: i64) -> Result<Vec<SetOpCol>, SqlError> {
+    let mut cols = Vec::with_capacity(ncols as usize);
     for c in 0..ncols {
-        let col = match table.get_col_idx(c as i64) {
-            Some(p) => p,
-            None => continue,
-        };
+        let col = table.get_col_idx(c).ok_or_else(|| {
+            SqlError::Plan("SET operation: column missing".into())
+        })?;
         let col_type = unsafe { teide::raw::td_type(col) };
-        let data = unsafe { teide::raw::td_data(col) };
-        let kh: u64 = match col_type {
-            6 | 14 | 11 => {
-                // TD_I64, TD_SYM, TD_TIMESTAMP
-                let v = unsafe { *(data as *const i64).add(row) };
-                v as u64
-            }
-            7 => {
-                // TD_F64
-                let v = unsafe { *(data as *const f64).add(row) };
-                v.to_bits()
-            }
-            5 => {
-                // TD_I32
-                let v = unsafe { *(data as *const i32).add(row) };
-                v as u64
-            }
-            15 => {
-                // TD_ENUM
-                let v = unsafe { *(data as *const u32).add(row) };
-                v as u64
-            }
-            _ => 0,
-        };
-        h = if c == 0 {
-            kh.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(kh >> 32)
-        } else {
-            h ^ kh.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(h >> 16)
-        };
+        let elem_size = unsafe { teide::raw::td_type_sizes[col_type as usize] } as usize;
+        let data = unsafe { teide::raw::td_data(col) } as *const u8;
+        cols.push(SetOpCol {
+            col_type,
+            elem_size,
+            data,
+        });
     }
-    h
+    Ok(cols)
+}
+
+fn hash_setop_row(cols: &[SetOpCol], row: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for col in cols {
+        col.col_type.hash(&mut hasher);
+        unsafe { setop_cell_bytes(col, row) }.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn setop_rows_equal(
+    left_cols: &[SetOpCol],
+    left_row: usize,
+    right_cols: &[SetOpCol],
+    right_row: usize,
+) -> bool {
+    left_cols.iter().zip(right_cols.iter()).all(|(l, r)| {
+        l.col_type == r.col_type
+            && l.elem_size == r.elem_size
+            && unsafe { setop_cell_bytes(l, left_row) == setop_cell_bytes(r, right_row) }
+    })
+}
+
+/// Return one cell as raw bytes for fixed-width set-operation comparison.
+///
+/// # Safety
+/// `col.data` must point to a contiguous allocation of at least
+/// `(row + 1) * col.elem_size` bytes.
+unsafe fn setop_cell_bytes(col: &SetOpCol, row: usize) -> &[u8] {
+    let byte_offset = row * col.elem_size;
+    unsafe { std::slice::from_raw_parts(col.data.add(byte_offset), col.elem_size) }
 }
 
 /// Apply ORDER BY and LIMIT from the outer query to a result.

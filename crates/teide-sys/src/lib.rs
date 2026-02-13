@@ -111,6 +111,28 @@ pub const OP_AND: u16 = 31;
 pub const OP_OR: u16 = 32;
 pub const OP_MIN2: u16 = 33;
 pub const OP_MAX2: u16 = 34;
+pub const OP_IF: u16 = 35;
+pub const OP_LIKE: u16 = 36;
+pub const OP_UPPER: u16 = 37;
+pub const OP_LOWER: u16 = 38;
+pub const OP_STRLEN: u16 = 39;
+pub const OP_SUBSTR: u16 = 40;
+pub const OP_REPLACE: u16 = 41;
+pub const OP_TRIM: u16 = 42;
+pub const OP_CONCAT: u16 = 43;
+pub const OP_EXTRACT: u16 = 45;
+pub const OP_DATE_TRUNC: u16 = 46;
+
+// EXTRACT / DATE_TRUNC field identifiers
+pub const TD_EXTRACT_YEAR: i64 = 0;
+pub const TD_EXTRACT_MONTH: i64 = 1;
+pub const TD_EXTRACT_DAY: i64 = 2;
+pub const TD_EXTRACT_HOUR: i64 = 3;
+pub const TD_EXTRACT_MINUTE: i64 = 4;
+pub const TD_EXTRACT_SECOND: i64 = 5;
+pub const TD_EXTRACT_DOW: i64 = 6;
+pub const TD_EXTRACT_DOY: i64 = 7;
+pub const TD_EXTRACT_EPOCH: i64 = 8;
 
 // Reductions (pipeline breakers)
 pub const OP_SUM: u16 = 50;
@@ -121,6 +143,7 @@ pub const OP_COUNT: u16 = 54;
 pub const OP_AVG: u16 = 55;
 pub const OP_FIRST: u16 = 56;
 pub const OP_LAST: u16 = 57;
+pub const OP_COUNT_DISTINCT: u16 = 58;
 
 // Structural (pipeline breakers)
 pub const OP_FILTER: u16 = 60;
@@ -136,6 +159,34 @@ pub const OP_TAIL: u16 = 68;
 // Misc
 pub const OP_ALIAS: u16 = 70;
 pub const OP_MATERIALIZE: u16 = 71;
+pub const OP_WINDOW: u16 = 72;
+
+// Window function kinds
+pub const TD_WIN_ROW_NUMBER: u8 = 0;
+pub const TD_WIN_RANK: u8 = 1;
+pub const TD_WIN_DENSE_RANK: u8 = 2;
+pub const TD_WIN_NTILE: u8 = 3;
+pub const TD_WIN_SUM: u8 = 4;
+pub const TD_WIN_AVG: u8 = 5;
+pub const TD_WIN_MIN: u8 = 6;
+pub const TD_WIN_MAX: u8 = 7;
+pub const TD_WIN_COUNT: u8 = 8;
+pub const TD_WIN_LAG: u8 = 9;
+pub const TD_WIN_LEAD: u8 = 10;
+pub const TD_WIN_FIRST_VALUE: u8 = 11;
+pub const TD_WIN_LAST_VALUE: u8 = 12;
+pub const TD_WIN_NTH_VALUE: u8 = 13;
+
+// Window frame type
+pub const TD_FRAME_ROWS: u8 = 0;
+pub const TD_FRAME_RANGE: u8 = 1;
+
+// Window frame bounds
+pub const TD_BOUND_UNBOUNDED_PRECEDING: u8 = 0;
+pub const TD_BOUND_N_PRECEDING: u8 = 1;
+pub const TD_BOUND_CURRENT_ROW: u8 = 2;
+pub const TD_BOUND_N_FOLLOWING: u8 = 3;
+pub const TD_BOUND_UNBOUNDED_FOLLOWING: u8 = 4;
 
 // Op flags
 pub const OP_FLAG_FUSED: u8 = 0x01;
@@ -161,6 +212,9 @@ pub enum td_err_t {
 }
 
 /// Equivalent to C macro: `TD_ERR_PTR(e)` — cast error code to pointer.
+///
+/// # Safety
+/// The returned pointer is an encoded error sentinel and must never be dereferenced.
 #[inline]
 pub unsafe fn td_err_ptr(e: td_err_t) -> *mut td_t {
     e as usize as *mut td_t
@@ -175,7 +229,20 @@ pub fn td_is_err(p: *const td_t) -> bool {
 /// Equivalent to C macro: `TD_ERR_CODE(p)` — extract error code from error pointer.
 #[inline]
 pub fn td_err_code(p: *const td_t) -> td_err_t {
-    unsafe { std::mem::transmute(p as u32) }
+    match p as usize as u32 {
+        0 => td_err_t::TD_OK,
+        1 => td_err_t::TD_ERR_OOM,
+        2 => td_err_t::TD_ERR_TYPE,
+        3 => td_err_t::TD_ERR_RANGE,
+        4 => td_err_t::TD_ERR_LENGTH,
+        5 => td_err_t::TD_ERR_RANK,
+        6 => td_err_t::TD_ERR_DOMAIN,
+        7 => td_err_t::TD_ERR_NYI,
+        8 => td_err_t::TD_ERR_IO,
+        9 => td_err_t::TD_ERR_SCHEMA,
+        10 => td_err_t::TD_ERR_CORRUPT,
+        _ => td_err_t::TD_ERR_CORRUPT,
+    }
 }
 
 // ===== Core Type: td_t (32-byte block header) =====
@@ -250,36 +317,54 @@ pub struct td_t {
 // ===== Inline Accessors =====
 
 /// Get the type tag of a td_t.
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
 #[inline]
 pub unsafe fn td_type(v: *const td_t) -> i8 {
     (*v).type_
 }
 
 /// True if the value is an atom (negative type).
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
 #[inline]
 pub unsafe fn td_is_atom(v: *const td_t) -> bool {
     (*v).type_ < 0
 }
 
 /// True if the value is a vector (positive type).
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
 #[inline]
 pub unsafe fn td_is_vec(v: *const td_t) -> bool {
     (*v).type_ > 0
 }
 
 /// Get the length (for vectors).
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
 #[inline]
 pub unsafe fn td_len(v: *const td_t) -> i64 {
     (*v).val.len
 }
 
 /// Get pointer to data payload (byte 32 onward).
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
 #[inline]
 pub unsafe fn td_data(v: *mut td_t) -> *mut c_void {
     (v as *mut u8).add(32) as *mut c_void
 }
 
 /// Element size for a given type tag.
+///
+/// # Safety
+/// `t` must be a valid positive type tag in the range `0..TD_TYPE_COUNT`.
 #[inline]
 pub unsafe fn td_elem_size(t: i8) -> u8 {
     td_type_sizes[t as usize]
@@ -317,6 +402,7 @@ pub struct td_graph_t {
     pub ext_nodes: *mut *mut td_op_ext_t,
     pub ext_count: u32,
     pub ext_cap: u32,
+    pub filter_mask: *mut td_t,
 }
 
 // ===== Morsel Iterator =====
@@ -546,6 +632,32 @@ extern "C" {
     pub fn td_or(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
     pub fn td_min2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
     pub fn td_max2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_if(
+        g: *mut td_graph_t,
+        cond: *mut td_op_t,
+        then_val: *mut td_op_t,
+        else_val: *mut td_op_t,
+    ) -> *mut td_op_t;
+    pub fn td_like(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_upper(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_lower(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_strlen(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_substr(
+        g: *mut td_graph_t,
+        str: *mut td_op_t,
+        start: *mut td_op_t,
+        len: *mut td_op_t,
+    ) -> *mut td_op_t;
+    pub fn td_replace(
+        g: *mut td_graph_t,
+        str: *mut td_op_t,
+        from: *mut td_op_t,
+        to: *mut td_op_t,
+    ) -> *mut td_op_t;
+    pub fn td_trim_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_concat(g: *mut td_graph_t, args: *mut *mut td_op_t, n: c_int) -> *mut td_op_t;
+    pub fn td_extract(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
+    pub fn td_date_trunc(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
 
     // Reduction ops
     pub fn td_sum(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
@@ -556,6 +668,7 @@ extern "C" {
     pub fn td_avg(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_first(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_last(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_count_distinct(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
 
     // Structural ops
     pub fn td_filter(
@@ -569,6 +682,7 @@ extern "C" {
         df_node: *mut td_op_t,
         keys: *mut *mut td_op_t,
         descs: *mut u8,
+        nulls_first: *mut u8,
         n_cols: u8,
     ) -> *mut td_op_t;
 
@@ -602,6 +716,24 @@ extern "C" {
         agg_ops: *mut u16,
         agg_ins: *mut *mut td_op_t,
         n_aggs: u8,
+    ) -> *mut td_op_t;
+    pub fn td_window_op(
+        g: *mut td_graph_t,
+        df_node: *mut td_op_t,
+        part_keys: *mut *mut td_op_t,
+        n_part: u8,
+        order_keys: *mut *mut td_op_t,
+        order_descs: *mut u8,
+        n_order: u8,
+        func_kinds: *mut u8,
+        func_inputs: *mut *mut td_op_t,
+        func_params: *mut i64,
+        n_funcs: u8,
+        frame_type: u8,
+        frame_start: u8,
+        frame_end: u8,
+        frame_start_n: i64,
+        frame_end_n: i64,
     ) -> *mut td_op_t;
 
     pub fn td_project(

@@ -9,371 +9,15 @@ extern crate teide_sys;
 
 use std::ffi::CString;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // ---------------------------------------------------------------------------
-// Raw FFI declarations — these mirror what teide-sys will export.
-// Once teide-sys is fully populated we can replace these with `use teide_sys::*`.
+// FFI bridge backed by `teide-sys`.
 // ---------------------------------------------------------------------------
 
 #[allow(non_camel_case_types, dead_code)]
 mod ffi {
-    use std::os::raw::{c_char, c_int};
-
-    // ---- Core types -------------------------------------------------------
-
-    /// 32-byte block header — the fundamental C object.
-    #[repr(C)]
-    pub struct td_t {
-        pub _nullmap: [u8; 16],
-        pub mmod: u8,
-        pub order: u8,
-        pub type_: i8,
-        pub attrs: u8,
-        pub rc: u32,  // _Atomic in C, but we never touch it from Rust
-        pub val: [u8; 8], // union: i64, f64, len, etc.
-    }
-
-    /// Operation node (32 bytes).
-    #[repr(C)]
-    pub struct td_op_t {
-        pub opcode: u16,
-        pub arity: u8,
-        pub flags: u8,
-        pub out_type: i8,
-        pub pad: [u8; 3],
-        pub id: u32,
-        pub est_rows: u32,
-        pub inputs: [*mut td_op_t; 2],
-    }
-
-    /// Operation graph.
-    #[repr(C)]
-    pub struct td_graph_t {
-        pub nodes: *mut td_op_t,
-        pub node_count: u32,
-        pub node_cap: u32,
-        pub df: *mut td_t,
-        pub ext_nodes: *mut *mut std::ffi::c_void,
-        pub ext_count: u32,
-        pub ext_cap: u32,
-        pub filter_mask: *mut td_t,
-    }
-
-    // ---- Type constants ---------------------------------------------------
-
-    pub const TD_BOOL: i8 = 1;
-    pub const TD_I32: i8 = 5;
-    pub const TD_I64: i8 = 6;
-    pub const TD_F64: i8 = 7;
-    pub const TD_STR: i8 = 8;
-    pub const TD_TABLE: i8 = 13;
-    pub const TD_SYM: i8 = 14;
-    pub const TD_ENUM: i8 = 15;
-
-    // ---- Opcode constants for agg_ops -------------------------------------
-
-    pub const OP_SUM: u16 = 50;
-    pub const OP_MIN: u16 = 52;
-    pub const OP_MAX: u16 = 53;
-    pub const OP_COUNT: u16 = 54;
-    pub const OP_AVG: u16 = 55;
-    pub const OP_FIRST: u16 = 56;
-    pub const OP_LAST: u16 = 57;
-    pub const OP_COUNT_DISTINCT: u16 = 58;
-
-    // ---- Window function constants ----------------------------------------
-
-    pub const TD_WIN_ROW_NUMBER: u8 = 0;
-    pub const TD_WIN_RANK: u8 = 1;
-    pub const TD_WIN_DENSE_RANK: u8 = 2;
-    pub const TD_WIN_NTILE: u8 = 3;
-    pub const TD_WIN_SUM: u8 = 4;
-    pub const TD_WIN_AVG: u8 = 5;
-    pub const TD_WIN_MIN: u8 = 6;
-    pub const TD_WIN_MAX: u8 = 7;
-    pub const TD_WIN_COUNT: u8 = 8;
-    pub const TD_WIN_LAG: u8 = 9;
-    pub const TD_WIN_LEAD: u8 = 10;
-    pub const TD_WIN_FIRST_VALUE: u8 = 11;
-    pub const TD_WIN_LAST_VALUE: u8 = 12;
-    pub const TD_WIN_NTH_VALUE: u8 = 13;
-
-    pub const TD_FRAME_ROWS: u8 = 0;
-    pub const TD_FRAME_RANGE: u8 = 1;
-
-    pub const TD_BOUND_UNBOUNDED_PRECEDING: u8 = 0;
-    pub const TD_BOUND_N_PRECEDING: u8 = 1;
-    pub const TD_BOUND_CURRENT_ROW: u8 = 2;
-    pub const TD_BOUND_N_FOLLOWING: u8 = 3;
-    pub const TD_BOUND_UNBOUNDED_FOLLOWING: u8 = 4;
-
-    // ---- EXTRACT field constants ------------------------------------------
-
-    pub const TD_EXTRACT_YEAR: i64 = 0;
-    pub const TD_EXTRACT_MONTH: i64 = 1;
-    pub const TD_EXTRACT_DAY: i64 = 2;
-    pub const TD_EXTRACT_HOUR: i64 = 3;
-    pub const TD_EXTRACT_MINUTE: i64 = 4;
-    pub const TD_EXTRACT_SECOND: i64 = 5;
-    pub const TD_EXTRACT_DOW: i64 = 6;
-    pub const TD_EXTRACT_DOY: i64 = 7;
-    pub const TD_EXTRACT_EPOCH: i64 = 8;
-
-    // ---- Error constants --------------------------------------------------
-
-    pub const TD_OK: u32 = 0;
-    pub const TD_ERR_OOM: u32 = 1;
-    pub const TD_ERR_TYPE: u32 = 2;
-    pub const TD_ERR_RANGE: u32 = 3;
-    pub const TD_ERR_LENGTH: u32 = 4;
-    pub const TD_ERR_RANK: u32 = 5;
-    pub const TD_ERR_DOMAIN: u32 = 6;
-    pub const TD_ERR_NYI: u32 = 7;
-    pub const TD_ERR_IO: u32 = 8;
-    pub const TD_ERR_SCHEMA: u32 = 9;
-    pub const TD_ERR_CORRUPT: u32 = 10;
-
-    // ---- Accessor helpers -------------------------------------------------
-
-    /// `TD_IS_ERR(p)` → `(uintptr_t)(p) < 32`
-    #[inline]
-    pub fn td_is_err(p: *mut td_t) -> bool {
-        (p as usize) < 32
-    }
-
-    /// `TD_ERR_CODE(p)` → `(td_err_t)(uintptr_t)(p)`
-    #[inline]
-    pub fn td_err_code(p: *mut td_t) -> u32 {
-        p as usize as u32
-    }
-
-    /// `td_data(v)` → pointer at byte offset 32 from header
-    #[inline]
-    pub unsafe fn td_data(v: *mut td_t) -> *mut u8 {
-        unsafe { (v as *mut u8).add(32) }
-    }
-
-    /// `td_len(v)` → interpret val union as i64
-    #[inline]
-    pub unsafe fn td_len(v: *mut td_t) -> i64 {
-        unsafe { *((*v).val.as_ptr() as *const i64) }
-    }
-
-    /// Read the type tag.
-    #[inline]
-    pub unsafe fn td_type(v: *mut td_t) -> i8 {
-        unsafe { (*v).type_ }
-    }
-
-    // ---- Type sizes lookup ------------------------------------------------
-
-    extern "C" {
-        pub static td_type_sizes: [u8; 16];
-    }
-
-    // ---- FFI functions ----------------------------------------------------
-
-    extern "C" {
-        // Memory / init
-        pub fn td_arena_init();
-        pub fn td_arena_destroy_all();
-        pub fn td_sym_init();
-        pub fn td_sym_destroy();
-        pub fn td_pool_init(n_workers: u32) -> u32;
-        pub fn td_pool_destroy();
-
-        // Ref counting
-        pub fn td_retain(v: *mut td_t);
-        pub fn td_release(v: *mut td_t);
-
-        // Symbol table
-        pub fn td_sym_intern(s: *const c_char, len: usize) -> i64;
-        pub fn td_sym_str(id: i64) -> *mut td_t;
-
-        // Table API
-        pub fn td_table_new(ncols: i64) -> *mut td_t;
-        pub fn td_table_add_col(df: *mut td_t, name: i64, col: *mut td_t) -> *mut td_t;
-        pub fn td_table_get_col(df: *mut td_t, name: i64) -> *mut td_t;
-        pub fn td_table_nrows(df: *mut td_t) -> i64;
-        pub fn td_table_ncols(df: *mut td_t) -> i64;
-        pub fn td_table_col_name(df: *mut td_t, idx: i64) -> i64;
-        pub fn td_table_get_col_idx(df: *mut td_t, idx: i64) -> *mut td_t;
-
-        // String API
-        pub fn td_str_ptr(s: *mut td_t) -> *const c_char;
-        pub fn td_str_len(s: *mut td_t) -> usize;
-
-        // Vector API
-        pub fn td_vec_new(type_: i8, capacity: i64) -> *mut td_t;
-        pub fn td_vec_concat(a: *mut td_t, b: *mut td_t) -> *mut td_t;
-
-        // CSV API
-        pub fn td_csv_read(path: *const c_char) -> *mut td_t;
-        pub fn td_csv_read_opts(path: *const c_char, delimiter: c_char, header: bool) -> *mut td_t;
-
-        // Graph API
-        pub fn td_graph_new(df: *mut td_t) -> *mut td_graph_t;
-        pub fn td_graph_free(g: *mut td_graph_t);
-
-        // Source ops
-        pub fn td_scan(g: *mut td_graph_t, col_name: *const c_char) -> *mut td_op_t;
-        pub fn td_const_f64(g: *mut td_graph_t, val: f64) -> *mut td_op_t;
-        pub fn td_const_i64(g: *mut td_graph_t, val: i64) -> *mut td_op_t;
-        pub fn td_const_bool(g: *mut td_graph_t, val: bool) -> *mut td_op_t;
-        pub fn td_const_str(g: *mut td_graph_t, s: *const c_char) -> *mut td_op_t;
-        pub fn td_const_df(g: *mut td_graph_t, df: *mut td_t) -> *mut td_op_t;
-        pub fn td_const_vec(g: *mut td_graph_t, vec: *mut td_t) -> *mut td_op_t;
-
-        // Unary element-wise ops
-        pub fn td_neg(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_not(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_abs(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_sqrt_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_log_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_exp_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_ceil_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_floor_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_isnull(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_cast(g: *mut td_graph_t, a: *mut td_op_t, target_type: i8) -> *mut td_op_t;
-
-        // Binary element-wise ops
-        pub fn td_add(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_sub(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_mul(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_div(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_mod(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_eq(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_ne(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_lt(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_le(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_gt(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_ge(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_and(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_or(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_min2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_max2(g: *mut td_graph_t, a: *mut td_op_t, b: *mut td_op_t) -> *mut td_op_t;
-
-        // Reduction ops
-        pub fn td_sum(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_avg(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_min_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_max_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_count(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_first(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_last(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_count_distinct(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-
-        // Structural ops
-        pub fn td_filter(g: *mut td_graph_t, input: *mut td_op_t, predicate: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_sort_op(
-            g: *mut td_graph_t,
-            df_node: *mut td_op_t,
-            keys: *mut *mut td_op_t,
-            descs: *mut u8,
-            nulls_first: *mut u8,
-            n_cols: u8,
-        ) -> *mut td_op_t;
-        pub fn td_group(
-            g: *mut td_graph_t,
-            keys: *mut *mut td_op_t,
-            n_keys: u8,
-            agg_ops: *mut u16,
-            agg_ins: *mut *mut td_op_t,
-            n_aggs: u8,
-        ) -> *mut td_op_t;
-        pub fn td_project(
-            g: *mut td_graph_t,
-            input: *mut td_op_t,
-            cols: *mut *mut td_op_t,
-            n_cols: u8,
-        ) -> *mut td_op_t;
-        pub fn td_select(
-            g: *mut td_graph_t,
-            input: *mut td_op_t,
-            cols: *mut *mut td_op_t,
-            n_cols: u8,
-        ) -> *mut td_op_t;
-        pub fn td_head(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
-        pub fn td_tail(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
-        pub fn td_alias(g: *mut td_graph_t, input: *mut td_op_t, name: *const c_char) -> *mut td_op_t;
-
-        // Join
-        pub fn td_join(
-            g: *mut td_graph_t,
-            left_df: *mut td_op_t,
-            left_keys: *mut *mut td_op_t,
-            right_df: *mut td_op_t,
-            right_keys: *mut *mut td_op_t,
-            n_keys: u8,
-            join_type: u8,
-        ) -> *mut td_op_t;
-
-        // Window functions
-        pub fn td_window_op(
-            g: *mut td_graph_t,
-            df_node: *mut td_op_t,
-            part_keys: *mut *mut td_op_t,
-            n_part: u8,
-            order_keys: *mut *mut td_op_t,
-            order_descs: *mut u8,
-            n_order: u8,
-            func_kinds: *mut u8,
-            func_inputs: *mut *mut td_op_t,
-            func_params: *mut i64,
-            n_funcs: u8,
-            frame_type: u8,
-            frame_start: u8,
-            frame_end: u8,
-            frame_start_n: i64,
-            frame_end_n: i64,
-        ) -> *mut td_op_t;
-
-        // Ternary conditional (IF)
-        pub fn td_if(
-            g: *mut td_graph_t,
-            cond: *mut td_op_t,
-            then_val: *mut td_op_t,
-            else_val: *mut td_op_t,
-        ) -> *mut td_op_t;
-
-        // LIKE pattern matching
-        pub fn td_like(
-            g: *mut td_graph_t,
-            input: *mut td_op_t,
-            pattern: *mut td_op_t,
-        ) -> *mut td_op_t;
-
-        // String functions
-        pub fn td_upper(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_lower(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_strlen(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_trim_op(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_substr(
-            g: *mut td_graph_t,
-            str_col: *mut td_op_t,
-            start: *mut td_op_t,
-            len: *mut td_op_t,
-        ) -> *mut td_op_t;
-        pub fn td_replace(
-            g: *mut td_graph_t,
-            str_col: *mut td_op_t,
-            from: *mut td_op_t,
-            to: *mut td_op_t,
-        ) -> *mut td_op_t;
-        pub fn td_concat(
-            g: *mut td_graph_t,
-            args: *mut *mut td_op_t,
-            n: c_int,
-        ) -> *mut td_op_t;
-
-        // Date/time extraction and truncation
-        pub fn td_extract(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
-        pub fn td_date_trunc(g: *mut td_graph_t, col: *mut td_op_t, field: i64) -> *mut td_op_t;
-
-        // Optimizer + executor
-        pub fn td_optimize(g: *mut td_graph_t, root: *mut td_op_t) -> *mut td_op_t;
-        pub fn td_execute(g: *mut td_graph_t, root: *mut td_op_t) -> *mut td_t;
-    }
+    pub use teide_sys::*;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,18 +40,18 @@ pub enum Error {
 }
 
 impl Error {
-    fn from_code(code: u32) -> Self {
+    fn from_code(code: ffi::td_err_t) -> Self {
         match code {
-            ffi::TD_ERR_OOM => Error::Oom,
-            ffi::TD_ERR_TYPE => Error::Type,
-            ffi::TD_ERR_RANGE => Error::Range,
-            ffi::TD_ERR_LENGTH => Error::Length,
-            ffi::TD_ERR_RANK => Error::Rank,
-            ffi::TD_ERR_DOMAIN => Error::Domain,
-            ffi::TD_ERR_NYI => Error::Nyi,
-            ffi::TD_ERR_IO => Error::Io,
-            ffi::TD_ERR_SCHEMA => Error::Schema,
-            ffi::TD_ERR_CORRUPT => Error::Corrupt,
+            ffi::td_err_t::TD_ERR_OOM => Error::Oom,
+            ffi::td_err_t::TD_ERR_TYPE => Error::Type,
+            ffi::td_err_t::TD_ERR_RANGE => Error::Range,
+            ffi::td_err_t::TD_ERR_LENGTH => Error::Length,
+            ffi::td_err_t::TD_ERR_RANK => Error::Rank,
+            ffi::td_err_t::TD_ERR_DOMAIN => Error::Domain,
+            ffi::td_err_t::TD_ERR_NYI => Error::Nyi,
+            ffi::td_err_t::TD_ERR_IO => Error::Io,
+            ffi::td_err_t::TD_ERR_SCHEMA => Error::Schema,
+            ffi::td_err_t::TD_ERR_CORRUPT => Error::Corrupt,
             _ => Error::Corrupt,
         }
     }
@@ -539,7 +183,7 @@ pub enum FrameBound {
 }
 
 impl FrameBound {
-    fn to_code(&self) -> u8 {
+    fn to_code(self) -> u8 {
         match self {
             FrameBound::UnboundedPreceding => ffi::TD_BOUND_UNBOUNDED_PRECEDING,
             FrameBound::Preceding(_) => ffi::TD_BOUND_N_PRECEDING,
@@ -549,9 +193,9 @@ impl FrameBound {
         }
     }
 
-    fn to_n(&self) -> i64 {
+    fn to_n(self) -> i64 {
         match self {
-            FrameBound::Preceding(n) | FrameBound::Following(n) => *n,
+            FrameBound::Preceding(n) | FrameBound::Following(n) => n,
             _ => 0,
         }
     }
@@ -569,6 +213,46 @@ fn check_ptr(ptr: *mut ffi::td_t) -> Result<*mut ffi::td_t> {
     }
 }
 
+struct EngineGuard;
+
+impl Drop for EngineGuard {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::td_pool_destroy();
+            ffi::td_sym_destroy();
+            ffi::td_arena_destroy_all();
+        }
+    }
+}
+
+fn engine_slot() -> &'static Mutex<Weak<EngineGuard>> {
+    static ENGINE_SLOT: OnceLock<Mutex<Weak<EngineGuard>>> = OnceLock::new();
+    ENGINE_SLOT.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
+    let lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
+    if let Some(existing) = lock.upgrade() {
+        return Ok(existing);
+    }
+    drop(lock);
+
+    unsafe {
+        ffi::td_arena_init();
+        ffi::td_sym_init();
+        ffi::td_pool_init(0);
+    }
+
+    let guard = Arc::new(EngineGuard);
+    let mut lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
+    if let Some(existing) = lock.upgrade() {
+        Ok(existing)
+    } else {
+        *lock = Arc::downgrade(&guard);
+        Ok(guard)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Context — manages global engine state (arena, sym table, thread pool)
 // ---------------------------------------------------------------------------
@@ -583,6 +267,7 @@ pub fn sym_intern(s: &str) -> i64 {
 ///
 /// Only one `Context` should exist at a time. The C engine uses global state.
 pub struct Context {
+    engine: Arc<EngineGuard>,
     // *mut () makes Context !Send + !Sync (C engine uses thread-local arenas)
     _not_send_sync: PhantomData<*mut ()>,
 }
@@ -591,12 +276,11 @@ impl Context {
     /// Create a new engine context. Calls `td_arena_init`, `td_sym_init`,
     /// `td_pool_init(0)` (auto-detect thread count).
     pub fn new() -> Result<Self> {
-        unsafe {
-            ffi::td_arena_init();
-            ffi::td_sym_init();
-            ffi::td_pool_init(0);
-        }
-        Ok(Context { _not_send_sync: PhantomData })
+        let engine = acquire_engine_guard()?;
+        Ok(Context {
+            engine,
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Read a CSV file into a `Table`.
@@ -604,7 +288,11 @@ impl Context {
         let c_path = CString::new(path).map_err(|_| Error::Io)?;
         let ptr = unsafe { ffi::td_csv_read(c_path.as_ptr()) };
         let ptr = check_ptr(ptr)?;
-        Ok(Table { raw: ptr, _not_send_sync: PhantomData })
+        Ok(Table {
+            raw: ptr,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Read a CSV file with custom options.
@@ -614,7 +302,11 @@ impl Context {
             ffi::td_csv_read_opts(c_path.as_ptr(), delimiter as std::os::raw::c_char, header)
         };
         let ptr = check_ptr(ptr)?;
-        Ok(Table { raw: ptr, _not_send_sync: PhantomData })
+        Ok(Table {
+            raw: ptr,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Create a new operation graph bound to a table.
@@ -622,18 +314,9 @@ impl Context {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
         Graph {
             raw,
+            engine: table.engine.clone(),
             _table: PhantomData,
             _pinned: Vec::new(),
-        }
-    }
-}
-
-impl Drop for Context {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::td_pool_destroy();
-            ffi::td_sym_destroy();
-            ffi::td_arena_destroy_all();
         }
     }
 }
@@ -645,21 +328,35 @@ impl Drop for Context {
 /// A columnar table backed by the Teide engine.
 pub struct Table {
     raw: *mut ffi::td_t,
+    engine: Arc<EngineGuard>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl Table {
     /// Wrap a raw pointer as a Table (takes ownership — will call td_release on drop).
     /// The pointer must already be retained.
+    ///
+    /// # Safety
+    /// `raw` must be a valid Teide `td_t*` table pointer obtained from the same
+    /// initialized engine runtime.
     pub unsafe fn from_raw(raw: *mut ffi::td_t) -> Self {
-        Table { raw, _not_send_sync: PhantomData }
+        let engine = acquire_engine_guard().expect("engine runtime is not available");
+        Table {
+            raw,
+            engine,
+            _not_send_sync: PhantomData,
+        }
     }
 
     /// Create a shared reference to this table by incrementing the C ref count.
     /// Both the original and the clone will call `td_release` on drop.
     pub fn clone_ref(&self) -> Self {
         unsafe { ffi::td_retain(self.raw); }
-        Table { raw: self.raw, _not_send_sync: PhantomData }
+        Table {
+            raw: self.raw,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        }
     }
 
     /// Raw pointer access (for interop).
@@ -699,6 +396,7 @@ impl Table {
 
     /// Add a column to this table. The table pointer may change (COW semantics).
     /// `name` is a pre-interned symbol ID.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn add_column_raw(&mut self, name_id: i64, col: *mut ffi::td_t) {
         self.raw = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
     }
@@ -710,9 +408,9 @@ impl Table {
         assert_eq!(names.len(), nc);
         unsafe {
             let mut new_raw = ffi::td_table_new(nc as i64);
-            for i in 0..nc {
+            for (i, name) in names.iter().enumerate().take(nc) {
                 let col = ffi::td_table_get_col_idx(self.raw, i as i64);
-                let name_id = sym_intern(&names[i]);
+                let name_id = sym_intern(name);
                 ffi::td_retain(col);
                 new_raw = ffi::td_table_add_col(new_raw, name_id, col);
             }
@@ -855,6 +553,7 @@ impl Column {
 /// executed when `execute()` is called.
 pub struct Graph<'a> {
     raw: *mut ffi::td_graph_t,
+    engine: Arc<EngineGuard>,
     // Ties lifetime to the Table AND makes Graph !Send + !Sync via *mut ()
     _table: PhantomData<(&'a Table, *mut ())>,
     // Pin arrays passed to C functions that store pointers (td_group, td_sort_op).
@@ -1259,6 +958,7 @@ impl Graph<'_> {
     /// window function. Partitions by `part_keys`, orders within each
     /// partition by `order_keys` (with `order_descs` flags), and computes
     /// each function described by `funcs` and `func_inputs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn window_op(
         &mut self,
         df_node: Column,
@@ -1377,7 +1077,11 @@ impl Graph<'_> {
         let result = check_ptr(result)?;
         // Retain so Table's Drop can release it
         unsafe { ffi::td_retain(result) };
-        Ok(Table { raw: result, _not_send_sync: PhantomData })
+        Ok(Table {
+            raw: result,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Execute a graph node and return the raw result (vector or table).
@@ -1391,6 +1095,7 @@ impl Graph<'_> {
     }
 
     /// Inject a pre-computed vector as a constant node in the graph.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn const_vec(&self, vec: *mut ffi::td_t) -> Column {
         Column {
             raw: unsafe { ffi::td_const_vec(self.raw, vec) },
@@ -1399,6 +1104,9 @@ impl Graph<'_> {
 
     /// Set a boolean filter mask for group-by pushdown.
     /// Rows where mask[r]==0 are skipped in scan loops.
+    ///
+    /// # Safety
+    /// `mask` must be a valid boolean vector allocated by the same engine runtime.
     pub unsafe fn set_filter_mask(&mut self, mask: *mut ffi::td_t) {
         unsafe {
             ffi::td_retain(mask);
@@ -1427,36 +1135,91 @@ pub use ffi::td_graph_t;
 
 /// Low-level FFI access for downstream crates (e.g., teide-sql).
 pub mod raw {
-    pub use super::ffi::{td_type, td_data, td_len, td_type_sizes, td_vec_new, td_t};
+    pub use super::ffi::{td_t, td_type_sizes, td_vec_new};
+
+    /// Read the logical type tag from a raw value pointer.
+    ///
+    /// # Safety
+    /// `v` must be a valid non-null `td_t*`.
+    #[inline]
+    pub unsafe fn td_type(v: *mut td_t) -> i8 {
+        unsafe { super::ffi::td_type(v as *const td_t) }
+    }
+
+    /// Read vector length from a raw value pointer.
+    ///
+    /// # Safety
+    /// `v` must be a valid non-null `td_t*`.
+    #[inline]
+    pub unsafe fn td_len(v: *mut td_t) -> i64 {
+        unsafe { super::ffi::td_len(v as *const td_t) }
+    }
+
+    /// Return raw data pointer for a vector.
+    ///
+    /// # Safety
+    /// `v` must be a valid non-null vector `td_t*` from the current runtime.
+    #[inline]
+    pub unsafe fn td_data(v: *mut td_t) -> *mut u8 {
+        unsafe { super::ffi::td_data(v) as *mut u8 }
+    }
+
+    /// Override vector length metadata in-place.
+    ///
+    /// # Safety
+    /// `v` must be a valid non-null vector `td_t*`, and `len` must not exceed
+    /// the allocated element capacity for that vector.
+    #[inline]
+    pub unsafe fn td_set_len(v: *mut td_t, len: i64) {
+        unsafe { (*v).val.len = len; }
+    }
 }
 
 /// Low-level helper: get column by symbol ID from a raw table pointer.
 /// Returns null if not found. Caller must NOT release the result.
+///
+/// # Safety
+/// `df` must be a valid table pointer from the current runtime.
 pub unsafe fn ffi_table_get_col(df: *mut ffi::td_t, name_id: i64) -> *mut ffi::td_t {
     unsafe { ffi::td_table_get_col(df, name_id) }
 }
 
 /// Low-level helper: create new table.
+///
+/// # Safety
+/// The engine runtime must be initialized and alive.
 pub unsafe fn ffi_table_new(ncols: i64) -> *mut ffi::td_t {
     unsafe { ffi::td_table_new(ncols) }
 }
 
 /// Low-level helper: add column to table.
+///
+/// # Safety
+/// `df` and `col` must be valid pointers from the same engine runtime.
 pub unsafe fn ffi_table_add_col(df: *mut ffi::td_t, name_id: i64, col: *mut ffi::td_t) -> *mut ffi::td_t {
     unsafe { ffi::td_table_add_col(df, name_id, col) }
 }
 
 /// Low-level helper: concatenate two vectors.
+///
+/// # Safety
+/// `a` and `b` must be valid vector pointers from the same engine runtime.
 pub unsafe fn ffi_vec_concat(a: *mut ffi::td_t, b: *mut ffi::td_t) -> *mut ffi::td_t {
     unsafe { ffi::td_vec_concat(a, b) }
 }
 
 /// Low-level helper: release a td_t pointer.
+///
+/// # Safety
+/// `v` must be a valid pointer whose lifetime is managed by Teide refcounting.
 pub unsafe fn ffi_release(v: *mut ffi::td_t) {
     unsafe { ffi::td_release(v) }
 }
 
 /// Low-level helper: retain a td_t pointer.
+///
+/// # Safety
+/// `v` must be a valid pointer whose lifetime is managed by Teide refcounting.
 pub unsafe fn ffi_retain(v: *mut ffi::td_t) {
     unsafe { ffi::td_retain(v) }
 }
@@ -1464,6 +1227,15 @@ pub unsafe fn ffi_retain(v: *mut ffi::td_t) {
 /// Check if a raw pointer is an error sentinel.
 pub fn ffi_is_err(p: *mut ffi::td_t) -> bool {
     ffi::td_is_err(p)
+}
+
+/// Decode a raw engine error pointer to `Error`.
+pub fn ffi_error_from_ptr(p: *mut ffi::td_t) -> Option<Error> {
+    if ffi::td_is_err(p) {
+        Some(Error::from_code(ffi::td_err_code(p)))
+    } else {
+        None
+    }
 }
 
 // Re-export EXTRACT field constants

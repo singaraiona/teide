@@ -77,8 +77,6 @@ impl Clone for StoredTable {
 }
 
 /// A stateful SQL session that maintains a table registry across queries.
-/// Note: `tables` must be declared before `ctx` so it drops first —
-/// Table::drop calls td_release which requires live arenas.
 pub struct Session {
     tables: HashMap<String, StoredTable>,
     ctx: Context,

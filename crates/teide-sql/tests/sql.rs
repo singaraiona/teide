@@ -389,6 +389,43 @@ fn union_all() {
 }
 
 #[test]
+fn intersect_all_distinct_keys() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1 FROM csv WHERE id1 = 'id001' \
+                 INTERSECT ALL \
+                 SELECT id1 FROM csv WHERE id1 = 'id002'",
+            )
+            .unwrap(),
+    );
+    // No shared key values between the two inputs.
+    assert_eq!(r.table.nrows(), 0);
+}
+
+#[test]
+fn except_all_distinct_keys() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1 FROM csv WHERE id1 = 'id001' \
+                 EXCEPT ALL \
+                 SELECT id1 FROM csv WHERE id1 = 'id002'",
+            )
+            .unwrap(),
+    );
+    // Left side has four id001 rows; right side does not remove any of them.
+    assert_eq!(r.table.nrows(), 4);
+    for row in 0..r.table.nrows() as usize {
+        assert_eq!(r.table.get_str(0, row).unwrap(), "id001");
+    }
+}
+
+#[test]
 fn subquery() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();

@@ -504,6 +504,32 @@ fn string_ops() {
 }
 
 #[test]
+fn concat_many_args() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+    let g = ctx.graph(&table);
+
+    let df = g.const_df(&table);
+    let mut args = Vec::new();
+    args.push(g.scan("id1"));
+    for _ in 0..19 {
+        args.push(g.const_str("x"));
+    }
+
+    let concat_col = g.concat(&args);
+    let aliased = g.alias(concat_col, "concat_many");
+    let projected = g.select(df, &[aliased]);
+    let result = g.execute(projected).unwrap();
+
+    assert_eq!(result.nrows(), 20);
+    assert_eq!(result.ncols(), 1);
+    let expected = format!("{}{}", "id001", "x".repeat(19));
+    assert_eq!(result.get_str(0, 0).unwrap(), expected);
+}
+
+#[test]
 fn cast_i64_to_f64() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (_file, path) = create_test_csv();
@@ -579,7 +605,7 @@ fn window_row_number() {
         let rn = result.get_i64(9, r).unwrap();
         parts.entry(key).or_default().push(rn);
     }
-    for (_key, vals) in &parts {
+    for vals in parts.values() {
         let mut sorted = vals.clone();
         sorted.sort();
         assert_eq!(sorted, vec![1, 2, 3, 4], "ROW_NUMBER should be 1..4 per partition");

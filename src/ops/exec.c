@@ -4694,24 +4694,33 @@ static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
 /* CONCAT(a, b, ...) */
 static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
     int n_args = (int)ext->sym;
+    if (n_args < 2) return TD_ERR_PTR(TD_ERR_DOMAIN);
 
     /* Evaluate all inputs */
-    td_t* args[16];
-    int nn = n_args < 16 ? n_args : 16;
+    td_t* args_stack[16];
+    td_t** args = args_stack;
+    td_t* args_hdr = NULL;
+    if (n_args > 16) {
+        args = (td_t**)scratch_calloc(&args_hdr, (size_t)n_args * sizeof(td_t*));
+        if (!args) return TD_ERR_PTR(TD_ERR_OOM);
+    }
+
     args[0] = exec_node(g, op->inputs[0]);
     args[1] = exec_node(g, op->inputs[1]);
     uint32_t* trail = (uint32_t*)((char*)(ext + 1));
-    for (int i = 2; i < nn; i++) {
+    for (int i = 2; i < n_args; i++) {
         args[i] = exec_node(g, &g->nodes[trail[i - 2]]);
     }
     /* Error check */
-    for (int i = 0; i < nn; i++) {
+    for (int i = 0; i < n_args; i++) {
         if (!args[i] || TD_IS_ERR(args[i])) {
             td_t* err = args[i];
-            for (int j = 0; j < nn; j++) {
+            for (int j = 0; j < n_args; j++) {
                 if (j != i && args[j] && !TD_IS_ERR(args[j])) td_release(args[j]);
             }
+            scratch_free(args_hdr);
             return err;
         }
     }
@@ -4719,7 +4728,8 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     int64_t nrows = args[0]->len;
     td_t* result = td_vec_new(TD_SYM, nrows);
     if (!result || TD_IS_ERR(result)) {
-        for (int i = 0; i < nn; i++) td_release(args[i]);
+        for (int i = 0; i < n_args; i++) td_release(args[i]);
+        scratch_free(args_hdr);
         return result;
     }
     result->len = nrows;
@@ -4728,7 +4738,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     for (int64_t r = 0; r < nrows; r++) {
         char buf[4096];
         size_t bi = 0;
-        for (int a = 0; a < nn; a++) {
+        for (int a = 0; a < n_args; a++) {
             int8_t t = args[a]->type;
             if (t == TD_SYM || t == TD_ENUM) {
                 const char* sp; size_t sl;
@@ -4744,7 +4754,8 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
         buf[bi] = '\0';
         dst[r] = td_sym_intern(buf, bi);
     }
-    for (int i = 0; i < nn; i++) td_release(args[i]);
+    for (int i = 0; i < n_args; i++) td_release(args[i]);
+    scratch_free(args_hdr);
     return result;
 }
 

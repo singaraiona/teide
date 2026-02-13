@@ -41,7 +41,7 @@ fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 out.extend(walkdir(&path));
-            } else if path.extension().map_or(false, |e| e == "c") {
+            } else if path.extension().is_some_and(|e| e == "c") {
                 out.push(path);
             }
         }

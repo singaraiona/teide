@@ -1,3 +1,26 @@
+/*
+ *   Copyright (c) 2024-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
 #include "exec.h"
 #include "hash.h"
 #include "pool.h"
@@ -61,6 +84,857 @@ static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
             return g->ext_nodes[i];
     }
     return NULL;
+}
+
+typedef struct {
+    bool    enabled;
+    double  bias_f64;
+    int64_t bias_i64;
+} agg_affine_t;
+
+#define AGG_LINEAR_MAX_TERMS 8
+
+typedef struct {
+    bool    enabled;
+    uint8_t n_terms;
+    void*   term_ptrs[AGG_LINEAR_MAX_TERMS];
+    int8_t  term_types[AGG_LINEAR_MAX_TERMS];
+    int64_t coeff_i64[AGG_LINEAR_MAX_TERMS];
+    int64_t bias_i64;
+} agg_linear_t;
+
+typedef struct {
+    uint8_t n_terms;
+    int64_t syms[AGG_LINEAR_MAX_TERMS];
+    int64_t coeff_i64[AGG_LINEAR_MAX_TERMS];
+    int64_t bias_i64;
+} linear_expr_i64_t;
+
+static bool atom_to_numeric(td_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
+    if (!atom || !td_is_atom(atom)) return false;
+    switch (atom->type) {
+        case TD_ATOM_F64:
+            *out_f = atom->f64;
+            *out_i = (int64_t)atom->f64;
+            *out_is_f64 = true;
+            return true;
+        case TD_ATOM_I64:
+        case TD_ATOM_SYM:
+        case TD_ATOM_DATE:
+        case TD_ATOM_TIME:
+        case TD_ATOM_TIMESTAMP:
+            *out_i = atom->i64;
+            *out_f = (double)atom->i64;
+            *out_is_f64 = false;
+            return true;
+        case TD_ATOM_I32:
+            *out_i = (int64_t)atom->i32;
+            *out_f = (double)atom->i32;
+            *out_is_f64 = false;
+            return true;
+        case TD_ATOM_I16:
+            *out_i = (int64_t)atom->i16;
+            *out_f = (double)atom->i16;
+            *out_is_f64 = false;
+            return true;
+        case TD_ATOM_U8:
+        case TD_ATOM_BOOL:
+            *out_i = (int64_t)atom->u8;
+            *out_f = (double)atom->u8;
+            *out_is_f64 = false;
+            return true;
+        case TD_ATOM_ENUM:
+            *out_i = (int64_t)atom->u32;
+            *out_f = (double)atom->u32;
+            *out_is_f64 = false;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Evaluate a numeric constant sub-expression from op graph.
+ * Supports CONST and arithmetic trees over constant children. */
+static bool eval_const_numeric_expr(td_graph_t* g, td_op_t* op,
+                                    double* out_f, int64_t* out_i, bool* out_is_f64) {
+    if (!g || !op || !out_f || !out_i || !out_is_f64) return false;
+
+    if (op->opcode == OP_CONST) {
+        td_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || !ext->literal) return false;
+        return atom_to_numeric(ext->literal, out_f, out_i, out_is_f64);
+    }
+
+    if ((op->opcode == OP_NEG || op->opcode == OP_ABS) && op->arity == 1 && op->inputs[0]) {
+        double af = 0.0;
+        int64_t ai = 0;
+        bool a_is_f64 = false;
+        if (!eval_const_numeric_expr(g, op->inputs[0], &af, &ai, &a_is_f64)) return false;
+        if (a_is_f64 || op->out_type == TD_F64) {
+            double v = a_is_f64 ? af : (double)ai;
+            double r = (op->opcode == OP_NEG) ? -v : fabs(v);
+            *out_f = r;
+            *out_i = (int64_t)r;
+            *out_is_f64 = true;
+            return true;
+        }
+        int64_t v = ai;
+        int64_t r = (op->opcode == OP_NEG) ? -v : (v < 0 ? -v : v);
+        *out_i = r;
+        *out_f = (double)r;
+        *out_is_f64 = false;
+        return true;
+    }
+
+    if (op->arity != 2 || !op->inputs[0] || !op->inputs[1]) return false;
+    if (op->opcode < OP_ADD || op->opcode > OP_MAX2) return false;
+
+    double lf = 0.0, rf = 0.0;
+    int64_t li = 0, ri = 0;
+    bool l_is_f64 = false, r_is_f64 = false;
+    if (!eval_const_numeric_expr(g, op->inputs[0], &lf, &li, &l_is_f64)) return false;
+    if (!eval_const_numeric_expr(g, op->inputs[1], &rf, &ri, &r_is_f64)) return false;
+
+    if (op->out_type == TD_F64 || l_is_f64 || r_is_f64 || op->opcode == OP_DIV) {
+        double lv = l_is_f64 ? lf : (double)li;
+        double rv = r_is_f64 ? rf : (double)ri;
+        double r = 0.0;
+        switch (op->opcode) {
+            case OP_ADD: r = lv + rv; break;
+            case OP_SUB: r = lv - rv; break;
+            case OP_MUL: r = lv * rv; break;
+            case OP_DIV: r = rv != 0.0 ? lv / rv : 0.0; break;
+            case OP_MOD: r = rv != 0.0 ? fmod(lv, rv) : 0.0; break;
+            case OP_MIN2: r = lv < rv ? lv : rv; break;
+            case OP_MAX2: r = lv > rv ? lv : rv; break;
+            default: return false;
+        }
+        *out_f = r;
+        *out_i = (int64_t)r;
+        *out_is_f64 = true;
+        return true;
+    }
+
+    int64_t r = 0;
+    switch (op->opcode) {
+        case OP_ADD: r = li + ri; break;
+        case OP_SUB: r = li - ri; break;
+        case OP_MUL: r = li * ri; break;
+        case OP_DIV: r = ri != 0 ? li / ri : 0; break;
+        case OP_MOD: r = ri != 0 ? li % ri : 0; break;
+        case OP_MIN2: r = li < ri ? li : ri; break;
+        case OP_MAX2: r = li > ri ? li : ri; break;
+        default: return false;
+    }
+    *out_i = r;
+    *out_f = (double)r;
+    *out_is_f64 = false;
+    return true;
+}
+
+static bool const_expr_to_i64(td_graph_t* g, td_op_t* op, int64_t* out) {
+    if (!g || !op || !out) return false;
+    double c_f = 0.0;
+    int64_t c_i = 0;
+    bool c_is_f64 = false;
+    if (!eval_const_numeric_expr(g, op, &c_f, &c_i, &c_is_f64)) return false;
+    if (!c_is_f64) {
+        *out = c_i;
+        return true;
+    }
+    if (!isfinite(c_f)) return false;
+    double ip = 0.0;
+    if (modf(c_f, &ip) != 0.0) return false;
+    if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
+    *out = (int64_t)ip;
+    return true;
+}
+
+static inline bool type_is_linear_i64_col(int8_t t) {
+    return t == TD_I64 || t == TD_SYM || t == TD_TIME || t == TD_TIMESTAMP ||
+           t == TD_I32 || t == TD_DATE || t == TD_I16 ||
+           t == TD_U8 || t == TD_BOOL || t == TD_ENUM;
+}
+
+static bool linear_expr_add_term(linear_expr_i64_t* e, int64_t sym, int64_t coeff) {
+    if (!e) return false;
+    if (coeff == 0) return true;
+    for (uint8_t i = 0; i < e->n_terms; i++) {
+        if (e->syms[i] != sym) continue;
+        int64_t next = e->coeff_i64[i] + coeff;
+        if (next != 0) {
+            e->coeff_i64[i] = next;
+            return true;
+        }
+        for (uint8_t j = i + 1; j < e->n_terms; j++) {
+            e->syms[j - 1] = e->syms[j];
+            e->coeff_i64[j - 1] = e->coeff_i64[j];
+        }
+        e->n_terms--;
+        return true;
+    }
+    if (e->n_terms >= AGG_LINEAR_MAX_TERMS) return false;
+    e->syms[e->n_terms] = sym;
+    e->coeff_i64[e->n_terms] = coeff;
+    e->n_terms++;
+    return true;
+}
+
+static void linear_expr_scale(linear_expr_i64_t* e, int64_t k) {
+    if (!e || k == 1) return;
+    e->bias_i64 *= k;
+    for (uint8_t i = 0; i < e->n_terms; i++)
+        e->coeff_i64[i] *= k;
+}
+
+static bool linear_expr_add_scaled(linear_expr_i64_t* dst, const linear_expr_i64_t* src, int64_t scale) {
+    if (!dst || !src) return false;
+    dst->bias_i64 += src->bias_i64 * scale;
+    for (uint8_t i = 0; i < src->n_terms; i++) {
+        if (!linear_expr_add_term(dst, src->syms[i], src->coeff_i64[i] * scale))
+            return false;
+    }
+    return true;
+}
+
+/* Parse an expression tree into integer linear form:
+ *   sum(coeff[i] * scan(sym[i])) + bias
+ * Supports +, -, unary -, and multiplication by integer constants. */
+static bool parse_linear_i64_expr(td_graph_t* g, td_op_t* op, linear_expr_i64_t* out) {
+    if (!g || !op || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    int64_t c = 0;
+    if (const_expr_to_i64(g, op, &c)) {
+        out->bias_i64 = c;
+        return true;
+    }
+
+    if (op->opcode == OP_SCAN) {
+        td_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->base.opcode != OP_SCAN) return false;
+        out->n_terms = 1;
+        out->syms[0] = ext->sym;
+        out->coeff_i64[0] = 1;
+        return true;
+    }
+
+    if (op->opcode == OP_NEG && op->arity == 1 && op->inputs[0]) {
+        linear_expr_i64_t inner;
+        if (!parse_linear_i64_expr(g, op->inputs[0], &inner)) return false;
+        linear_expr_scale(&inner, -1);
+        *out = inner;
+        return true;
+    }
+
+    if ((op->opcode == OP_ADD || op->opcode == OP_SUB) &&
+        op->arity == 2 && op->inputs[0] && op->inputs[1]) {
+        linear_expr_i64_t lhs;
+        linear_expr_i64_t rhs;
+        if (!parse_linear_i64_expr(g, op->inputs[0], &lhs)) return false;
+        if (!parse_linear_i64_expr(g, op->inputs[1], &rhs)) return false;
+        *out = lhs;
+        return linear_expr_add_scaled(out, &rhs, op->opcode == OP_ADD ? 1 : -1);
+    }
+
+    if (op->opcode == OP_MUL && op->arity == 2 && op->inputs[0] && op->inputs[1]) {
+        int64_t k = 0;
+        linear_expr_i64_t side;
+        if (const_expr_to_i64(g, op->inputs[0], &k) &&
+            parse_linear_i64_expr(g, op->inputs[1], &side)) {
+            linear_expr_scale(&side, k);
+            *out = side;
+            return true;
+        }
+        if (const_expr_to_i64(g, op->inputs[1], &k) &&
+            parse_linear_i64_expr(g, op->inputs[0], &side)) {
+            linear_expr_scale(&side, k);
+            *out = side;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
+ * Example: (v1 + 1) * 2, v1 + v2 + 1 */
+static bool try_linear_sumavg_input_i64(td_graph_t* g, td_t* df, td_op_t* input_op,
+                                        agg_linear_t* out_plan) {
+    if (!g || !df || !input_op || !out_plan) return false;
+    linear_expr_i64_t lin;
+    if (!parse_linear_i64_expr(g, input_op, &lin)) return false;
+
+    memset(out_plan, 0, sizeof(*out_plan));
+    out_plan->n_terms = lin.n_terms;
+    out_plan->bias_i64 = lin.bias_i64;
+    for (uint8_t i = 0; i < lin.n_terms; i++) {
+        td_t* col = td_table_get_col(df, lin.syms[i]);
+        if (!col || !type_is_linear_i64_col(col->type)) return false;
+        out_plan->term_ptrs[i] = td_data(col);
+        out_plan->term_types[i] = col->type;
+        out_plan->coeff_i64[i] = lin.coeff_i64[i];
+    }
+    out_plan->enabled = true;
+    return true;
+}
+
+/* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
+ * plus the additive bias so we can adjust results from (sum,count) directly. */
+static bool try_affine_sumavg_input(td_graph_t* g, td_t* df, td_op_t* input_op,
+                                    td_t** out_vec, agg_affine_t* out_affine) {
+    if (!g || !df || !input_op || !out_vec || !out_affine) return false;
+    if (input_op->opcode != OP_ADD && input_op->opcode != OP_SUB) return false;
+    if (input_op->arity != 2 || !input_op->inputs[0] || !input_op->inputs[1]) return false;
+
+    td_op_t* lhs = input_op->inputs[0];
+    td_op_t* rhs = input_op->inputs[1];
+    td_op_t* base_op = NULL;
+    int sign = 1;
+    double c_f = 0.0;
+    int64_t c_i = 0;
+    bool c_is_f64 = false;
+
+    double lhs_f = 0.0, rhs_f = 0.0;
+    int64_t lhs_i = 0, rhs_i = 0;
+    bool lhs_is_f64 = false, rhs_is_f64 = false;
+    bool lhs_const = eval_const_numeric_expr(g, lhs, &lhs_f, &lhs_i, &lhs_is_f64);
+    bool rhs_const = eval_const_numeric_expr(g, rhs, &rhs_f, &rhs_i, &rhs_is_f64);
+
+    if (input_op->opcode == OP_ADD) {
+        if (lhs_const) {
+            base_op = rhs;
+            sign = 1;
+            c_f = lhs_f;
+            c_i = lhs_i;
+            c_is_f64 = lhs_is_f64;
+        } else if (rhs_const) {
+            base_op = lhs;
+            sign = 1;
+            c_f = rhs_f;
+            c_i = rhs_i;
+            c_is_f64 = rhs_is_f64;
+        }
+    } else { /* OP_SUB */
+        if (rhs_const) {
+            base_op = lhs;
+            sign = -1;
+            c_f = rhs_f;
+            c_i = rhs_i;
+            c_is_f64 = rhs_is_f64;
+        }
+    }
+    if (!base_op) return false;
+
+    td_op_ext_t* base_ext = find_ext(g, base_op->id);
+    if (!base_ext || base_ext->base.opcode != OP_SCAN) return false;
+    td_t* base_vec = td_table_get_col(df, base_ext->sym);
+    if (!base_vec) return false;
+
+    int8_t bt = base_vec->type;
+    if (bt == TD_F64) {
+        out_affine->enabled = true;
+        out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
+        out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
+        *out_vec = base_vec;
+        return true;
+    }
+
+    if (bt == TD_I64 || bt == TD_SYM || bt == TD_TIMESTAMP ||
+        bt == TD_I32 || bt == TD_I16 || bt == TD_U8 || bt == TD_BOOL ||
+        bt == TD_ENUM) {
+        int64_t c = 0;
+        if (c_is_f64) {
+            if (!isfinite(c_f)) return false;
+            double ip = 0.0;
+            if (modf(c_f, &ip) != 0.0) return false;
+            if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
+            c = (int64_t)ip;
+        } else {
+            c = c_i;
+        }
+        out_affine->enabled = true;
+        out_affine->bias_i64 = sign > 0 ? c : -c;
+        out_affine->bias_f64 = (double)out_affine->bias_i64;
+        *out_vec = base_vec;
+        return true;
+    }
+
+    return false;
+}
+
+/* ============================================================================
+ * Expression Compiler: morsel-batched fused evaluation
+ *
+ * Compiles an expression DAG (e.g. v1 + v2 * 3) into a flat instruction
+ * array. Evaluates in morsel-sized chunks (1024 elements) with scratch
+ * registers — never allocates full-length intermediate vectors.
+ * ============================================================================ */
+
+#define EXPR_MAX_REGS 16
+#define EXPR_MAX_INS  48
+#define EXPR_MORSEL   1024
+
+typedef struct {
+    uint8_t opcode;     /* OP_ADD, OP_NEG, OP_CAST, etc. */
+    uint8_t dst;        /* destination register */
+    uint8_t src1;       /* source 1 register */
+    uint8_t src2;       /* source 2 register (0xFF for unary) */
+} expr_ins_t;
+
+enum { REG_SCAN = 0, REG_CONST = 1, REG_SCRATCH = 2 };
+
+typedef struct {
+    uint8_t n_ins;
+    uint8_t n_regs;
+    uint8_t n_scratch;      /* scratch registers needed */
+    uint8_t out_reg;
+    int8_t  out_type;       /* TD_F64, TD_I64, or TD_BOOL */
+    struct {
+        uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
+        int8_t      type;       /* computational type: TD_F64 / TD_I64 / TD_BOOL */
+        int8_t      col_type;   /* original column type (REG_SCAN only) */
+        const void* data;       /* column data pointer (REG_SCAN only) */
+        double      const_f64;  /* scalar value (REG_CONST) */
+        int64_t     const_i64;  /* scalar value (REG_CONST) */
+    } regs[EXPR_MAX_REGS];
+    expr_ins_t ins[EXPR_MAX_INS];
+} td_expr_t;
+
+/* Is this opcode an element-wise op suitable for expression compilation? */
+static inline bool expr_is_elementwise(uint16_t op) {
+    return (op >= OP_NEG && op <= OP_CAST) || (op >= OP_ADD && op <= OP_MAX2);
+}
+
+/* Insert CAST instruction to promote register to target type */
+static uint8_t expr_ensure_type(td_expr_t* out, uint8_t src, int8_t target) {
+    if (out->regs[src].type == target) return src;
+    if (out->n_regs >= EXPR_MAX_REGS || out->n_ins >= EXPR_MAX_INS) return src;
+    uint8_t r = out->n_regs;
+    out->regs[r].kind = REG_SCRATCH;
+    out->regs[r].type = target;
+    out->n_regs++;
+    out->n_scratch++;
+    out->ins[out->n_ins++] = (expr_ins_t){
+        .opcode = OP_CAST, .dst = r, .src1 = src, .src2 = 0xFF,
+    };
+    return r;
+}
+
+/* Compile expression DAG into flat instruction array.
+ * Returns true on success. Only compiles element-wise subtrees. */
+static bool expr_compile(td_graph_t* g, td_t* df, td_op_t* root, td_expr_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!root || !g || !df) return false;
+    if (root->opcode == OP_SCAN || root->opcode == OP_CONST) return false;
+    if (!expr_is_elementwise(root->opcode)) return false;
+
+    uint32_t nc = g->node_count;
+    uint8_t node_reg[nc];
+    memset(node_reg, 0xFF, nc * sizeof(uint8_t));
+
+    /* Post-order DFS with explicit stack */
+    typedef struct { td_op_t* node; uint8_t phase; } dfs_t;
+    dfs_t dfs[64];
+    int sp = 0;
+    dfs[sp++] = (dfs_t){root, 0};
+
+    while (sp > 0) {
+        dfs_t* top = &dfs[sp - 1];
+        td_op_t* node = top->node;
+
+        if (node->id < nc && node_reg[node->id] != 0xFF) { sp--; continue; }
+
+        if (top->phase == 0) {
+            top->phase = 1;
+            for (int i = node->arity - 1; i >= 0; i--) {
+                td_op_t* ch = node->inputs[i];
+                if (!ch) continue;
+                if (ch->id < nc && node_reg[ch->id] != 0xFF) continue;
+                if (sp >= 64) return false;
+                dfs[sp++] = (dfs_t){ch, 0};
+            }
+        } else {
+            sp--;
+            uint8_t r = out->n_regs;
+            if (r >= EXPR_MAX_REGS) return false;
+
+            if (node->opcode == OP_SCAN) {
+                td_op_ext_t* ext = find_ext(g, node->id);
+                if (!ext) return false;
+                td_t* col = td_table_get_col(df, ext->sym);
+                if (!col) return false;
+                out->regs[r].kind = REG_SCAN;
+                out->regs[r].col_type = col->type;
+                out->regs[r].data = td_data(col);
+                out->regs[r].type = (col->type == TD_F64) ? TD_F64 : TD_I64;
+            } else if (node->opcode == OP_CONST) {
+                td_op_ext_t* ext = find_ext(g, node->id);
+                if (!ext || !ext->literal) return false;
+                double cf; int64_t ci; bool is_f64;
+                if (!atom_to_numeric(ext->literal, &cf, &ci, &is_f64)) return false;
+                out->regs[r].kind = REG_CONST;
+                out->regs[r].type = is_f64 ? TD_F64 : TD_I64;
+                out->regs[r].const_f64 = cf;
+                out->regs[r].const_i64 = ci;
+            } else if (expr_is_elementwise(node->opcode)) {
+                if (!node->inputs[0]) return false;
+                uint8_t s1 = node_reg[node->inputs[0]->id];
+                if (s1 == 0xFF) return false;
+                uint8_t s2 = 0xFF;
+                if (node->arity >= 2 && node->inputs[1]) {
+                    s2 = node_reg[node->inputs[1]->id];
+                    if (s2 == 0xFF) return false;
+                }
+
+                int8_t t1 = out->regs[s1].type;
+                int8_t t2 = (s2 != 0xFF) ? out->regs[s2].type : t1;
+                uint16_t op = node->opcode;
+                int8_t ot;
+
+                /* Determine output type */
+                if (op == OP_CAST)
+                    ot = node->out_type;
+                else if ((op >= OP_EQ && op <= OP_GE) ||
+                    op == OP_AND || op == OP_OR || op == OP_NOT)
+                    ot = TD_BOOL;
+                else if (t1 == TD_F64 || t2 == TD_F64 || op == OP_DIV ||
+                         op == OP_SQRT || op == OP_LOG || op == OP_EXP)
+                    ot = TD_F64;
+                else
+                    ot = TD_I64;
+
+                /* Type promotion: ensure both sources match for the operation.
+                 * Skip for OP_CAST — the instruction itself IS the conversion. */
+                if (op == OP_CAST) {
+                    /* No promotion needed; CAST handles the conversion */
+                    r = out->n_regs;
+                } else if (ot == TD_F64 && s2 != 0xFF) {
+                    /* Arithmetic with f64 output — promote i64 inputs to f64 */
+                    s1 = expr_ensure_type(out, s1, TD_F64);
+                    s2 = expr_ensure_type(out, s2, TD_F64);
+                    r = out->n_regs; /* re-read after possible CAST inserts */
+                    if (r >= EXPR_MAX_REGS) return false;
+                } else if (ot == TD_F64 && s2 == 0xFF) {
+                    /* Unary f64 — promote input */
+                    s1 = expr_ensure_type(out, s1, TD_F64);
+                    r = out->n_regs;
+                    if (r >= EXPR_MAX_REGS) return false;
+                } else if (ot == TD_BOOL && s2 != 0xFF && t1 != t2) {
+                    /* Comparison with mixed types — promote both to f64 */
+                    int8_t pt = (t1 == TD_F64 || t2 == TD_F64) ? TD_F64 : TD_I64;
+                    s1 = expr_ensure_type(out, s1, pt);
+                    s2 = expr_ensure_type(out, s2, pt);
+                    r = out->n_regs;
+                    if (r >= EXPR_MAX_REGS) return false;
+                }
+
+                out->regs[r].kind = REG_SCRATCH;
+                out->regs[r].type = ot;
+                out->n_scratch++;
+
+                if (out->n_ins >= EXPR_MAX_INS) return false;
+                out->ins[out->n_ins++] = (expr_ins_t){
+                    .opcode = (uint8_t)op, .dst = r, .src1 = s1, .src2 = s2,
+                };
+            } else {
+                return false;
+            }
+
+            out->n_regs++;
+            if (node->id < nc) node_reg[node->id] = r;
+        }
+    }
+
+    if (out->n_regs == 0 || out->n_ins == 0) return false;
+    out->out_reg = out->n_regs - 1;
+    out->out_type = out->regs[out->out_reg].type;
+    return true;
+}
+
+/* ---- Morsel-batched expression evaluator ---- */
+
+/* Load SCAN column data into i64 scratch buffer with type conversion */
+static void expr_load_i64(int64_t* dst, const void* data, int8_t col_type,
+                          int64_t start, int64_t n) {
+    switch (col_type) {
+        case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+            memcpy(dst, (const int64_t*)data + start, (size_t)n * 8);
+            break;
+        case TD_I32: case TD_DATE: {
+            const int32_t* s = (const int32_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = s[j];
+        } break;
+        case TD_ENUM: {
+            const uint32_t* s = (const uint32_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = s[j];
+        } break;
+        case TD_U8: case TD_BOOL: {
+            const uint8_t* s = (const uint8_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = s[j];
+        } break;
+        case TD_I16: {
+            const int16_t* s = (const int16_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = s[j];
+        } break;
+        default: memset(dst, 0, (size_t)n * 8); break;
+    }
+}
+
+/* Load SCAN column data into f64 scratch buffer with type conversion */
+static void expr_load_f64(double* dst, const void* data, int8_t col_type,
+                          int64_t start, int64_t n) {
+    switch (col_type) {
+        case TD_F64:
+            memcpy(dst, (const double*)data + start, (size_t)n * 8);
+            break;
+        case TD_I64: case TD_SYM: case TD_TIMESTAMP: {
+            const int64_t* s = (const int64_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
+        case TD_I32: case TD_DATE: {
+            const int32_t* s = (const int32_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
+        case TD_ENUM: {
+            const uint32_t* s = (const uint32_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
+        case TD_U8: case TD_BOOL: {
+            const uint8_t* s = (const uint8_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
+        case TD_I16: {
+            const int16_t* s = (const int16_t*)data + start;
+            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
+        default: memset(dst, 0, (size_t)n * 8); break;
+    }
+}
+
+/* Execute a binary instruction over n elements.
+ * Switch is OUTSIDE the loop so each case auto-vectorizes. */
+static void expr_exec_binary(uint8_t opcode, int8_t dt, void* dp,
+                              int8_t t1, const void* ap,
+                              int8_t t2, const void* bp, int64_t n) {
+    (void)t2;
+    if (dt == TD_F64) {
+        double* d = (double*)dp;
+        const double* a = (const double*)ap;
+        const double* b = (const double*)bp;
+        switch (opcode) {
+            case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = a[j] + b[j]; break;
+            case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = a[j] - b[j]; break;
+            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = a[j] * b[j]; break;
+            case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] / b[j] : 0; break;
+            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? fmod(a[j], b[j]) : 0; break;
+            case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
+            case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
+            default: break;
+        }
+    } else if (dt == TD_I64) {
+        int64_t* d = (int64_t*)dp;
+        const int64_t* a = (const int64_t*)ap;
+        const int64_t* b = (const int64_t*)bp;
+        switch (opcode) {
+            case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = a[j] + b[j]; break;
+            case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = a[j] - b[j]; break;
+            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = a[j] * b[j]; break;
+            case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] / b[j] : 0; break;
+            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] % b[j] : 0; break;
+            case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
+            case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
+            default: break;
+        }
+    } else if (dt == TD_BOOL) {
+        uint8_t* d = (uint8_t*)dp;
+        if (t1 == TD_F64) {
+            const double* a = (const double*)ap;
+            const double* b = (const double*)bp;
+            switch (opcode) {
+                case OP_EQ: for (int64_t j = 0; j < n; j++) d[j] = a[j] == b[j]; break;
+                case OP_NE: for (int64_t j = 0; j < n; j++) d[j] = a[j] != b[j]; break;
+                case OP_LT: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j]; break;
+                case OP_LE: for (int64_t j = 0; j < n; j++) d[j] = a[j] <= b[j]; break;
+                case OP_GT: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j]; break;
+                case OP_GE: for (int64_t j = 0; j < n; j++) d[j] = a[j] >= b[j]; break;
+                default: break;
+            }
+        } else if (t1 == TD_I64) {
+            const int64_t* a = (const int64_t*)ap;
+            const int64_t* b = (const int64_t*)bp;
+            switch (opcode) {
+                case OP_EQ: for (int64_t j = 0; j < n; j++) d[j] = a[j] == b[j]; break;
+                case OP_NE: for (int64_t j = 0; j < n; j++) d[j] = a[j] != b[j]; break;
+                case OP_LT: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j]; break;
+                case OP_LE: for (int64_t j = 0; j < n; j++) d[j] = a[j] <= b[j]; break;
+                case OP_GT: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j]; break;
+                case OP_GE: for (int64_t j = 0; j < n; j++) d[j] = a[j] >= b[j]; break;
+                default: break;
+            }
+        } else { /* both bool */
+            const uint8_t* a = (const uint8_t*)ap;
+            const uint8_t* b = (const uint8_t*)bp;
+            switch (opcode) {
+                case OP_AND: for (int64_t j = 0; j < n; j++) d[j] = a[j] && b[j]; break;
+                case OP_OR:  for (int64_t j = 0; j < n; j++) d[j] = a[j] || b[j]; break;
+                default: break;
+            }
+        }
+    }
+}
+
+/* Execute a unary instruction over n elements */
+static void expr_exec_unary(uint8_t opcode, int8_t dt, void* dp,
+                             int8_t t1, const void* ap, int64_t n) {
+    if (dt == TD_F64) {
+        double* d = (double*)dp;
+        if (t1 == TD_F64) {
+            const double* a = (const double*)ap;
+            switch (opcode) {
+                case OP_NEG:   for (int64_t j = 0; j < n; j++) d[j] = -a[j]; break;
+                case OP_ABS:   for (int64_t j = 0; j < n; j++) d[j] = fabs(a[j]); break;
+                case OP_SQRT:  for (int64_t j = 0; j < n; j++) d[j] = sqrt(a[j]); break;
+                case OP_LOG:   for (int64_t j = 0; j < n; j++) d[j] = log(a[j]); break;
+                case OP_EXP:   for (int64_t j = 0; j < n; j++) d[j] = exp(a[j]); break;
+                case OP_CEIL:  for (int64_t j = 0; j < n; j++) d[j] = ceil(a[j]); break;
+                case OP_FLOOR: for (int64_t j = 0; j < n; j++) d[j] = floor(a[j]); break;
+                default: break;
+            }
+        } else { /* CAST i64→f64 */
+            const int64_t* a = (const int64_t*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = (double)a[j];
+        }
+    } else if (dt == TD_I64) {
+        int64_t* d = (int64_t*)dp;
+        if (t1 == TD_I64) {
+            const int64_t* a = (const int64_t*)ap;
+            switch (opcode) {
+                case OP_NEG: for (int64_t j = 0; j < n; j++) d[j] = -a[j]; break;
+                case OP_ABS: for (int64_t j = 0; j < n; j++) d[j] = a[j] < 0 ? -a[j] : a[j]; break;
+                default: break;
+            }
+        } else { /* CAST f64→i64 */
+            const double* a = (const double*)ap;
+            for (int64_t j = 0; j < n; j++) d[j] = (int64_t)a[j];
+        }
+    } else if (dt == TD_BOOL) {
+        uint8_t* d = (uint8_t*)dp;
+        const uint8_t* a = (const uint8_t*)ap;
+        switch (opcode) {
+            case OP_NOT: for (int64_t j = 0; j < n; j++) d[j] = !a[j]; break;
+            default: break;
+        }
+    }
+}
+
+/* Evaluate compiled expression for morsel [start, end).
+ * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
+ * Returns pointer to output data (morsel-relative indexing). */
+static void* expr_eval_morsel(const td_expr_t* expr, void** scratch,
+                               int64_t start, int64_t end) {
+    int64_t n = end - start;
+    if (n <= 0) return NULL;
+
+    void* rptrs[EXPR_MAX_REGS];
+    for (uint8_t r = 0; r < expr->n_regs; r++) {
+        int8_t rt = expr->regs[r].type;
+        int8_t ct = expr->regs[r].col_type;
+        switch (expr->regs[r].kind) {
+            case REG_SCAN:
+                /* Direct pointer if native type matches, else convert */
+                if (rt == TD_F64 && ct == TD_F64) {
+                    rptrs[r] = (double*)expr->regs[r].data + start;
+                } else if (rt == TD_I64 && (ct == TD_I64 || ct == TD_SYM ||
+                           ct == TD_TIMESTAMP)) {
+                    rptrs[r] = (int64_t*)expr->regs[r].data + start;
+                } else {
+                    rptrs[r] = scratch[r];
+                    if (rt == TD_F64)
+                        expr_load_f64(scratch[r], expr->regs[r].data, ct, start, n);
+                    else
+                        expr_load_i64(scratch[r], expr->regs[r].data, ct, start, n);
+                }
+                break;
+            case REG_CONST:
+                rptrs[r] = scratch[r];
+                if (rt == TD_F64) {
+                    double v = expr->regs[r].const_f64;
+                    double* d = (double*)scratch[r];
+                    for (int64_t j = 0; j < n; j++) d[j] = v;
+                } else {
+                    int64_t v = expr->regs[r].const_i64;
+                    int64_t* d = (int64_t*)scratch[r];
+                    for (int64_t j = 0; j < n; j++) d[j] = v;
+                }
+                break;
+            default: /* REG_SCRATCH */
+                rptrs[r] = scratch[r];
+                break;
+        }
+    }
+
+    for (uint8_t i = 0; i < expr->n_ins; i++) {
+        const expr_ins_t* ins = &expr->ins[i];
+        int8_t dt = expr->regs[ins->dst].type;
+        if (ins->src2 != 0xFF) {
+            expr_exec_binary(ins->opcode, dt, rptrs[ins->dst],
+                             expr->regs[ins->src1].type, rptrs[ins->src1],
+                             expr->regs[ins->src2].type, rptrs[ins->src2], n);
+        } else {
+            expr_exec_unary(ins->opcode, dt, rptrs[ins->dst],
+                            expr->regs[ins->src1].type, rptrs[ins->src1], n);
+        }
+    }
+
+    return rptrs[expr->out_reg];
+}
+
+/* Context for parallel full-vector expression evaluation */
+typedef struct {
+    const td_expr_t* expr;
+    void*  out_data;
+    int8_t out_type;
+} expr_full_ctx_t;
+
+static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    expr_full_ctx_t* c = (expr_full_ctx_t*)ctx;
+    const td_expr_t* expr = c->expr;
+    uint8_t esz = td_elem_size(c->out_type);
+
+    /* Per-worker scratch buffers (stack-allocated, morsel-sized) */
+    char scratch_mem[EXPR_MAX_REGS][EXPR_MORSEL * 8];
+    void* scratch[EXPR_MAX_REGS];
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        scratch[r] = scratch_mem[r];
+
+    for (int64_t ms = start; ms < end; ms += EXPR_MORSEL) {
+        int64_t me = (ms + EXPR_MORSEL < end) ? ms + EXPR_MORSEL : end;
+        void* result = expr_eval_morsel(expr, scratch, ms, me);
+        if (result)
+            memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
+    }
+}
+
+/* Evaluate compiled expression into a full-length output vector.
+ * Replaces exec_node() for expression subtrees — no intermediate vectors. */
+static td_t* expr_eval_full(const td_expr_t* expr, int64_t nrows) {
+    td_t* out = td_vec_new(expr->out_type, nrows);
+    if (!out || TD_IS_ERR(out)) return out;
+    out->len = nrows;
+
+    expr_full_ctx_t ctx = {
+        .expr = expr, .out_data = td_data(out), .out_type = expr->out_type,
+    };
+
+    td_pool_t* pool = td_pool_get();
+    if (pool && nrows >= TD_PARALLEL_THRESHOLD)
+        td_pool_dispatch(pool, expr_full_fn, &ctx, nrows);
+    else
+        expr_full_fn(&ctx, 0, 0, nrows);
+
+    return out;
 }
 
 /* ============================================================================
@@ -183,7 +1057,7 @@ static void binary_range(td_op_t* op, int8_t out_type,
         else if (lp_i32)  lv = (double)lp_i32[i];
         else if (lp_u32)  lv = (double)lp_u32[i];
         else if (lp_bool) lv = (double)lp_bool[i];
-        else if (l_scalar && (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64)) lv = l_f64;
+        else if (l_scalar && (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64 || lhs->type == TD_F64)) lv = l_f64;
         else              lv = (double)l_i64;
 
         if (rp_f64)       rv = rp_f64[i];
@@ -191,7 +1065,7 @@ static void binary_range(td_op_t* op, int8_t out_type,
         else if (rp_i32)  rv = (double)rp_i32[i];
         else if (rp_u32)  rv = (double)rp_u32[i];
         else if (rp_bool) rv = (double)rp_bool[i];
-        else if (r_scalar && (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64)) rv = r_f64;
+        else if (r_scalar && (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64 || rhs->type == TD_F64)) rv = r_f64;
         else              rv = (double)r_i64;
 
         if (out_type == TD_F64) {
@@ -266,11 +1140,18 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
     if (!lhs || TD_IS_ERR(lhs)) return lhs;
     if (!rhs || TD_IS_ERR(rhs)) return rhs;
 
-    int64_t len = lhs->len;
-    bool l_scalar = td_is_atom(lhs);
-    bool r_scalar = td_is_atom(rhs);
-    if (l_scalar) len = rhs->len;
-    if (r_scalar && !l_scalar) len = lhs->len;
+    bool l_scalar = td_is_atom(lhs) || (lhs->type > 0 && lhs->len == 1);
+    bool r_scalar = td_is_atom(rhs) || (rhs->type > 0 && rhs->len == 1);
+
+    int64_t len = 1;
+    if (!l_scalar && !r_scalar) {
+        if (lhs->len != rhs->len) return TD_ERR_PTR(TD_ERR_LENGTH);
+        len = lhs->len;
+    } else if (l_scalar && !r_scalar) {
+        len = rhs->len;
+    } else if (!l_scalar && r_scalar) {
+        len = lhs->len;
+    }
 
     int8_t out_type = op->out_type;
     td_t* result = td_vec_new(out_type, len);
@@ -301,14 +1182,44 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
     if (l_scalar) {
         if (str_resolved && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR))
             l_i64_val = resolved_sym_id;
-        else if (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64) l_f64_val = lhs->f64;
-        else l_i64_val = lhs->i64;
+        else if (td_is_atom(lhs)) {
+            if (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64) l_f64_val = lhs->f64;
+            else l_i64_val = lhs->i64;
+        } else {
+            int8_t t = lhs->type;
+            if (t == TD_F64) l_f64_val = ((double*)td_data(lhs))[0];
+            else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP || t == TD_TIME)
+                l_i64_val = ((int64_t*)td_data(lhs))[0];
+            else if (t == TD_I32 || t == TD_DATE)
+                l_i64_val = (int64_t)((int32_t*)td_data(lhs))[0];
+            else if (t == TD_I16)
+                l_i64_val = (int64_t)((int16_t*)td_data(lhs))[0];
+            else if (t == TD_ENUM)
+                l_i64_val = (int64_t)((uint32_t*)td_data(lhs))[0];
+            else
+                l_i64_val = (int64_t)((uint8_t*)td_data(lhs))[0];
+        }
     }
     if (r_scalar) {
         if (str_resolved && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR))
             r_i64_val = resolved_sym_id;
-        else if (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64) r_f64_val = rhs->f64;
-        else r_i64_val = rhs->i64;
+        else if (td_is_atom(rhs)) {
+            if (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64) r_f64_val = rhs->f64;
+            else r_i64_val = rhs->i64;
+        } else {
+            int8_t t = rhs->type;
+            if (t == TD_F64) r_f64_val = ((double*)td_data(rhs))[0];
+            else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP || t == TD_TIME)
+                r_i64_val = ((int64_t*)td_data(rhs))[0];
+            else if (t == TD_I32 || t == TD_DATE)
+                r_i64_val = (int64_t)((int32_t*)td_data(rhs))[0];
+            else if (t == TD_I16)
+                r_i64_val = (int64_t)((int16_t*)td_data(rhs))[0];
+            else if (t == TD_ENUM)
+                r_i64_val = (int64_t)((uint32_t*)td_data(rhs))[0];
+            else
+                r_i64_val = (int64_t)((uint8_t*)td_data(rhs))[0];
+        }
     }
 
     td_pool_t* pool = td_pool_get();
@@ -2508,6 +3419,9 @@ typedef struct {
     int8_t  out_type;
     bool    src_f64;
     uint16_t agg_op;
+    bool    affine;
+    double  bias_f64;
+    int64_t bias_i64;
     void*   dst;
 } agg_out_t;
 
@@ -2575,10 +3489,12 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case OP_SUM:
                             v = sf ? ((const double*)(row + ly->off_sum))[s]
                                    : (double)((const int64_t*)(row + ly->off_sum))[s];
+                            if (ao->affine) v += ao->bias_f64 * cnt;
                             break;
                         case OP_AVG:
                             v = sf ? ((const double*)(row + ly->off_sum))[s] / cnt
                                    : (double)((const int64_t*)(row + ly->off_sum))[s] / cnt;
+                            if (ao->affine) v += ao->bias_f64;
                             break;
                         case OP_MIN:
                             v = sf ? ((const double*)(row + ly->off_min))[s]
@@ -2594,7 +3510,10 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 } else {
                     int64_t v;
                     switch (op) {
-                        case OP_SUM:   v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                        case OP_SUM:
+                            v = ((const int64_t*)(row + ly->off_sum))[s];
+                            if (ao->affine) v += ao->bias_i64 * cnt;
+                            break;
                         case OP_COUNT: v = cnt; break;
                         case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
                         case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
@@ -2734,7 +3653,8 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                               double*  sum_f64,  int64_t* sum_i64,
                               double*  min_f64,  double*  max_f64,
                               int64_t* min_i64,  int64_t* max_i64,
-                              int64_t* counts) {
+                              int64_t* counts,
+                              const agg_affine_t* affine) {
     for (uint8_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         td_t* agg_col = agg_vecs[a];
@@ -2756,8 +3676,16 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
             if (out_type == TD_F64) {
                 double v;
                 switch (agg_op) {
-                    case OP_SUM: v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
-                    case OP_AVG: v = is_f64 ? sum_f64[idx] / counts[gi] : (double)sum_i64[idx] / counts[gi]; break;
+                    case OP_SUM:
+                        v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
+                        if (affine && affine[a].enabled)
+                            v += affine[a].bias_f64 * counts[gi];
+                        break;
+                    case OP_AVG:
+                        v = is_f64 ? sum_f64[idx] / counts[gi] : (double)sum_i64[idx] / counts[gi];
+                        if (affine && affine[a].enabled)
+                            v += affine[a].bias_f64;
+                        break;
                     case OP_MIN: v = is_f64 ? min_f64[idx] : (double)min_i64[idx]; break;
                     case OP_MAX: v = is_f64 ? max_f64[idx] : (double)max_i64[idx]; break;
                     case OP_FIRST: case OP_LAST:
@@ -2768,7 +3696,11 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
             } else {
                 int64_t v;
                 switch (agg_op) {
-                    case OP_SUM:   v = sum_i64[idx]; break;
+                    case OP_SUM:
+                        v = sum_i64[idx];
+                        if (affine && affine[a].enabled)
+                            v += affine[a].bias_i64 * counts[gi];
+                        break;
                     case OP_COUNT: v = counts[gi]; break;
                     case OP_MIN:   v = min_i64[idx]; break;
                     case OP_MAX:   v = max_i64[idx]; break;
@@ -2888,11 +3820,80 @@ static inline void da_read_val(const void* ptr, int8_t type, int64_t r,
     }
 }
 
+/* Materialize a scalar (atom or len-1 vector) into a full-length vector so
+ * group-aggregation loops can read row-wise without out-of-bounds access. */
+static td_t* materialize_broadcast_input(td_t* src, int64_t nrows) {
+    if (!src || TD_IS_ERR(src) || nrows < 0) return NULL;
+
+    int8_t out_type = td_is_atom(src) ? (int8_t)-src->type : src->type;
+    if (out_type <= 0 || out_type >= TD_TYPE_COUNT) return NULL;
+
+    td_t* out = td_vec_new(out_type, nrows);
+    if (!out || TD_IS_ERR(out)) return out;
+    out->len = nrows;
+    if (nrows == 0) return out;
+
+    if (!td_is_atom(src)) {
+        uint8_t esz = td_elem_size(src->type);
+        const char* s = (const char*)td_data(src);
+        char* d = (char*)td_data(out);
+        for (int64_t i = 0; i < nrows; i++)
+            memcpy(d + (size_t)i * esz, s, esz);
+        return out;
+    }
+
+    switch (src->type) {
+        case TD_ATOM_F64: {
+            double v = src->f64;
+            for (int64_t i = 0; i < nrows; i++) ((double*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_I64:
+        case TD_ATOM_SYM:
+        case TD_ATOM_TIME:
+        case TD_ATOM_TIMESTAMP: {
+            int64_t v = src->i64;
+            for (int64_t i = 0; i < nrows; i++) ((int64_t*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_DATE: {
+            int32_t v = (int32_t)src->i64;
+            for (int64_t i = 0; i < nrows; i++) ((int32_t*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_I32: {
+            int32_t v = src->i32;
+            for (int64_t i = 0; i < nrows; i++) ((int32_t*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_I16: {
+            int16_t v = src->i16;
+            for (int64_t i = 0; i < nrows; i++) ((int16_t*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_U8:
+        case TD_ATOM_BOOL: {
+            uint8_t v = src->u8;
+            for (int64_t i = 0; i < nrows; i++) ((uint8_t*)td_data(out))[i] = v;
+            return out;
+        }
+        case TD_ATOM_ENUM: {
+            uint32_t v = src->u32;
+            for (int64_t i = 0; i < nrows; i++) ((uint32_t*)td_data(out))[i] = v;
+            return out;
+        }
+        default:
+            td_release(out);
+            return NULL;
+    }
+}
+
 /* ---- Scalar aggregate (n_keys==0): one flat scan, no GID, no hash ---- */
 typedef struct {
     void**         agg_ptrs;
     int8_t*        agg_types;
     uint16_t*      agg_ops;
+    agg_linear_t*  agg_linear;
     uint8_t        n_aggs;
     uint8_t        need_flags;
     const uint8_t* mask;
@@ -2900,6 +3901,18 @@ typedef struct {
     da_accum_t*    accums;
     uint32_t       n_accums;
 } scalar_ctx_t;
+
+static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
+    if (type == TD_I64 || type == TD_SYM || type == TD_TIME || type == TD_TIMESTAMP)
+        return ((const int64_t*)ptr)[r];
+    if (type == TD_I32 || type == TD_DATE)
+        return (int64_t)((const int32_t*)ptr)[r];
+    if (type == TD_I16)
+        return (int64_t)((const int16_t*)ptr)[r];
+    if (type == TD_ENUM)
+        return (int64_t)((const uint32_t*)ptr)[r];
+    return (int64_t)((const uint8_t*)ptr)[r];
+}
 
 /* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask) */
 static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -2927,6 +3940,30 @@ static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     acc->count[0] += end - start;
 }
 
+/* Tight loop for single SUM/AVG on integer linear expression (no mask). */
+static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    da_accum_t* acc = &c->accums[worker_id];
+    const agg_linear_t* lin = &c->agg_linear[0];
+    int64_t n = end - start;
+
+    int64_t sum = lin->bias_i64 * n;
+    for (uint8_t t = 0; t < lin->n_terms; t++) {
+        int64_t coeff = lin->coeff_i64[t];
+        if (coeff == 0) continue;
+        const void* ptr = lin->term_ptrs[t];
+        int8_t type = lin->term_types[t];
+        int64_t term_sum = 0;
+        for (int64_t r = start; r < end; r++)
+            term_sum += scalar_i64_at(ptr, type, r);
+        sum += coeff * term_sum;
+    }
+
+    acc->i64[0] += sum;
+    acc->f64[0] += (double)sum;
+    acc->count[0] += n;
+}
+
 /* Generic scalar accumulation: handles all ops, all types, mask */
 static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
@@ -2938,9 +3975,19 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         if (mask && !mask[r]) continue;
         acc->count[0]++;
         for (uint8_t a = 0; a < n_aggs; a++) {
-            if (!c->agg_ptrs[a]) continue;
             double fv; int64_t iv;
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+            if (c->agg_linear && c->agg_linear[a].enabled) {
+                const agg_linear_t* lin = &c->agg_linear[a];
+                iv = lin->bias_i64;
+                for (uint8_t t = 0; t < lin->n_terms; t++) {
+                    iv += lin->coeff_i64[t] *
+                          scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
+                }
+                fv = (double)iv;
+            } else {
+                if (!c->agg_ptrs[a]) continue;
+                da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+            }
             uint16_t op = c->agg_ops[a];
             if (op == OP_SUM || op == OP_AVG) {
                 acc->f64[a] += fv;
@@ -3084,27 +4131,84 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
     /* Resolve agg input columns (VLA — n_aggs ≤ 8) */
     td_t* agg_vecs[n_aggs];
     uint8_t agg_owned[n_aggs]; /* 1 = we allocated via exec_node, must free */
+    agg_affine_t agg_affine[n_aggs];
+    agg_linear_t agg_linear[n_aggs];
     memset(agg_vecs, 0, n_aggs * sizeof(td_t*));
     memset(agg_owned, 0, n_aggs * sizeof(uint8_t));
+    memset(agg_affine, 0, n_aggs * sizeof(agg_affine_t));
+    memset(agg_linear, 0, n_aggs * sizeof(agg_linear_t));
 
     for (uint8_t a = 0; a < n_aggs; a++) {
-        td_op_t* agg_op = ext->agg_ins[a];
-        td_op_ext_t* agg_ext = find_ext(g, agg_op->id);
+        td_op_t* agg_input_op = ext->agg_ins[a];
+        td_op_ext_t* agg_ext = find_ext(g, agg_input_op->id);
+
+        /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
+        uint16_t agg_kind = ext->agg_ops[a];
+        if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
+            try_affine_sumavg_input(g, df, agg_input_op, &agg_vecs[a], &agg_affine[a])) {
+            continue;
+        }
+
+        /* SUM/AVG(integer-linear expr): scalar path can aggregate directly
+         * without materializing the expression vector. */
+        if (n_keys == 0 && nrows > 0 &&
+            (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
+            try_linear_sumavg_input_i64(g, df, agg_input_op, &agg_linear[a])) {
+            continue;
+        }
+
         if (agg_ext && agg_ext->base.opcode == OP_SCAN) {
             agg_vecs[a] = td_table_get_col(df, agg_ext->sym);
         } else if (agg_ext && agg_ext->base.opcode == OP_CONST && agg_ext->literal) {
             agg_vecs[a] = agg_ext->literal;
         } else {
-            /* Expression node (ADD/MUL etc) — evaluate against current df */
+            /* Expression node (ADD/MUL etc) — try compiled expression first */
+            td_expr_t agg_expr;
+            if (expr_compile(g, df, agg_input_op, &agg_expr)) {
+                td_t* vec = expr_eval_full(&agg_expr, nrows);
+                if (vec && !TD_IS_ERR(vec)) {
+                    agg_vecs[a] = vec;
+                    agg_owned[a] = 1;
+                    continue;
+                }
+            }
+            /* Fallback: full recursive evaluation */
             td_t* saved_df = g->df;
             g->df = df;
-            td_t* vec = exec_node(g, agg_op);
+            td_t* vec = exec_node(g, agg_input_op);
             g->df = saved_df;
             if (vec && !TD_IS_ERR(vec)) {
                 agg_vecs[a] = vec;
                 agg_owned[a] = 1;
             }
         }
+    }
+
+    /* Normalize scalar agg inputs to full-length vectors.
+     * Constants and scalar sub-expressions (len=1) must be broadcast to nrows
+     * before row-wise aggregation loops. */
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        if (!agg_vecs[a] || TD_IS_ERR(agg_vecs[a])) continue;
+        if (ext->agg_ops[a] == OP_COUNT) continue; /* value is ignored for COUNT */
+
+        bool needs_broadcast = td_is_atom(agg_vecs[a]) ||
+                               (agg_vecs[a]->type > 0 && agg_vecs[a]->len == 1 && nrows > 1);
+        if (!needs_broadcast) continue;
+
+        td_t* bcast = materialize_broadcast_input(agg_vecs[a], nrows);
+        if (!bcast || TD_IS_ERR(bcast)) {
+            for (uint8_t i = 0; i < n_aggs; i++) {
+                if (agg_owned[i] && agg_vecs[i]) td_release(agg_vecs[i]);
+            }
+            for (uint8_t k = 0; k < n_keys; k++) {
+                if (key_owned[k] && key_vecs[k]) td_release(key_vecs[k]);
+            }
+            return bcast && TD_IS_ERR(bcast) ? bcast : TD_ERR_PTR(TD_ERR_OOM);
+        }
+
+        if (agg_owned[a]) td_release(agg_vecs[a]);
+        agg_vecs[a] = bcast;
+        agg_owned[a] = 1;
     }
 
     /* Pre-compute key metadata (VLA — n_keys ≤ 8) */
@@ -3198,6 +4302,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
             .agg_ops    = ext->agg_ops,
+            .agg_linear = agg_linear,
             .n_aggs     = n_aggs,
             .need_flags = need_flags,
             .mask       = mask,
@@ -3216,6 +4321,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
                 sc_fn = scalar_sum_i64_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == TD_F64)
                 sc_fn = scalar_sum_f64_fn;
+        } else if (n_aggs == 1 && !mask && agg_linear[0].enabled) {
+            uint16_t op0 = ext->agg_ops[0];
+            if (op0 == OP_SUM || op0 == OP_AVG)
+                sc_fn = scalar_sum_linear_i64_fn;
         }
 
         if (sc_n > 1)
@@ -3258,7 +4367,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* df) {
 
         emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
                          m->f64, m->i64, m->min_f64, m->max_f64,
-                         m->min_i64, m->max_i64, m->count);
+                         m->min_i64, m->max_i64, m->count, agg_affine);
 
         da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
         for (uint8_t a = 0; a < n_aggs; a++)
@@ -3601,7 +4710,7 @@ da_path:;
 
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                              dense_f64, dense_i64, dense_min_f64, dense_max_f64,
-                             dense_min_i64, dense_max_i64, dense_counts);
+                             dense_min_i64, dense_max_i64, dense_counts, agg_affine);
 
             scratch_free(_h_df64); scratch_free(_h_di64);
             scratch_free(_h_dminf); scratch_free(_h_dmaxf);
@@ -3759,7 +4868,11 @@ ht_path:;
             agg_cols[a] = new_col;
             agg_outs[a] = (agg_out_t){
                 .out_type = out_type, .src_f64 = is_f64,
-                .agg_op = agg_op, .dst = td_data(new_col),
+                .agg_op = agg_op,
+                .affine = agg_affine[a].enabled,
+                .bias_f64 = agg_affine[a].bias_f64,
+                .bias_i64 = agg_affine[a].bias_i64,
+                .dst = td_data(new_col),
             };
         }
 
@@ -3901,10 +5014,12 @@ sequential_fallback:;
                     case OP_SUM:
                         v = is_f64 ? ((const double*)(row + ly->off_sum))[s]
                                    : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * cnt;
                         break;
                     case OP_AVG:
                         v = is_f64 ? ((const double*)(row + ly->off_sum))[s] / cnt
                                    : (double)((const int64_t*)(row + ly->off_sum))[s] / cnt;
+                        if (agg_affine[a].enabled) v += agg_affine[a].bias_f64;
                         break;
                     case OP_MIN:
                         v = is_f64 ? ((const double*)(row + ly->off_min))[s]
@@ -3920,7 +5035,10 @@ sequential_fallback:;
             } else {
                 int64_t v;
                 switch (agg_op) {
-                    case OP_SUM:   v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                    case OP_SUM:
+                        v = ((const int64_t*)(row + ly->off_sum))[s];
+                        if (agg_affine[a].enabled) v += agg_affine[a].bias_i64 * cnt;
+                        break;
                     case OP_COUNT: v = cnt; break;
                     case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
                     case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
@@ -5958,27 +7076,40 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         /* Unary element-wise */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR:
-        case OP_ISNULL: case OP_CAST: {
-            td_t* input = exec_node(g, op->inputs[0]);
-            if (!input || TD_IS_ERR(input)) return input;
-            td_t* result = exec_elementwise_unary(g, op, input);
-            td_release(input);
-            return result;
-        }
-
+        case OP_ISNULL: case OP_CAST:
         /* Binary element-wise */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: {
-            td_t* lhs = exec_node(g, op->inputs[0]);
-            td_t* rhs = exec_node(g, op->inputs[1]);
-            if (!lhs || TD_IS_ERR(lhs)) { if (rhs && !TD_IS_ERR(rhs)) td_release(rhs); return lhs; }
-            if (!rhs || TD_IS_ERR(rhs)) { td_release(lhs); return rhs; }
-            td_t* result = exec_elementwise_binary(g, op, lhs, rhs);
-            td_release(lhs);
-            td_release(rhs);
-            return result;
+            /* Try compiled expression first (fuses entire subtree) */
+            if (g->df) {
+                int64_t nr = td_table_nrows(g->df);
+                if (nr > 0) {
+                    td_expr_t ex;
+                    if (expr_compile(g, g->df, op, &ex)) {
+                        td_t* vec = expr_eval_full(&ex, nr);
+                        if (vec && !TD_IS_ERR(vec)) return vec;
+                    }
+                }
+            }
+            /* Fallback: recursive per-node evaluation */
+            if (op->arity == 1) {
+                td_t* input = exec_node(g, op->inputs[0]);
+                if (!input || TD_IS_ERR(input)) return input;
+                td_t* result = exec_elementwise_unary(g, op, input);
+                td_release(input);
+                return result;
+            } else {
+                td_t* lhs = exec_node(g, op->inputs[0]);
+                td_t* rhs = exec_node(g, op->inputs[1]);
+                if (!lhs || TD_IS_ERR(lhs)) { if (rhs && !TD_IS_ERR(rhs)) td_release(rhs); return lhs; }
+                if (!rhs || TD_IS_ERR(rhs)) { td_release(lhs); return rhs; }
+                td_t* result = exec_elementwise_binary(g, op, lhs, rhs);
+                td_release(lhs);
+                td_release(rhs);
+                return result;
+            }
         }
 
         /* Reductions */

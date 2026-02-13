@@ -1,4 +1,29 @@
+/*
+ *   Copyright (c) 2024-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
 #include "opt.h"
+#include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -57,6 +82,232 @@ static bool is_const(td_op_t* n) {
     return n && n->opcode == OP_CONST;
 }
 
+static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
+            return g->ext_nodes[i];
+    }
+    return NULL;
+}
+
+static bool track_ext_node(td_graph_t* g, td_op_ext_t* ext) {
+    if (g->ext_count >= g->ext_cap) {
+        uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
+        td_op_ext_t** new_exts =
+            (td_op_ext_t**)realloc(g->ext_nodes, new_cap * sizeof(td_op_ext_t*));
+        if (!new_exts) return false;
+        g->ext_nodes = new_exts;
+        g->ext_cap = new_cap;
+    }
+    g->ext_nodes[g->ext_count++] = ext;
+    return true;
+}
+
+static td_op_ext_t* ensure_ext_node(td_graph_t* g, uint32_t node_id) {
+    td_op_ext_t* ext = find_ext(g, node_id);
+    if (ext) return ext;
+
+    ext = (td_op_ext_t*)calloc(1, sizeof(td_op_ext_t));
+    if (!ext) return NULL;
+    ext->base.id = node_id;
+    if (!track_ext_node(g, ext)) {
+        free(ext);
+        return NULL;
+    }
+    return ext;
+}
+
+static bool atom_to_numeric(td_t* v, double* out_f, int64_t* out_i, bool* is_f64) {
+    if (!v || !td_is_atom(v)) return false;
+    switch (v->type) {
+        case TD_ATOM_F64:
+            *out_f = v->f64;
+            *out_i = (int64_t)v->f64;
+            *is_f64 = true;
+            return true;
+        case TD_ATOM_I64:
+        case TD_ATOM_SYM:
+        case TD_ATOM_DATE:
+        case TD_ATOM_TIME:
+        case TD_ATOM_TIMESTAMP:
+            *out_i = v->i64;
+            *out_f = (double)v->i64;
+            *is_f64 = false;
+            return true;
+        case TD_ATOM_I32:
+            *out_i = (int64_t)v->i32;
+            *out_f = (double)v->i32;
+            *is_f64 = false;
+            return true;
+        case TD_ATOM_I16:
+            *out_i = (int64_t)v->i16;
+            *out_f = (double)v->i16;
+            *is_f64 = false;
+            return true;
+        case TD_ATOM_U8:
+        case TD_ATOM_BOOL:
+            *out_i = (int64_t)v->u8;
+            *out_f = (double)v->u8;
+            *is_f64 = false;
+            return true;
+        case TD_ATOM_ENUM:
+            *out_i = (int64_t)v->u32;
+            *out_f = (double)v->u32;
+            *is_f64 = false;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool replace_with_const(td_graph_t* g, td_op_t* node, td_t* literal) {
+    td_op_ext_t* ext = ensure_ext_node(g, node->id);
+    if (!ext) return false;
+
+    ext->base = *node;
+    ext->base.opcode = OP_CONST;
+    ext->base.arity = 0;
+    ext->base.inputs[0] = NULL;
+    ext->base.inputs[1] = NULL;
+    ext->base.flags &= (uint8_t)~OP_FLAG_FUSED;
+    ext->base.out_type = literal->type < 0 ? (int8_t)-literal->type : literal->type;
+    ext->literal = literal;
+
+    *node = ext->base;
+    g->nodes[node->id] = ext->base;
+    return true;
+}
+
+static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
+    td_op_t* lhs = node->inputs[0];
+    td_op_t* rhs = node->inputs[1];
+    if (!is_const(lhs) || !is_const(rhs)) return false;
+
+    td_op_ext_t* le = find_ext(g, lhs->id);
+    td_op_ext_t* re = find_ext(g, rhs->id);
+    if (!le || !re || !le->literal || !re->literal) return false;
+    if (!td_is_atom(le->literal) || !td_is_atom(re->literal)) return false;
+
+    double lf = 0.0, rf = 0.0;
+    int64_t li = 0, ri = 0;
+    bool l_is_f64 = false, r_is_f64 = false;
+    if (!atom_to_numeric(le->literal, &lf, &li, &l_is_f64)) return false;
+    if (!atom_to_numeric(re->literal, &rf, &ri, &r_is_f64)) return false;
+
+    td_t* folded = NULL;
+    switch (node->out_type) {
+        case TD_F64: {
+            double lv = l_is_f64 ? lf : (double)li;
+            double rv = r_is_f64 ? rf : (double)ri;
+            double r = 0.0;
+            switch (node->opcode) {
+                case OP_ADD: r = lv + rv; break;
+                case OP_SUB: r = lv - rv; break;
+                case OP_MUL: r = lv * rv; break;
+                case OP_DIV: r = rv != 0.0 ? lv / rv : 0.0; break;
+                case OP_MOD: r = rv != 0.0 ? fmod(lv, rv) : 0.0; break;
+                case OP_MIN2: r = lv < rv ? lv : rv; break;
+                case OP_MAX2: r = lv > rv ? lv : rv; break;
+                default: return false;
+            }
+            folded = td_f64(r);
+            break;
+        }
+        case TD_I64: {
+            int64_t lv = l_is_f64 ? (int64_t)lf : li;
+            int64_t rv = r_is_f64 ? (int64_t)rf : ri;
+            int64_t r = 0;
+            switch (node->opcode) {
+                case OP_ADD: r = lv + rv; break;
+                case OP_SUB: r = lv - rv; break;
+                case OP_MUL: r = lv * rv; break;
+                case OP_DIV: r = rv != 0 ? lv / rv : 0; break;
+                case OP_MOD: r = rv != 0 ? lv % rv : 0; break;
+                case OP_MIN2: r = lv < rv ? lv : rv; break;
+                case OP_MAX2: r = lv > rv ? lv : rv; break;
+                default: return false;
+            }
+            folded = td_i64(r);
+            break;
+        }
+        case TD_BOOL: {
+            double lv = l_is_f64 ? lf : (double)li;
+            double rv = r_is_f64 ? rf : (double)ri;
+            bool r = false;
+            switch (node->opcode) {
+                case OP_EQ:  r = lv == rv; break;
+                case OP_NE:  r = lv != rv; break;
+                case OP_LT:  r = lv < rv; break;
+                case OP_LE:  r = lv <= rv; break;
+                case OP_GT:  r = lv > rv; break;
+                case OP_GE:  r = lv >= rv; break;
+                case OP_AND: r = (uint8_t)lv && (uint8_t)rv; break;
+                case OP_OR:  r = (uint8_t)lv || (uint8_t)rv; break;
+                default: return false;
+            }
+            folded = td_bool(r);
+            break;
+        }
+        default:
+            return false;
+    }
+
+    if (!folded || TD_IS_ERR(folded)) return false;
+    if (!replace_with_const(g, node, folded)) {
+        td_release(folded);
+        return false;
+    }
+    return true;
+}
+
+static bool atom_to_bool(td_t* v, bool* out) {
+    double vf = 0.0;
+    int64_t vi = 0;
+    bool is_f64 = false;
+    if (!atom_to_numeric(v, &vf, &vi, &is_f64)) return false;
+    if (is_f64) {
+        *out = (uint8_t)vf != 0;
+    } else {
+        *out = vi != 0;
+    }
+    return true;
+}
+
+static bool fold_filter_const_predicate(td_graph_t* g, td_op_t* node) {
+    if (node->opcode != OP_FILTER || node->arity != 2) return false;
+    td_op_t* pred = node->inputs[1];
+    if (!is_const(pred)) return false;
+
+    td_op_ext_t* pred_ext = find_ext(g, pred->id);
+    if (!pred_ext || !pred_ext->literal || !td_is_atom(pred_ext->literal)) return false;
+
+    bool keep_rows = false;
+    if (!atom_to_bool(pred_ext->literal, &keep_rows)) return false;
+
+    if (keep_rows) {
+        node->opcode = OP_MATERIALIZE;
+        node->arity = 1;
+        node->inputs[1] = NULL;
+        node->flags &= (uint8_t)~OP_FLAG_FUSED;
+        g->nodes[node->id] = *node;
+        return true;
+    }
+
+    td_op_ext_t* ext = ensure_ext_node(g, node->id);
+    if (!ext) return false;
+    ext->base = *node;
+    ext->base.opcode = OP_HEAD;
+    ext->base.arity = 1;
+    ext->base.inputs[1] = NULL;
+    ext->base.est_rows = 0;
+    ext->base.flags &= (uint8_t)~OP_FLAG_FUSED;
+    ext->sym = 0;
+
+    *node = ext->base;
+    g->nodes[node->id] = ext->base;
+    return true;
+}
+
 static void pass_constant_fold(td_graph_t* g, td_op_t* node) {
     if (!node || node->flags & OP_FLAG_DEAD) return;
 
@@ -67,12 +318,11 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* node) {
 
     /* Only fold element-wise binary ops with two const inputs */
     if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
-        if (is_const(node->inputs[0]) && is_const(node->inputs[1])) {
-            /* Both inputs are constants — this could be folded.
-               For now, we skip full constant folding to keep things simple.
-               The executor handles it correctly already. */
-        }
+        (void)fold_binary_const(g, node);
     }
+
+    /* FILTER with constant predicate can be reduced to pass-through/empty. */
+    (void)fold_filter_const_predicate(g, node);
 }
 
 /* --------------------------------------------------------------------------

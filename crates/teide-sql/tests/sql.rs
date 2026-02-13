@@ -1,3 +1,24 @@
+//   Copyright (c) 2024-2026 Anton Kundenko <singaraiona@gmail.com>
+//   All rights reserved.
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy
+//   of this software and associated documentation files (the "Software"), to deal
+//   in the Software without restriction, including without limitation the rights
+//   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//   copies of the Software, and to permit persons to whom the Software is
+//   furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in all
+//   copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+
 //! SQL integration tests for teide-sql.
 //!
 //! Small-data tests (26) use a ~20-row inline CSV for deterministic assertions.
@@ -546,6 +567,44 @@ fn math_expressions() {
     // Row 0: v1=1 + v2=2 = 3; v3=1.5 * 2.0 = 3.0
     assert_eq!(r.table.get_i64(0, 0).unwrap(), 3);
     assert!((r.table.get_f64(1, 0).unwrap() - 3.0).abs() < 1e-10);
+}
+
+#[test]
+fn scalar_subexpr_broadcast() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    let r = unwrap_query(
+        session
+            .execute("SELECT v1 + 2 * 1 as x, v1 + 2 as y FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    assert_eq!(r.columns.len(), 2);
+    for i in 0..r.table.nrows() as usize {
+        assert_eq!(r.table.get_i64(0, i).unwrap(), r.table.get_i64(1, i).unwrap());
+    }
+
+    let agg = unwrap_query(
+        session
+            .execute("SELECT SUM(v1 + 2 * 1) as a, SUM(v1 + 2) as b, SUM(v1 - 2 * 1) as d, SUM(v1 - 2) as e, SUM(2 * 1) as c FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(agg.table.nrows(), 1);
+    assert_eq!(agg.table.get_i64(0, 0).unwrap(), agg.table.get_i64(1, 0).unwrap());
+    assert_eq!(agg.table.get_i64(2, 0).unwrap(), agg.table.get_i64(3, 0).unwrap());
+    assert_eq!(agg.table.get_i64(4, 0).unwrap(), 40);
+
+    let linear = unwrap_query(
+        session
+            .execute("SELECT SUM((v1 + 1) * 2) as a, SUM(v1) * 2 + COUNT(*) * 2 as b, AVG(v1 + v2 + 1) as c, AVG(v1 + v2) + 1 as d FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(linear.table.nrows(), 1);
+    assert_eq!(linear.table.get_i64(0, 0).unwrap(), linear.table.get_i64(1, 0).unwrap());
+    let c = linear.table.get_f64(2, 0).unwrap();
+    let d = linear.table.get_f64(3, 0).unwrap();
+    assert!((c - d).abs() < 1e-10, "expected AVG linear forms to match: {c} vs {d}");
 }
 
 #[test]

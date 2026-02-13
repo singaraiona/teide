@@ -23,9 +23,9 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "part.h"
+#include "mem/sys.h"
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <dirent.h>
 
 /* --------------------------------------------------------------------------
@@ -77,11 +77,11 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
         if (part_count >= part_cap) {
             part_cap = part_cap == 0 ? 16 : part_cap * 2;
-            char** tmp = (char**)realloc(part_dirs, (size_t)part_cap * sizeof(char*));
+            char** tmp = (char**)td_sys_realloc(part_dirs, (size_t)part_cap * sizeof(char*));
             if (!tmp) break; /* OOM — stop collecting */
             part_dirs = tmp;
         }
-        char* dup = strdup(ent->d_name);
+        char* dup = td_sys_strdup(ent->d_name);
         if (!dup) break;
         part_dirs[part_count] = dup;
         part_count++;
@@ -89,7 +89,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     closedir(d);
 
     if (part_count == 0) {
-        free(part_dirs);
+        td_sys_free(part_dirs);
         return TD_ERR_PTR(TD_ERR_IO);
     }
 
@@ -109,25 +109,25 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[0], table_name);
     td_t* first = td_splay_load(path);
     if (!first || TD_IS_ERR(first)) {
-        for (int64_t i = 0; i < part_count; i++) free(part_dirs[i]);
-        free(part_dirs);
+        for (int64_t i = 0; i < part_count; i++) td_sys_free(part_dirs[i]);
+        td_sys_free(part_dirs);
         return first;
     }
 
     if (part_count == 1) {
-        for (int64_t i = 0; i < part_count; i++) free(part_dirs[i]);
-        free(part_dirs);
+        for (int64_t i = 0; i < part_count; i++) td_sys_free(part_dirs[i]);
+        td_sys_free(part_dirs);
         return first;
     }
 
     /* Load remaining partitions and concatenate */
     int64_t ncols = td_table_ncols(first);
     /* Accumulate rows from all partitions */
-    td_t** all_dfs = (td_t**)malloc((size_t)part_count * sizeof(td_t*));
+    td_t** all_dfs = (td_t**)td_sys_alloc((size_t)part_count * sizeof(td_t*));
     if (!all_dfs) {
         td_release(first);
-        for (int64_t i = 0; i < part_count; i++) free(part_dirs[i]);
-        free(part_dirs);
+        for (int64_t i = 0; i < part_count; i++) td_sys_free(part_dirs[i]);
+        td_sys_free(part_dirs);
         return TD_ERR_PTR(TD_ERR_OOM);
     }
     all_dfs[0] = first;
@@ -170,10 +170,10 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     for (int64_t p = 0; p < part_count; p++) {
         if (all_dfs[p] && !TD_IS_ERR(all_dfs[p]))
             td_release(all_dfs[p]);
-        free(part_dirs[p]);
+        td_sys_free(part_dirs[p]);
     }
-    free(all_dfs);
-    free(part_dirs);
+    td_sys_free(all_dfs);
+    td_sys_free(part_dirs);
 
     return result;
 }

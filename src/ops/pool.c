@@ -22,7 +22,7 @@
  */
 
 #include "pool.h"
-#include <stdlib.h>
+#include "mem/sys.h"
 #include <string.h>
 
 /* Task granularity: TD_DISPATCH_MORSELS * TD_MORSEL_ELEMS elements per task */
@@ -42,7 +42,7 @@ typedef struct {
 
 static void worker_loop(void* arg) {
     worker_ctx_t wctx = *(worker_ctx_t*)arg;
-    free(arg);
+    td_sys_free(arg);
 
     td_pool_t* pool = wctx.pool;
 
@@ -102,7 +102,7 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
     if (pool->task_cap < MAX_RING_CAP) {
         /* Will grow if needed in dispatch */
     }
-    pool->tasks = (td_pool_task_t*)calloc(pool->task_cap, sizeof(td_pool_task_t));
+    pool->tasks = (td_pool_task_t*)td_sys_alloc(pool->task_cap * sizeof(td_pool_task_t));
     if (!pool->tasks) return TD_ERR_OOM;
 
     pool->task_head = 0;
@@ -112,21 +112,21 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
 
     td_err_t err = td_sem_init(&pool->work_ready, 0);
     if (err != TD_OK) {
-        free(pool->tasks);
+        td_sys_free(pool->tasks);
         return err;
     }
 
     /* Spawn worker threads */
     if (n_workers > 0) {
-        pool->threads = (td_thread_t*)calloc(n_workers, sizeof(td_thread_t));
+        pool->threads = (td_thread_t*)td_sys_alloc(n_workers * sizeof(td_thread_t));
         if (!pool->threads) {
             td_sem_destroy(&pool->work_ready);
-            free(pool->tasks);
+            td_sys_free(pool->tasks);
             return TD_ERR_OOM;
         }
 
         for (uint32_t i = 0; i < n_workers; i++) {
-            worker_ctx_t* wctx = (worker_ctx_t*)malloc(sizeof(worker_ctx_t));
+            worker_ctx_t* wctx = (worker_ctx_t*)td_sys_alloc(sizeof(worker_ctx_t));
             if (!wctx) {
                 /* Partial cleanup: shut down already-started threads */
                 atomic_store_explicit(&pool->shutdown, 1, memory_order_release);
@@ -136,9 +136,9 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
                 for (uint32_t j = 0; j < i; j++) {
                     td_thread_join(pool->threads[j]);
                 }
-                free(pool->threads);
+                td_sys_free(pool->threads);
                 td_sem_destroy(&pool->work_ready);
-                free(pool->tasks);
+                td_sys_free(pool->tasks);
                 return TD_ERR_OOM;
             }
             wctx->pool = pool;
@@ -146,7 +146,7 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
 
             err = td_thread_create(&pool->threads[i], worker_loop, wctx);
             if (err != TD_OK) {
-                free(wctx);
+                td_sys_free(wctx);
                 atomic_store_explicit(&pool->shutdown, 1, memory_order_release);
                 for (uint32_t j = 0; j < i; j++) {
                     td_sem_signal(&pool->work_ready);
@@ -154,9 +154,9 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
                 for (uint32_t j = 0; j < i; j++) {
                     td_thread_join(pool->threads[j]);
                 }
-                free(pool->threads);
+                td_sys_free(pool->threads);
                 td_sem_destroy(&pool->work_ready);
-                free(pool->tasks);
+                td_sys_free(pool->tasks);
                 return err;
             }
         }
@@ -183,9 +183,9 @@ void td_pool_free(td_pool_t* pool) {
         td_thread_join(pool->threads[i]);
     }
 
-    free(pool->threads);
+    td_sys_free(pool->threads);
     td_sem_destroy(&pool->work_ready);
-    free(pool->tasks);
+    td_sys_free(pool->tasks);
     memset(pool, 0, sizeof(*pool));
 }
 
@@ -206,7 +206,7 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
         uint32_t new_cap = pool->task_cap;
         while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
         if (new_cap > pool->task_cap) {
-            td_pool_task_t* new_tasks = (td_pool_task_t*)realloc(
+            td_pool_task_t* new_tasks = (td_pool_task_t*)td_sys_realloc(
                 pool->tasks, new_cap * sizeof(td_pool_task_t));
             if (new_tasks) {
                 pool->tasks = new_tasks;
@@ -282,7 +282,7 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
         uint32_t new_cap = pool->task_cap;
         while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
         if (new_cap > pool->task_cap) {
-            td_pool_task_t* new_tasks = (td_pool_task_t*)realloc(
+            td_pool_task_t* new_tasks = (td_pool_task_t*)td_sys_realloc(
                 pool->tasks, new_cap * sizeof(td_pool_task_t));
             if (new_tasks) {
                 pool->tasks = new_tasks;

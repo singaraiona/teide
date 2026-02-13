@@ -38,7 +38,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <stdlib.h>
+#include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
  * Virtual memory
@@ -105,13 +105,13 @@ static void* thread_trampoline(void* raw) {
     td_thread_trampoline_t ctx = *(td_thread_trampoline_t*)raw;
     /* Free the trampoline struct allocated on the heap. We copied it first
      * so the creating thread can proceed freely.                            */
-    free(raw);
+    td_sys_free(raw);
     ctx.fn(ctx.arg);
     return NULL;
 }
 
 td_err_t td_thread_create(td_thread_t* t, td_thread_fn fn, void* arg) {
-    td_thread_trampoline_t* ctx = malloc(sizeof(*ctx));
+    td_thread_trampoline_t* ctx = (td_thread_trampoline_t*)td_sys_alloc(sizeof(*ctx));
     if (!ctx) return TD_ERR_OOM;
     ctx->fn  = fn;
     ctx->arg = arg;
@@ -119,7 +119,7 @@ td_err_t td_thread_create(td_thread_t* t, td_thread_fn fn, void* arg) {
     pthread_t pt;
     int rc = pthread_create(&pt, NULL, thread_trampoline, ctx);
     if (rc != 0) {
-        free(ctx);
+        td_sys_free(ctx);
         return TD_ERR_OOM;
     }
     *t = (td_thread_t)pt;

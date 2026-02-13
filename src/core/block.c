@@ -22,18 +22,14 @@
  */
 
 #include "block.h"
-#include <stdlib.h>
 
-/* Weak stub for td_alloc — replaced by buddy allocator in Phase 1.
- * Uses aligned_alloc to satisfy the 32-byte alignment invariant. */
+/* Weak stub for td_alloc — replaced by buddy allocator at link time.
+ * Uses td_vm_alloc (mmap) — page-aligned and zero-filled. */
 __attribute__((weak))
 td_t* td_alloc(size_t size) {
     if (size < 32) size = 32;
-    /* Round up to multiple of 32 for alignment */
-    size = (size + 31) & ~(size_t)31;
-    void* p = aligned_alloc(32, size);
-    if (!p) return NULL;
-    memset(p, 0, size);
+    size = (size + 4095) & ~(size_t)4095;
+    void* p = td_vm_alloc(size);
     return (td_t*)p;
 }
 

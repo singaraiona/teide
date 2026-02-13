@@ -22,8 +22,8 @@
  */
 
 #include "opt.h"
+#include "mem/sys.h"
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -97,7 +97,7 @@ static bool track_ext_node(td_graph_t* g, td_op_ext_t* ext) {
     if (g->ext_count >= g->ext_cap) {
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         td_op_ext_t** new_exts =
-            (td_op_ext_t**)realloc(g->ext_nodes, new_cap * sizeof(td_op_ext_t*));
+            (td_op_ext_t**)td_sys_realloc(g->ext_nodes, new_cap * sizeof(td_op_ext_t*));
         if (!new_exts) return false;
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
@@ -110,11 +110,11 @@ static td_op_ext_t* ensure_ext_node(td_graph_t* g, uint32_t node_id) {
     td_op_ext_t* ext = find_ext(g, node_id);
     if (ext) return ext;
 
-    ext = (td_op_ext_t*)calloc(1, sizeof(td_op_ext_t));
+    ext = (td_op_ext_t*)td_sys_alloc(sizeof(td_op_ext_t));
     if (!ext) return NULL;
     ext->base.id = node_id;
     if (!track_ext_node(g, ext)) {
-        free(ext);
+        td_sys_free(ext);
         return NULL;
     }
     return ext;

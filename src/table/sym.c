@@ -22,8 +22,8 @@
  */
 
 #include "sym.h"
+#include "mem/sys.h"
 #include <string.h>
-#include <stdlib.h>
 
 /* --------------------------------------------------------------------------
  * FNV-1a 32-bit hash
@@ -68,13 +68,13 @@ void td_sym_init(void) {
     if (g_sym_inited) return;
 
     g_sym.bucket_cap = SYM_INIT_CAP;
-    g_sym.buckets = (uint64_t*)calloc(g_sym.bucket_cap, sizeof(uint64_t));
+    g_sym.buckets = (uint64_t*)td_sys_alloc(g_sym.bucket_cap * sizeof(uint64_t));
     if (!g_sym.buckets) return;
 
     g_sym.str_cap = SYM_INIT_CAP;
     g_sym.str_count = 0;
-    g_sym.strings = (td_t**)calloc(g_sym.str_cap, sizeof(td_t*));
-    if (!g_sym.strings) { free(g_sym.buckets); g_sym.buckets = NULL; return; }
+    g_sym.strings = (td_t**)td_sys_alloc(g_sym.str_cap * sizeof(td_t*));
+    if (!g_sym.strings) { td_sys_free(g_sym.buckets); g_sym.buckets = NULL; return; }
 
     g_sym_inited = true;
 }
@@ -93,8 +93,8 @@ void td_sym_destroy(void) {
         }
     }
 
-    free(g_sym.strings);
-    free(g_sym.buckets);
+    td_sys_free(g_sym.strings);
+    td_sys_free(g_sym.buckets);
 
     memset(&g_sym, 0, sizeof(g_sym));
     g_sym_inited = false;
@@ -120,7 +120,7 @@ static void ht_insert(uint64_t* buckets, uint32_t cap, uint32_t hash, uint32_t i
 
 static void ht_grow(void) {
     uint32_t new_cap = g_sym.bucket_cap * 2;
-    uint64_t* new_buckets = (uint64_t*)calloc(new_cap, sizeof(uint64_t));
+    uint64_t* new_buckets = (uint64_t*)td_sys_alloc(new_cap * sizeof(uint64_t));
     if (!new_buckets) return; /* stay at current capacity */
 
     /* Re-insert all existing entries */
@@ -132,7 +132,7 @@ static void ht_grow(void) {
         ht_insert(new_buckets, new_cap, h, id);
     }
 
-    free(g_sym.buckets);
+    td_sys_free(g_sym.buckets);
     g_sym.buckets = new_buckets;
     g_sym.bucket_cap = new_cap;
 }
@@ -174,8 +174,8 @@ int64_t td_sym_intern(const char* str, size_t len) {
     /* Grow strings array if needed */
     if (new_id >= g_sym.str_cap) {
         uint32_t new_str_cap = g_sym.str_cap * 2;
-        td_t** new_strings = (td_t**)realloc(g_sym.strings,
-                                               new_str_cap * sizeof(td_t*));
+        td_t** new_strings = (td_t**)td_sys_realloc(g_sym.strings,
+                                                    new_str_cap * sizeof(td_t*));
         if (!new_strings) return -1;
         g_sym.strings = new_strings;
         g_sym.str_cap = new_str_cap;

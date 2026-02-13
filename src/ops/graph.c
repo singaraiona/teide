@@ -22,8 +22,8 @@
  */
 
 #include "graph.h"
+#include "mem/sys.h"
 #include <string.h>
-#include <stdlib.h>
 
 /* --------------------------------------------------------------------------
  * Graph allocation helpers
@@ -97,8 +97,8 @@ static td_op_t* graph_alloc_node(td_graph_t* g) {
     if (g->node_count >= g->node_cap) {
         td_op_t* old_nodes = g->nodes;
         uint32_t new_cap = g->node_cap * 2;
-        td_op_t* new_nodes = (td_op_t*)realloc(g->nodes,
-                                                 new_cap * sizeof(td_op_t));
+        td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
+                                                      new_cap * sizeof(td_op_t));
         if (!new_nodes) return NULL;
         g->nodes = new_nodes;
         g->node_cap = new_cap;
@@ -113,16 +113,16 @@ static td_op_t* graph_alloc_node(td_graph_t* g) {
 
 static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
     /* Extended nodes are 64 bytes; extra bytes appended for inline arrays */
-    td_op_ext_t* ext = (td_op_ext_t*)calloc(1, sizeof(td_op_ext_t) + extra);
+    td_op_ext_t* ext = (td_op_ext_t*)td_sys_alloc(sizeof(td_op_ext_t) + extra);
     if (!ext) return NULL;
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
         td_op_t* old_nodes = g->nodes;
         uint32_t new_cap = g->node_cap * 2;
-        td_op_t* new_nodes = (td_op_t*)realloc(g->nodes,
-                                                 new_cap * sizeof(td_op_t));
-        if (!new_nodes) { free(ext); return NULL; }
+        td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
+                                                      new_cap * sizeof(td_op_t));
+        if (!new_nodes) { td_sys_free(ext); return NULL; }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
         graph_fixup_ptrs(g, old_nodes);
@@ -134,9 +134,9 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
     /* Track ext node for cleanup */
     if (g->ext_count >= g->ext_cap) {
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
-        td_op_ext_t** new_exts = (td_op_ext_t**)realloc(g->ext_nodes,
-                                                          new_cap * sizeof(td_op_ext_t*));
-        if (!new_exts) { g->node_count--; free(ext); return NULL; }
+        td_op_ext_t** new_exts = (td_op_ext_t**)td_sys_realloc(g->ext_nodes,
+                                                               new_cap * sizeof(td_op_ext_t*));
+        if (!new_exts) { g->node_count--; td_sys_free(ext); return NULL; }
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
     }
@@ -157,11 +157,11 @@ static td_op_ext_t* graph_alloc_ext_node(td_graph_t* g) {
  * -------------------------------------------------------------------------- */
 
 td_graph_t* td_graph_new(td_t* tbl) {
-    td_graph_t* g = (td_graph_t*)calloc(1, sizeof(td_graph_t));
+    td_graph_t* g = (td_graph_t*)td_sys_alloc(sizeof(td_graph_t));
     if (!g) return NULL;
 
-    g->nodes = (td_op_t*)calloc(GRAPH_INIT_CAP, sizeof(td_op_t));
-    if (!g->nodes) { free(g); return NULL; }
+    g->nodes = (td_op_t*)td_sys_alloc(GRAPH_INIT_CAP * sizeof(td_op_t));
+    if (!g->nodes) { td_sys_free(g); return NULL; }
     g->node_cap = GRAPH_INIT_CAP;
     g->node_count = 0;
     g->table = tbl;
@@ -180,14 +180,14 @@ void td_graph_free(td_graph_t* g) {
 
     /* Free extended nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {
-        free(g->ext_nodes[i]);
+        td_sys_free(g->ext_nodes[i]);
     }
-    free(g->ext_nodes);
+    td_sys_free(g->ext_nodes);
 
-    free(g->nodes);
+    td_sys_free(g->nodes);
     if (g->table) td_release(g->table);
     if (g->filter_mask) td_release(g->filter_mask);
-    free(g);
+    td_sys_free(g);
 }
 
 /* --------------------------------------------------------------------------
@@ -491,17 +491,13 @@ td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n) {
     if (n_args > (SIZE_MAX / sizeof(uint32_t))) return NULL;
     size_t extra = (n > 2) ? (size_t)(n - 2) * sizeof(uint32_t) : 0;
 
-    /* Save IDs before alloc */
-    uint32_t* ids = (uint32_t*)malloc(n_args * sizeof(uint32_t));
-    if (!ids) return NULL;
+    /* Save IDs before alloc (n is small — bounded by function arity) */
+    uint32_t ids[n];
     for (int i = 0; i < n; i++) ids[i] = args[i]->id;
     uint32_t est = args[0]->est_rows;
 
     td_op_ext_t* ext = graph_alloc_ext_node_ex(g, extra);
-    if (!ext) {
-        free(ids);
-        return NULL;
-    }
+    if (!ext) return NULL;
 
     ext->base.opcode = OP_CONCAT;
     ext->base.arity = 2;
@@ -516,7 +512,6 @@ td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n) {
     for (int i = 2; i < n; i++) trail[i - 2] = ids[i];
 
     g->nodes[ext->base.id] = ext->base;
-    free(ids);
     return &g->nodes[ext->base.id];
 }
 

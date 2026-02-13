@@ -22,6 +22,7 @@
  */
 
 #include "arena.h"
+#include "sys.h"
 #include "core/platform.h"
 #include <string.h>
 
@@ -413,6 +414,10 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
 
 void td_mem_stats(td_mem_stats_t* out) {
     *out = td_tl_stats;
+    int64_t sc = 0, sp = 0;
+    td_sys_get_stat(&sc, &sp);
+    out->sys_current = (size_t)sc;
+    out->sys_peak    = (size_t)sp;
 }
 
 /* --------------------------------------------------------------------------

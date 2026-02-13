@@ -415,6 +415,8 @@ typedef struct {
     size_t slab_hits;        /* slab cache hits */
     size_t direct_count;     /* active direct mmaps */
     size_t direct_bytes;     /* bytes in direct mmaps */
+    size_t sys_current;      /* sys allocator: current mmap'd bytes */
+    size_t sys_peak;         /* sys allocator: peak mmap'd bytes */
 } td_mem_stats_t;
 
 /* ===== Forward Declarations (internal types) ===== */

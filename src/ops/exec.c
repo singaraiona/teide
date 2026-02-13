@@ -75,6 +75,27 @@ static inline void scratch_free(td_t* hdr) {
 }
 
 /* --------------------------------------------------------------------------
+ * Cancellation check: returns true if the current query was cancelled.
+ * Uses relaxed load — zero cost on x86 (piggybacks on existing cache line).
+ * -------------------------------------------------------------------------- */
+
+static inline bool pool_cancelled(td_pool_t* pool) {
+    return pool && TD_UNLIKELY(atomic_load_explicit(&pool->cancelled,
+                                                     memory_order_relaxed));
+}
+
+#define CHECK_CANCEL(pool)                                \
+    do { if (pool_cancelled(pool))                        \
+             return TD_ERR_PTR(TD_ERR_CANCEL); } while(0)
+
+#define CHECK_CANCEL_GOTO(pool, lbl)                      \
+    do { if (pool_cancelled(pool)) {                      \
+             result = TD_ERR_PTR(TD_ERR_CANCEL);          \
+             goto lbl;                                    \
+         }                                                \
+    } while(0)
+
+/* --------------------------------------------------------------------------
  * Helper: find the extended node for a given base node ID
  * -------------------------------------------------------------------------- */
 
@@ -2885,6 +2906,21 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
         }
     }
 
+    /* Check cancellation before expensive gather phase */
+    {
+        td_pool_t* cp = td_pool_get();
+        if (pool_cancelled(cp)) {
+            for (uint8_t k = 0; k < n_sort; k++) {
+                if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+                    td_release(sort_vecs[k]);
+                scratch_free(enum_rank_hdrs[k]);
+            }
+            scratch_free(radix_itmp_hdr);
+            scratch_free(indices_hdr);
+            return TD_ERR_PTR(TD_ERR_CANCEL);
+        }
+    }
+
     /* Materialize sorted result — fused multi-column gather.
      * When limit > 0, only gather the first `limit` rows (SORT+LIMIT fusion). */
     int64_t gather_rows = nrows;
@@ -4846,6 +4882,7 @@ ht_path:;
             .mask      = mask,
         };
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
+        CHECK_CANCEL_GOTO(pool, cleanup);
 
         /* Phase 2: parallel per-partition aggregation (no column access) */
         part_hts = (group_ht_t*)scratch_calloc(&part_hts_hdr,
@@ -4866,6 +4903,7 @@ ht_path:;
             .layout      = ght_layout,
         };
         td_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
+        CHECK_CANCEL_GOTO(pool, cleanup);
 
         /* Prefix offsets */
         uint32_t part_offsets[RADIX_P + 1];
@@ -5365,6 +5403,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     uint32_t ht_cap = (uint32_t)ht_cap64;
 
     td_t* result = NULL;
+    td_t* counts_hdr = NULL;
+    td_t* l_idx_hdr = NULL;
+    td_t* r_idx_hdr = NULL;
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     int64_t* ht_next = (int64_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(int64_t));
@@ -5388,12 +5429,12 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         else
             join_build_fn(&bctx, 0, 0, right_rows);
     }
+    CHECK_CANCEL_GOTO(pool, join_cleanup);
 
     /* Phase 2: Parallel probe (two-pass: count → prefix-sum → fill) */
     uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
     if (n_tasks == 0) n_tasks = 1;
 
-    td_t* counts_hdr;
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
     if (!morsel_counts) {
@@ -5429,8 +5470,6 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
 
     /* Allocate output pair arrays */
-    td_t* l_idx_hdr = NULL;
-    td_t* r_idx_hdr = NULL;
     int64_t* l_idx = NULL;
     int64_t* r_idx = NULL;
 
@@ -5452,6 +5491,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             for (uint32_t t = 0; t < n_tasks; t++)
                 join_fill_fn(&probe_ctx, 0, t, t + 1);
     }
+
+    CHECK_CANCEL_GOTO(pool, join_cleanup);
 
     /* Phase 3: Build result table with parallel column gather */
     int64_t left_ncols = td_table_ncols(left_table);
@@ -7043,6 +7084,25 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
         n_parts = 1;
     }
 
+    /* Check cancellation before expensive per-partition compute */
+    {
+        td_pool_t* cpool = td_pool_get();
+        if (pool_cancelled(cpool)) {
+            scratch_free(poff_hdr);
+            scratch_free(indices_hdr);
+            if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
+            for (uint8_t k = 0; k < n_sort; k++)
+                if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
+            for (uint8_t k = 0; k < n_sort; k++)
+                if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+                    td_release(sort_vecs[k]);
+            for (uint8_t f = 0; f < n_funcs; f++)
+                if (func_owned[f] && func_vecs[f] && !TD_IS_ERR(func_vecs[f]))
+                    td_release(func_vecs[f]);
+            return TD_ERR_PTR(TD_ERR_CANCEL);
+        }
+    }
+
     /* --- Phase 3: Allocate result vectors and compute per-partition --- */
     for (uint8_t f = 0; f < n_funcs; f++) {
         uint8_t kind = ext->window.func_kinds[f];
@@ -7476,7 +7536,11 @@ td_t* td_execute(td_graph_t* g, td_op_t* root) {
     if (!g || !root) return TD_ERR_PTR(TD_ERR_NYI);
 
     /* Lazy-init the global thread pool on first call */
-    td_pool_get();
+    td_pool_t* pool = td_pool_get();
+
+    /* Reset cancellation flag at the start of each query */
+    if (pool)
+        atomic_store_explicit(&pool->cancelled, 0, memory_order_relaxed);
 
     return exec_node(g, root);
 }

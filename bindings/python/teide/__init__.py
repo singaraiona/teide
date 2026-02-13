@@ -104,6 +104,9 @@ class TeideLib:
         lib.td_pool_destroy.argtypes = []
         lib.td_pool_destroy.restype = None
 
+        lib.td_cancel.argtypes = []
+        lib.td_cancel.restype = None
+
         lib.td_alloc.argtypes = [ctypes.c_size_t]
         lib.td_alloc.restype = c_td_p
 
@@ -308,6 +311,10 @@ class TeideLib:
 
     def pool_destroy(self):
         self._lib.td_pool_destroy()
+
+    def cancel(self):
+        """Cancel any currently running query. Thread-safe."""
+        self._lib.td_cancel()
 
     def retain(self, ptr):
         self._lib.td_retain(ptr)

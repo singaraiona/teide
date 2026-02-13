@@ -62,6 +62,9 @@ struct td_pool {
     /* Barrier */
     _Atomic(uint32_t)  pending;       /* decremented by each task completion */
     td_sem_t           work_ready;    /* workers sleep here */
+
+    /* Query cancellation — set by td_cancel(), checked per-morsel */
+    _Atomic(uint32_t)  cancelled;
 };
 
 /* Total workers = n_workers + 1 (main thread is worker 0) */

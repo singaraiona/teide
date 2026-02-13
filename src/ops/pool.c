@@ -63,6 +63,14 @@ static void worker_loop(void* arg) {
                                             memory_order_acquire))
                 break;
 
+            /* Skip execution if query was cancelled */
+            if (TD_UNLIKELY(atomic_load_explicit(&pool->cancelled,
+                                                  memory_order_relaxed))) {
+                atomic_fetch_sub_explicit(&pool->pending, 1,
+                                          memory_order_acq_rel);
+                continue;
+            }
+
             td_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
             t->fn(t->ctx, wctx.worker_id, t->start, t->end);
 
@@ -242,6 +250,12 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
                                                  memory_order_acq_rel);
         if (idx >= n_tasks) break;
 
+        if (TD_UNLIKELY(atomic_load_explicit(&pool->cancelled,
+                                              memory_order_relaxed))) {
+            atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            continue;
+        }
+
         td_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
         t->fn(t->ctx, 0, t->start, t->end);
 
@@ -304,6 +318,12 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
         uint32_t idx = atomic_fetch_add_explicit(&pool->task_tail, 1,
                                                  memory_order_acq_rel);
         if (idx >= n_tasks) break;
+
+        if (TD_UNLIKELY(atomic_load_explicit(&pool->cancelled,
+                                              memory_order_relaxed))) {
+            atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            continue;
+        }
 
         td_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
         t->fn(t->ctx, 0, t->start, t->end);
@@ -374,4 +394,10 @@ void td_pool_destroy(void) {
     if (state != 2) return;
     td_pool_free(&g_pool);
     atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);
+}
+
+void td_cancel(void) {
+    td_pool_t* pool = td_pool_get();
+    if (pool)
+        atomic_store_explicit(&pool->cancelled, 1, memory_order_release);
 }

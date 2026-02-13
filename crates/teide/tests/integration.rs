@@ -803,3 +803,29 @@ fn csv_explicit_date_types() {
     assert_eq!(table.get_i64(1, 2).unwrap(), 0);
     assert_eq!(table.get_i64(2, 2).unwrap(), 0);
 }
+
+#[test]
+fn cancel_resets_between_queries() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_test_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    // Set cancel before executing — the flag is reset at td_execute() entry,
+    // so the query should still succeed (the reset happens before any dispatch).
+    teide::cancel();
+
+    let g = ctx.graph(&table).unwrap();
+    let v1 = g.scan("v1").unwrap();
+    let sum = g.sum(v1);
+    let result = g.execute(sum);
+    // The query succeeds because td_execute resets the flag first.
+    assert!(result.is_ok());
+
+    // Verify next query also works after cancel was consumed
+    let g2 = ctx.graph(&table).unwrap();
+    let v1b = g2.scan("v1").unwrap();
+    let sum2 = g2.sum(v1b);
+    let result2 = g2.execute(sum2);
+    assert!(result2.is_ok());
+}

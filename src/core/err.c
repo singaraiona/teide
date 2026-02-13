@@ -35,6 +35,7 @@ static const char* err_strings[] = {
     [TD_ERR_IO]      = "I/O error",
     [TD_ERR_SCHEMA]  = "schema error",
     [TD_ERR_CORRUPT] = "corrupt data",
+    [TD_ERR_CANCEL]  = "query cancelled",
 };
 
 #define ERR_STRING_COUNT (sizeof(err_strings) / sizeof(err_strings[0]))

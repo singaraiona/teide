@@ -45,6 +45,7 @@ static MunitResult test_err_str_all(const void* params, void* fixture) {
     munit_assert_string_equal(td_err_str(TD_ERR_IO),      "I/O error");
     munit_assert_string_equal(td_err_str(TD_ERR_SCHEMA),  "schema error");
     munit_assert_string_equal(td_err_str(TD_ERR_CORRUPT), "corrupt data");
+    munit_assert_string_equal(td_err_str(TD_ERR_CANCEL),  "query cancelled");
     return MUNIT_OK;
 }
 

@@ -218,6 +218,7 @@ pub enum td_err_t {
     TD_ERR_IO = 8,
     TD_ERR_SCHEMA = 9,
     TD_ERR_CORRUPT = 10,
+    TD_ERR_CANCEL = 11,
 }
 
 /// Equivalent to C macro: `TD_ERR_PTR(e)` — cast error code to pointer.
@@ -250,6 +251,7 @@ pub fn td_err_code(p: *const td_t) -> td_err_t {
         8 => td_err_t::TD_ERR_IO,
         9 => td_err_t::TD_ERR_SCHEMA,
         10 => td_err_t::TD_ERR_CORRUPT,
+        11 => td_err_t::TD_ERR_CANCEL,
         _ => td_err_t::TD_ERR_CORRUPT,
     }
 }
@@ -793,6 +795,7 @@ extern "C" {
     // --- Pool / Parallel API ---
     pub fn td_pool_init(n_workers: u32) -> td_err_t;
     pub fn td_pool_destroy();
+    pub fn td_cancel();
 }
 
 // ===== Compile-time layout assertions =====

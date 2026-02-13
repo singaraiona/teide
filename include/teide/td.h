@@ -146,7 +146,8 @@ typedef enum {
     TD_ERR_NYI,
     TD_ERR_IO,
     TD_ERR_SCHEMA,
-    TD_ERR_CORRUPT
+    TD_ERR_CORRUPT,
+    TD_ERR_CANCEL
 } td_err_t;
 
 #define TD_ERR_PTR(e)   ((td_t*)(uintptr_t)(e))
@@ -678,6 +679,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
 
 td_err_t td_pool_init(uint32_t n_workers);
 void     td_pool_destroy(void);
+void     td_cancel(void);
 
 #ifdef __cplusplus
 }

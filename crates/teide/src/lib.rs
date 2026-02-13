@@ -58,6 +58,7 @@ pub enum Error {
     Io,
     Schema,
     Corrupt,
+    Cancel,
     InvalidInput,
     RuntimeUnavailable,
 }
@@ -75,6 +76,7 @@ impl Error {
             ffi::td_err_t::TD_ERR_IO => Error::Io,
             ffi::td_err_t::TD_ERR_SCHEMA => Error::Schema,
             ffi::td_err_t::TD_ERR_CORRUPT => Error::Corrupt,
+            ffi::td_err_t::TD_ERR_CANCEL => Error::Cancel,
             _ => Error::Corrupt,
         }
     }
@@ -93,6 +95,7 @@ impl std::fmt::Display for Error {
             Error::Io => "I/O error",
             Error::Schema => "schema error",
             Error::Corrupt => "corrupt data",
+            Error::Cancel => "query cancelled",
             Error::InvalidInput => "invalid input",
             Error::RuntimeUnavailable => "engine runtime is not available",
         };
@@ -284,6 +287,15 @@ fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
 fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
     let lock = engine_slot().lock().map_err(|_| Error::Corrupt)?;
     lock.upgrade().ok_or(Error::RuntimeUnavailable)
+}
+
+/// Cancel any currently running query.
+///
+/// Safe to call from any thread (e.g. a signal handler or a separate
+/// cancellation thread). The next morsel boundary in the executor will
+/// observe the flag and return `Error::Cancel`.
+pub fn cancel() {
+    unsafe { ffi::td_cancel(); }
 }
 
 // ---------------------------------------------------------------------------

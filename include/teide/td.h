@@ -673,7 +673,8 @@ td_t*    td_meta_load_d(const char* path);
 /* ===== CSV API ===== */
 
 td_t* td_csv_read(const char* path);
-td_t* td_csv_read_opts(const char* path, char delimiter, bool header);
+td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
+                        const int8_t* col_types, int32_t n_types);
 
 /* ===== Pool / Parallel API ===== */
 

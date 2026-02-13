@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
 
-use teide::{AggOp, Context, FrameBound, FrameType, Table, WindowFunc};
+use teide::{AggOp, Context, FrameBound, FrameType, Table, WindowFunc, types};
 
 // The C engine uses global state — serialize all tests.
 static ENGINE_LOCK: Mutex<()> = Mutex::new(());
@@ -724,4 +724,82 @@ fn window_running_sum() {
     // The maximum running sum should equal the total
     let max_sum = *sums.last().unwrap();
     assert_eq!(max_sum, 110, "total running sum should be 110, got {max_sum}");
+}
+
+// ---------------------------------------------------------------------------
+// Date / Time / Timestamp CSV parsing
+// ---------------------------------------------------------------------------
+
+fn create_datetime_csv() -> (tempfile::NamedTempFile, String) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .unwrap();
+    writeln!(f, "date,time,timestamp,value").unwrap();
+    writeln!(f, "2024-01-15,09:30:00,2024-01-15T09:30:00,100").unwrap();
+    writeln!(f, "2024-06-30,14:15:30.500000,2024-06-30 14:15:30.500000,200").unwrap();
+    writeln!(f, "1970-01-01,00:00:00,1970-01-01T00:00:00,300").unwrap();
+    writeln!(f, "2000-03-01,23:59:59,2000-03-01T23:59:59,400").unwrap();
+    f.flush().unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    (f, path)
+}
+
+#[test]
+fn csv_date_time_auto_infer() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_datetime_csv();
+    let ctx = Context::new().unwrap();
+    let table = ctx.read_csv(&path).unwrap();
+
+    assert_eq!(table.nrows(), 4);
+    assert_eq!(table.ncols(), 4);
+
+    // Auto-inferred types
+    assert_eq!(table.col_type(0), types::DATE);
+    assert_eq!(table.col_type(1), types::TIME);
+    assert_eq!(table.col_type(2), types::TIMESTAMP);
+    assert_eq!(table.col_type(3), types::I64);
+
+    // DATE: 1970-01-01 → 0 days since epoch
+    assert_eq!(table.get_i64(0, 2).unwrap(), 0);
+    // DATE: 2024-01-15 → 19737 days since epoch
+    // (53 years * 365 + 13 leap days + 14 days = 19372 + 365 = 19737)
+    let d0 = table.get_i64(0, 0).unwrap();
+    assert!(d0 > 19700 && d0 < 19800, "2024-01-15 should be ~19737 days, got {d0}");
+
+    // TIME: 00:00:00 → 0 microseconds
+    assert_eq!(table.get_i64(1, 2).unwrap(), 0);
+    // TIME: 09:30:00 → 9*3600 + 30*60 = 34200 seconds = 34200000000 µs
+    assert_eq!(table.get_i64(1, 0).unwrap(), 34200_000_000);
+    // TIME: 14:15:30.500000 → 51330.5 seconds = 51330500000 µs
+    assert_eq!(table.get_i64(1, 1).unwrap(), 51330_500_000);
+
+    // TIMESTAMP: 1970-01-01T00:00:00 → 0 µs since epoch
+    assert_eq!(table.get_i64(2, 2).unwrap(), 0);
+    // TIMESTAMP: 2024-01-15T09:30:00 → d0 * 86400000000 + 34200000000
+    let ts0 = table.get_i64(2, 0).unwrap();
+    let expected_ts = d0 * 86_400_000_000 + 34_200_000_000;
+    assert_eq!(ts0, expected_ts, "timestamp should be days*86400M + time_us");
+}
+
+#[test]
+fn csv_explicit_date_types() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_file, path) = create_datetime_csv();
+    let ctx = Context::new().unwrap();
+
+    // Force explicit types: DATE, TIME, TIMESTAMP, I64
+    let col_types = [types::DATE, types::TIME, types::TIMESTAMP, types::I64];
+    let table = ctx.read_csv_opts(&path, ',', true, Some(&col_types)).unwrap();
+
+    assert_eq!(table.col_type(0), types::DATE);
+    assert_eq!(table.col_type(1), types::TIME);
+    assert_eq!(table.col_type(2), types::TIMESTAMP);
+    assert_eq!(table.col_type(3), types::I64);
+
+    // Epoch date/time should be zero
+    assert_eq!(table.get_i64(0, 2).unwrap(), 0);
+    assert_eq!(table.get_i64(1, 2).unwrap(), 0);
+    assert_eq!(table.get_i64(2, 2).unwrap(), 0);
 }

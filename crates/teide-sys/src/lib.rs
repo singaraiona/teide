@@ -789,7 +789,8 @@ extern "C" {
 
     // --- CSV API ---
     pub fn td_csv_read(path: *const c_char) -> *mut td_t;
-    pub fn td_csv_read_opts(path: *const c_char, delimiter: c_char, header: bool) -> *mut td_t;
+    pub fn td_csv_read_opts(path: *const c_char, delimiter: c_char, header: bool,
+                                col_types: *const i8, n_types: i32) -> *mut td_t;
 
     // --- Pool / Parallel API ---
     pub fn td_pool_init(n_workers: u32) -> td_err_t;

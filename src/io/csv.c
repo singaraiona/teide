@@ -256,7 +256,10 @@ typedef enum {
     CSV_TYPE_BOOL,
     CSV_TYPE_I64,
     CSV_TYPE_F64,
-    CSV_TYPE_STR
+    CSV_TYPE_STR,
+    CSV_TYPE_DATE,
+    CSV_TYPE_TIME,
+    CSV_TYPE_TIMESTAMP
 } csv_type_t;
 
 static csv_type_t detect_type(const char* f, size_t len) {
@@ -289,16 +292,58 @@ static csv_type_t detect_type(const char* f, size_t len) {
         if (!has_dot && !has_e) return CSV_TYPE_I64;
         return CSV_TYPE_F64;
     }
+
+    /* Date: YYYY-MM-DD (exactly 10 chars) or Timestamp: YYYY-MM-DD{T| }HH:MM:SS */
+    if (len >= 10 && f[4] == '-' && f[7] == '-') {
+        bool is_date = true;
+        for (int i = 0; i < 10; i++) {
+            if (i == 4 || i == 7) continue;
+            if ((unsigned)(f[i] - '0') > 9) { is_date = false; break; }
+        }
+        if (is_date) {
+            if (len == 10) return CSV_TYPE_DATE;
+            if (len >= 19 && (f[10] == 'T' || f[10] == ' ') &&
+                f[13] == ':' && f[16] == ':') {
+                int tp[] = {11,12,14,15,17,18};
+                bool is_ts = true;
+                for (int i = 0; i < 6; i++) {
+                    if ((unsigned)(f[tp[i]] - '0') > 9) { is_ts = false; break; }
+                }
+                if (is_ts) return CSV_TYPE_TIMESTAMP;
+            }
+        }
+    }
+
+    /* Time: HH:MM:SS[.ffffff] (at least 8 chars) */
+    if (len >= 8 && f[2] == ':' && f[5] == ':') {
+        int tp[] = {0,1,3,4,6,7};
+        bool is_time = true;
+        for (int i = 0; i < 6; i++) {
+            if ((unsigned)(f[tp[i]] - '0') > 9) { is_time = false; break; }
+        }
+        if (is_time) return CSV_TYPE_TIME;
+    }
+
     return CSV_TYPE_STR;
 }
 
 static csv_type_t promote_csv_type(csv_type_t cur, csv_type_t obs) {
     if (cur == CSV_TYPE_UNKNOWN) return obs;
     if (obs == CSV_TYPE_UNKNOWN) return cur;
+    if (cur == obs) return cur;
     if (cur == CSV_TYPE_STR || obs == CSV_TYPE_STR) return CSV_TYPE_STR;
-    if (cur == CSV_TYPE_F64 || obs == CSV_TYPE_F64) return CSV_TYPE_F64;
-    if (cur == CSV_TYPE_I64 || obs == CSV_TYPE_I64) return CSV_TYPE_I64;
-    return cur;
+    /* DATE + TIMESTAMP → TIMESTAMP */
+    if ((cur == CSV_TYPE_DATE && obs == CSV_TYPE_TIMESTAMP) ||
+        (cur == CSV_TYPE_TIMESTAMP && obs == CSV_TYPE_DATE))
+        return CSV_TYPE_TIMESTAMP;
+    /* Numeric promotion: BOOL ⊂ I64 ⊂ F64 (enum values 1 < 2 < 3) */
+    if (cur <= CSV_TYPE_F64 && obs <= CSV_TYPE_F64) {
+        if (cur == CSV_TYPE_F64 || obs == CSV_TYPE_F64) return CSV_TYPE_F64;
+        if (cur == CSV_TYPE_I64 || obs == CSV_TYPE_I64) return CSV_TYPE_I64;
+        return cur;
+    }
+    /* All other mixed types (e.g. DATE+I64, TIME+BOOL) → STR */
+    return CSV_TYPE_STR;
 }
 
 /* --------------------------------------------------------------------------
@@ -481,6 +526,63 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
     }
 
     return negative ? -val : val;
+}
+
+/* --------------------------------------------------------------------------
+ * Fast inline date/time parsers
+ *
+ * DATE:      YYYY-MM-DD        → int32_t  (days since 1970-01-01)
+ * TIME:      HH:MM:SS[.ffffff] → int64_t  (microseconds since midnight)
+ * TIMESTAMP: YYYY-MM-DD{T| }HH:MM:SS[.ffffff] → int64_t (µs since epoch)
+ *
+ * Uses Howard Hinnant's civil-calendar algorithm (public domain) for the
+ * date→days conversion — O(1), no tables, no branches.
+ * -------------------------------------------------------------------------- */
+
+TD_INLINE int32_t civil_to_days(int y, int m, int d) {
+    /* Shift Jan/Feb to months 10/11 of the previous year */
+    if (m <= 2) { y--; m += 9; } else { m -= 3; }
+    int era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * m + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int32_t)(era * 146097 + doe - 719468);
+}
+
+TD_INLINE int32_t fast_date(const char* p, size_t len) {
+    if (TD_UNLIKELY(len < 10)) return 0;
+    int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
+    int m = (p[5]-'0')*10 + (p[6]-'0');
+    int d = (p[8]-'0')*10 + (p[9]-'0');
+    return civil_to_days(y, m, d);
+}
+
+TD_INLINE int64_t fast_time(const char* p, size_t len) {
+    if (TD_UNLIKELY(len < 8)) return 0;
+    int h  = (p[0]-'0')*10 + (p[1]-'0');
+    int mi = (p[3]-'0')*10 + (p[4]-'0');
+    int s  = (p[6]-'0')*10 + (p[7]-'0');
+    int64_t us = (int64_t)h * 3600000000LL + (int64_t)mi * 60000000LL +
+                 (int64_t)s * 1000000LL;
+    /* Fractional seconds → microseconds */
+    if (len > 8 && p[8] == '.') {
+        int frac = 0, digits = 0;
+        for (size_t i = 9; i < len && digits < 6; i++, digits++) {
+            unsigned di = (unsigned char)p[i] - '0';
+            if (di > 9) break;
+            frac = frac * 10 + (int)di;
+        }
+        while (digits < 6) { frac *= 10; digits++; }
+        us += frac;
+    }
+    return us;
+}
+
+TD_INLINE int64_t fast_timestamp(const char* p, size_t len) {
+    if (TD_UNLIKELY(len < 19)) return 0;
+    int32_t days = fast_date(p, 10);
+    int64_t time_us = fast_time(p + 11, len - 11);
+    return (int64_t)days * 86400000000LL + time_us;
 }
 
 /* --------------------------------------------------------------------------
@@ -673,6 +775,15 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                 case CSV_TYPE_F64:
                     ((double*)ctx->col_data[c])[row] = fast_f64(fld, flen);
                     break;
+                case CSV_TYPE_DATE:
+                    ((int32_t*)ctx->col_data[c])[row] = fast_date(fld, flen);
+                    break;
+                case CSV_TYPE_TIME:
+                    ((int64_t*)ctx->col_data[c])[row] = fast_time(fld, flen);
+                    break;
+                case CSV_TYPE_TIMESTAMP:
+                    ((int64_t*)ctx->col_data[c])[row] = fast_timestamp(fld, flen);
+                    break;
                 case CSV_TYPE_STR: {
                     uint32_t lid = local_sym_intern(&my_syms[c], fld, flen);
                     ((uint32_t*)ctx->col_data[c])[row] = PACK_SYM(worker_id, lid);
@@ -716,6 +827,15 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                 case CSV_TYPE_F64:
                     ((double*)col_data[c])[row] = fast_f64(fld, flen);
                     break;
+                case CSV_TYPE_DATE:
+                    ((int32_t*)col_data[c])[row] = fast_date(fld, flen);
+                    break;
+                case CSV_TYPE_TIME:
+                    ((int64_t*)col_data[c])[row] = fast_time(fld, flen);
+                    break;
+                case CSV_TYPE_TIMESTAMP:
+                    ((int64_t*)col_data[c])[row] = fast_timestamp(fld, flen);
+                    break;
                 case CSV_TYPE_STR: {
                     int64_t sym_id = td_sym_intern(fld, flen);
                     if (sym_id < 0) sym_id = 0;
@@ -733,7 +853,8 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
  * td_csv_read_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
-td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
+td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
+                        const int8_t* col_types_in, int32_t n_types) {
     /* ---- 1. Open file and get size ---- */
     int fd = open(path, O_RDONLY);
     if (fd < 0) return TD_ERR_PTR(TD_ERR_IO);
@@ -824,10 +945,16 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
         return tbl;
     }
 
-    /* ---- 7. Sample-based type inference ---- */
-    csv_type_t col_types[CSV_MAX_COLS];
-    memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
-    {
+    /* ---- 7. Resolve column types ---- */
+    int8_t resolved_types[CSV_MAX_COLS];
+    if (col_types_in && n_types >= ncols) {
+        /* Explicit types provided by caller */
+        for (int c = 0; c < ncols; c++)
+            resolved_types[c] = col_types_in[c];
+    } else if (!col_types_in) {
+        /* Auto-infer from sample rows */
+        csv_type_t col_types[CSV_MAX_COLS];
+        memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
         int64_t sample_n = (n_rows < CSV_SAMPLE_ROWS) ? n_rows : CSV_SAMPLE_ROWS;
         for (int64_t r = 0; r < sample_n; r++) {
             const char* rp = buf + row_offsets[r];
@@ -839,6 +966,20 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                 col_types[c] = promote_csv_type(col_types[c], t);
             }
         }
+        for (int c = 0; c < ncols; c++) {
+            switch (col_types[c]) {
+                case CSV_TYPE_BOOL:      resolved_types[c] = TD_BOOL;      break;
+                case CSV_TYPE_I64:       resolved_types[c] = TD_I64;       break;
+                case CSV_TYPE_F64:       resolved_types[c] = TD_F64;       break;
+                case CSV_TYPE_DATE:      resolved_types[c] = TD_DATE;      break;
+                case CSV_TYPE_TIME:      resolved_types[c] = TD_TIME;      break;
+                case CSV_TYPE_TIMESTAMP: resolved_types[c] = TD_TIMESTAMP; break;
+                default:                 resolved_types[c] = TD_ENUM;      break;
+            }
+        }
+    } else {
+        /* col_types_in provided but too short — error */
+        goto fail_offsets;
     }
 
     /* ---- 8. Allocate column vectors ---- */
@@ -846,14 +987,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
     void* col_data[CSV_MAX_COLS];
 
     for (int c = 0; c < ncols; c++) {
-        int8_t type;
-        switch (col_types[c]) {
-            case CSV_TYPE_BOOL: type = TD_BOOL; break;
-            case CSV_TYPE_I64:  type = TD_I64;  break;
-            case CSV_TYPE_F64:  type = TD_F64;  break;
-            case CSV_TYPE_STR:  type = TD_ENUM; break;
-            default:            type = TD_ENUM; break;
-        }
+        int8_t type = resolved_types[c];
         col_vecs[c] = td_vec_new(type, n_rows);
         if (!col_vecs[c] || TD_IS_ERR(col_vecs[c])) {
             for (int j = 0; j < c; j++) td_release(col_vecs[j]);
@@ -863,12 +997,26 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
         col_data[c] = td_data(col_vecs[c]);
     }
 
+    /* Build csv_type_t array for parse functions (maps td types → csv types) */
+    csv_type_t parse_types[CSV_MAX_COLS];
+    for (int c = 0; c < ncols; c++) {
+        switch (resolved_types[c]) {
+            case TD_BOOL:      parse_types[c] = CSV_TYPE_BOOL;      break;
+            case TD_I64:       parse_types[c] = CSV_TYPE_I64;       break;
+            case TD_F64:       parse_types[c] = CSV_TYPE_F64;       break;
+            case TD_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
+            case TD_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
+            case TD_TIMESTAMP: parse_types[c] = CSV_TYPE_TIMESTAMP; break;
+            default:           parse_types[c] = CSV_TYPE_STR;       break;
+        }
+    }
+
     /* ---- 9. Parse data ---- */
     {
         /* Check if any string columns exist */
         int has_str_cols = 0;
         for (int c = 0; c < ncols; c++) {
-            if (col_types[c] == CSV_TYPE_STR) { has_str_cols = 1; break; }
+            if (parse_types[c] == CSV_TYPE_STR) { has_str_cols = 1; break; }
         }
 
         td_pool_t* pool = td_pool_get();
@@ -898,7 +1046,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                     .row_offsets = row_offsets,
                     .n_cols      = ncols,
                     .delim       = delimiter,
-                    .col_types   = col_types,
+                    .col_types   = parse_types,
                     .col_data    = col_data,
                     .local_syms  = local_syms,
                     .n_workers   = n_workers,
@@ -909,11 +1057,11 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
                 /* Merge local sym tables into global (main thread — safe) */
                 if (has_str_cols && local_syms) {
                     merge_local_syms(local_syms, n_workers, ncols,
-                                     col_types, col_data, n_rows);
+                                     parse_types, col_data, n_rows);
 
                     for (uint32_t w = 0; w < n_workers; w++) {
                         for (int c = 0; c < ncols; c++) {
-                            if (col_types[c] == CSV_TYPE_STR)
+                            if (parse_types[c] == CSV_TYPE_STR)
                                 local_sym_free(&local_syms[(size_t)w * (size_t)ncols + (size_t)c]);
                         }
                     }
@@ -924,7 +1072,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
 
         if (!use_parallel) {
             csv_parse_serial(buf, file_size, row_offsets, n_rows,
-                             ncols, delimiter, col_types, col_data);
+                             ncols, delimiter, parse_types, col_data);
         }
     }
 
@@ -962,5 +1110,5 @@ fail_unmap:
  * -------------------------------------------------------------------------- */
 
 td_t* td_csv_read(const char* path) {
-    return td_csv_read_opts(path, 0, true);
+    return td_csv_read_opts(path, 0, true, NULL, 0);
 }

@@ -334,10 +334,19 @@ impl Context {
     }
 
     /// Read a CSV file with custom options.
-    pub fn read_csv_opts(&self, path: &str, delimiter: char, header: bool) -> Result<Table> {
+    ///
+    /// Pass `col_types: None` to auto-infer types from a sample.
+    /// Pass `col_types: Some(&[TD_I64, TD_F64, TD_ENUM, ...])` to specify exact types.
+    pub fn read_csv_opts(&self, path: &str, delimiter: char, header: bool,
+                         col_types: Option<&[i8]>) -> Result<Table> {
         let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
+        let (types_ptr, n_types) = match col_types {
+            Some(t) => (t.as_ptr(), t.len() as i32),
+            None => (std::ptr::null(), 0),
+        };
         let ptr = unsafe {
-            ffi::td_csv_read_opts(c_path.as_ptr(), delimiter as std::os::raw::c_char, header)
+            ffi::td_csv_read_opts(c_path.as_ptr(), delimiter as std::os::raw::c_char,
+                                  header, types_ptr, n_types)
         };
         let ptr = check_ptr(ptr)?;
         Ok(Table {
@@ -520,7 +529,7 @@ impl Table {
         unsafe {
             let data = ffi::td_data(vec);
             match t {
-                ffi::TD_I64 | ffi::TD_SYM => {
+                ffi::TD_I64 | ffi::TD_SYM | ffi::TD_TIME | ffi::TD_TIMESTAMP => {
                     let p = data as *const i64;
                     Some(*p.add(row))
                 }
@@ -528,7 +537,7 @@ impl Table {
                     let p = data as *const u8;
                     Some(*p.add(row) as i64)
                 }
-                ffi::TD_I32 => {
+                ffi::TD_I32 | ffi::TD_DATE => {
                     let p = data as *const i32;
                     Some(*p.add(row) as i64)
                 }
@@ -1357,6 +1366,9 @@ pub mod types {
     pub const I64: i8 = super::ffi::TD_I64;
     pub const F64: i8 = super::ffi::TD_F64;
     pub const STR: i8 = super::ffi::TD_STR;
+    pub const DATE: i8 = super::ffi::TD_DATE;
+    pub const TIME: i8 = super::ffi::TD_TIME;
+    pub const TIMESTAMP: i8 = super::ffi::TD_TIMESTAMP;
     pub const TABLE: i8 = super::ffi::TD_TABLE;
     pub const SYM: i8 = super::ffi::TD_SYM;
     pub const ENUM: i8 = super::ffi::TD_ENUM;

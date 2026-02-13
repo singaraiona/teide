@@ -278,7 +278,8 @@ class TeideLib:
         lib.td_csv_read.argtypes = [ctypes.c_char_p]
         lib.td_csv_read.restype = c_td_p
 
-        lib.td_csv_read_opts.argtypes = [ctypes.c_char_p, ctypes.c_char, ctypes.c_bool]
+        lib.td_csv_read_opts.argtypes = [ctypes.c_char_p, ctypes.c_char, ctypes.c_bool,
+                                            ctypes.POINTER(ctypes.c_int8), ctypes.c_int32]
         lib.td_csv_read_opts.restype = c_td_p
 
         # ===== Storage (splay / partitioned) =====
@@ -453,6 +454,9 @@ TD_I32 = 5
 TD_I64 = 6
 TD_F64 = 7
 TD_STR = 8
+TD_DATE = 9
+TD_TIME = 10
+TD_TIMESTAMP = 11
 TD_ENUM = 15
 TD_TABLE = 13
 

@@ -154,6 +154,7 @@ pub const OP_AVG: u16 = 55;
 pub const OP_FIRST: u16 = 56;
 pub const OP_LAST: u16 = 57;
 pub const OP_COUNT_DISTINCT: u16 = 58;
+pub const OP_STDDEV: u16 = 59;
 
 // Structural (pipeline breakers)
 pub const OP_FILTER: u16 = 60;
@@ -170,6 +171,11 @@ pub const OP_TAIL: u16 = 68;
 pub const OP_ALIAS: u16 = 70;
 pub const OP_MATERIALIZE: u16 = 71;
 pub const OP_WINDOW: u16 = 72;
+
+// Statistical aggregates
+pub const OP_STDDEV_POP: u16 = 73;
+pub const OP_VAR: u16 = 74;
+pub const OP_VAR_POP: u16 = 75;
 
 // Window function kinds
 pub const TD_WIN_ROW_NUMBER: u8 = 0;

@@ -9,7 +9,7 @@ Four crates in a Cargo workspace:
 
 ```
 teide-cli  (binary: `teide`)     Tokio REPL, readline, output formats
-teide-sql  (lib)                 sqlparser-rs → Teide DAG planner
+teide-db  (lib)                 sqlparser-rs → Teide DAG planner
 teide      (lib)                 Safe Rust wrappers: Context, Table, Graph, Column
 teide-sys  (lib, -sys crate)     Raw FFI: bindgen from td.h, static linking
 ```
@@ -62,7 +62,7 @@ let grp = g.group_by(&[id1], &[g.sum(v1)]);
 let result: Table = g.execute(grp)?;
 ```
 
-## teide-sql — SQL Planner
+## teide-db — SQL Planner
 
 Uses `sqlparser-rs` with DuckDB dialect.
 
@@ -126,7 +126,7 @@ teide/
 │   ├── teide/
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs          # Context, Table, Graph, Column
-│   ├── teide-sql/
+│   ├── teide-db/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs

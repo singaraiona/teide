@@ -1274,17 +1274,17 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
  * ============================================================================ */
 
 typedef struct {
-    double sum_f, min_f, max_f, prod_f, first_f, last_f;
-    int64_t sum_i, min_i, max_i, prod_i, first_i, last_i;
+    double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
+    int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
     int64_t cnt;
     bool has_first;
 } reduce_acc_t;
 
 static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_f = 0; acc->min_f = DBL_MAX; acc->max_f = -DBL_MAX;
-    acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0;
+    acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0; acc->sum_sq_f = 0;
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
-    acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0;
+    acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
     acc->cnt = 0; acc->has_first = false;
 }
 
@@ -1296,6 +1296,7 @@ static void reduce_range(td_t* input, int64_t start, int64_t end, reduce_acc_t* 
         if (in_type == TD_F64) {
             double v = ((double*)base)[row];
             acc->sum_f += v;
+            acc->sum_sq_f += v * v;
             acc->prod_f *= v;
             if (v < acc->min_f) acc->min_f = v;
             if (v > acc->max_f) acc->max_f = v;
@@ -1320,6 +1321,7 @@ static void reduce_range(td_t* input, int64_t start, int64_t end, reduce_acc_t* 
             else
                 v = ((int64_t*)base)[row];
             acc->sum_i += v;
+            acc->sum_sq_i += v * v;
             acc->prod_i *= v;
             if (v < acc->min_i) acc->min_i = v;
             if (v > acc->max_i) acc->max_i = v;
@@ -1344,11 +1346,13 @@ static void par_reduce_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
 static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_type) {
     if (in_type == TD_F64) {
         dst->sum_f += src->sum_f;
+        dst->sum_sq_f += src->sum_sq_f;
         dst->prod_f *= src->prod_f;
         if (src->min_f < dst->min_f) dst->min_f = src->min_f;
         if (src->max_f > dst->max_f) dst->max_f = src->max_f;
     } else {
         dst->sum_i += src->sum_i;
+        dst->sum_sq_i += src->sum_sq_i;
         dst->prod_i *= src->prod_i;
         if (src->min_i < dst->min_i) dst->min_i = src->min_i;
         if (src->max_i > dst->max_i) dst->max_i = src->max_i;
@@ -1411,6 +1415,20 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
             case OP_AVG:   result = in_type == TD_F64 ? td_f64(merged.cnt > 0 ? merged.sum_f / merged.cnt : 0.0) : td_f64(merged.cnt > 0 ? (double)merged.sum_i / merged.cnt : 0.0); break;
             case OP_FIRST: result = in_type == TD_F64 ? td_f64(merged.first_f) : td_i64(merged.first_i); break;
             case OP_LAST:  result = in_type == TD_F64 ? td_f64(merged.last_f) : td_i64(merged.last_i); break;
+            case OP_VAR: case OP_VAR_POP:
+            case OP_STDDEV: case OP_STDDEV_POP: {
+                double mean, var_pop;
+                if (in_type == TD_F64) { mean = merged.sum_f / merged.cnt; var_pop = merged.sum_sq_f / merged.cnt - mean * mean; }
+                else { mean = (double)merged.sum_i / merged.cnt; var_pop = (double)merged.sum_sq_i / merged.cnt - mean * mean; }
+                if (var_pop < 0) var_pop = 0;
+                double val;
+                if (op->opcode == OP_VAR_POP) val = merged.cnt > 0 ? var_pop : NAN;
+                else if (op->opcode == OP_VAR) val = merged.cnt > 1 ? var_pop * merged.cnt / (merged.cnt - 1) : NAN;
+                else if (op->opcode == OP_STDDEV_POP) val = merged.cnt > 0 ? sqrt(var_pop) : NAN;
+                else val = merged.cnt > 1 ? sqrt(var_pop * merged.cnt / (merged.cnt - 1)) : NAN;
+                result = td_f64(val);
+                break;
+            }
             default:       result = TD_ERR_PTR(TD_ERR_NYI); break;
         }
         scratch_free(accs_hdr);
@@ -1430,6 +1448,19 @@ static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
         case OP_AVG:   return in_type == TD_F64 ? td_f64(acc.cnt > 0 ? acc.sum_f / acc.cnt : 0.0) : td_f64(acc.cnt > 0 ? (double)acc.sum_i / acc.cnt : 0.0);
         case OP_FIRST: return in_type == TD_F64 ? td_f64(acc.first_f) : td_i64(acc.first_i);
         case OP_LAST:  return in_type == TD_F64 ? td_f64(acc.last_f) : td_i64(acc.last_i);
+        case OP_VAR: case OP_VAR_POP:
+        case OP_STDDEV: case OP_STDDEV_POP: {
+            double mean, var_pop;
+            if (in_type == TD_F64) { mean = acc.sum_f / acc.cnt; var_pop = acc.sum_sq_f / acc.cnt - mean * mean; }
+            else { mean = (double)acc.sum_i / acc.cnt; var_pop = (double)acc.sum_sq_i / acc.cnt - mean * mean; }
+            if (var_pop < 0) var_pop = 0;
+            double val;
+            if (op->opcode == OP_VAR_POP) val = acc.cnt > 0 ? var_pop : NAN;
+            else if (op->opcode == OP_VAR) val = acc.cnt > 1 ? var_pop * acc.cnt / (acc.cnt - 1) : NAN;
+            else if (op->opcode == OP_STDDEV_POP) val = acc.cnt > 0 ? sqrt(var_pop) : NAN;
+            else val = acc.cnt > 1 ? sqrt(var_pop * acc.cnt / (acc.cnt - 1)) : NAN;
+            return td_f64(val);
+        }
         default:       return TD_ERR_PTR(TD_ERR_NYI);
     }
 }
@@ -3053,9 +3084,10 @@ static uint64_t hash_row_keys(td_t** key_vecs, uint8_t n_keys, int64_t row) {
 #define HT_SALT(h) ((uint8_t)((h) >> 56))
 
 /* Flags controlling which accumulator arrays are allocated */
-#define GHT_NEED_SUM 0x01
-#define GHT_NEED_MIN 0x02
-#define GHT_NEED_MAX 0x04
+#define GHT_NEED_SUM   0x01
+#define GHT_NEED_MIN   0x02
+#define GHT_NEED_MAX   0x04
+#define GHT_NEED_SUMSQ 0x08
 
 /* ── Row-layout HT ──────────────────────────────────────────────────────
  * Keys + accumulators stored inline in both radix entries and group rows.
@@ -3077,6 +3109,7 @@ typedef struct {
     uint16_t off_sum;         /* 0 => not allocated */
     uint16_t off_min;
     uint16_t off_max;
+    uint16_t off_sumsq;       /* sum-of-squares for STDDEV/VAR */
 } ght_layout_t;
 
 static ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
@@ -3103,9 +3136,10 @@ static ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
 
     uint16_t off = (uint16_t)(8 + (uint16_t)n_keys * 8);
     uint16_t block = (uint16_t)nv * 8;
-    if (need_flags & GHT_NEED_SUM) { ly.off_sum = off; off += block; }
-    if (need_flags & GHT_NEED_MIN) { ly.off_min = off; off += block; }
-    if (need_flags & GHT_NEED_MAX) { ly.off_max = off; off += block; }
+    if (need_flags & GHT_NEED_SUM)   { ly.off_sum   = off; off += block; }
+    if (need_flags & GHT_NEED_MIN)   { ly.off_min   = off; off += block; }
+    if (need_flags & GHT_NEED_MAX)   { ly.off_max   = off; off += block; }
+    if (need_flags & GHT_NEED_SUMSQ) { ly.off_sumsq = off; off += block; }
     ly.row_stride = off;
     return ly;
 }
@@ -3225,6 +3259,18 @@ static inline void init_accum_from_entry(char* row, const char* entry,
         if (nf & GHT_NEED_SUM) memcpy(row + ly->off_sum + s * 8, agg_data + s * 8, 8);
         if (nf & GHT_NEED_MIN) memcpy(row + ly->off_min + s * 8, agg_data + s * 8, 8);
         if (nf & GHT_NEED_MAX) memcpy(row + ly->off_max + s * 8, agg_data + s * 8, 8);
+        if (nf & GHT_NEED_SUMSQ) {
+            /* sumsq = v * v for the first entry */
+            if (ly->agg_is_f64 & (1u << a)) {
+                double v; memcpy(&v, agg_data + s * 8, 8);
+                double sq = v * v;
+                memcpy(row + ly->off_sumsq + s * 8, &sq, 8);
+            } else {
+                int64_t v; memcpy(&v, agg_data + s * 8, 8);
+                double sq = (double)v * (double)v;
+                memcpy(row + ly->off_sumsq + s * 8, &sq, 8);
+            }
+        }
     }
 }
 
@@ -3247,12 +3293,14 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_SUM) { double* p = (double*)(base + ly->off_sum) + s; *p += v; }
             if (nf & GHT_NEED_MIN) { double* p = (double*)(base + ly->off_min) + s; if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { double* p = (double*)(base + ly->off_max) + s; if (v > *p) *p = v; }
+            if (nf & GHT_NEED_SUMSQ) { double* p = (double*)(base + ly->off_sumsq) + s; *p += v * v; }
         } else {
             int64_t v;
             memcpy(&v, val, 8);
             if (nf & GHT_NEED_SUM) { int64_t* p = (int64_t*)(base + ly->off_sum) + s; *p += v; }
             if (nf & GHT_NEED_MIN) { int64_t* p = (int64_t*)(base + ly->off_min) + s; if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { int64_t* p = (int64_t*)(base + ly->off_max) + s; if (v > *p) *p = v; }
+            if (nf & GHT_NEED_SUMSQ) { double* p = (double*)(base + ly->off_sumsq) + s; *p += (double)v * (double)v; }
         }
     }
 }
@@ -3601,6 +3649,20 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             v = sf ? ((const double*)(row + ly->off_max))[s]
                                    : (double)((const int64_t*)(row + ly->off_max))[s];
                             break;
+                        case OP_VAR: case OP_VAR_POP:
+                        case OP_STDDEV: case OP_STDDEV_POP: {
+                            double sum_val = sf ? ((const double*)(row + ly->off_sum))[s]
+                                                : (double)((const int64_t*)(row + ly->off_sum))[s];
+                            double sq_val = ly->off_sumsq ? ((const double*)(row + ly->off_sumsq))[s] : 0.0;
+                            double mean = cnt > 0 ? sum_val / cnt : 0.0;
+                            double var_pop = cnt > 0 ? sq_val / cnt - mean * mean : 0.0;
+                            if (var_pop < 0) var_pop = 0;
+                            if (op == OP_VAR_POP) v = cnt > 0 ? var_pop : NAN;
+                            else if (op == OP_VAR) v = cnt > 1 ? var_pop * cnt / (cnt - 1) : NAN;
+                            else if (op == OP_STDDEV_POP) v = cnt > 0 ? sqrt(var_pop) : NAN;
+                            else v = cnt > 1 ? sqrt(var_pop * cnt / (cnt - 1)) : NAN;
+                            break;
+                        }
                         default: v = 0.0; break;
                     }
                     ((double*)ao->dst)[di] = v;
@@ -3724,6 +3786,7 @@ typedef struct {
     double*  max_f64;
     int64_t* min_i64;
     int64_t* max_i64;
+    double*  sumsq_f64;
     int64_t* count;
     /* Arena headers */
     td_t* _h_f64;
@@ -3732,6 +3795,7 @@ typedef struct {
     td_t* _h_max_f64;
     td_t* _h_min_i64;
     td_t* _h_max_i64;
+    td_t* _h_sumsq_f64;
     td_t* _h_count;
 } da_accum_t;
 
@@ -3739,6 +3803,7 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_f64);    scratch_free(a->_h_i64);
     scratch_free(a->_h_min_f64); scratch_free(a->_h_max_f64);
     scratch_free(a->_h_min_i64); scratch_free(a->_h_max_i64);
+    scratch_free(a->_h_sumsq_f64);
     scratch_free(a->_h_count);
 }
 
@@ -3751,14 +3816,18 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                               double*  min_f64,  double*  max_f64,
                               int64_t* min_i64,  int64_t* max_i64,
                               int64_t* counts,
-                              const agg_affine_t* affine) {
+                              const agg_affine_t* affine,
+                              double*  sumsq_f64) {
     for (uint8_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         td_t* agg_col = agg_vecs[a];
         bool is_f64 = agg_col && agg_col->type == TD_F64;
         int8_t out_type;
         switch (agg_op) {
-            case OP_AVG:   out_type = TD_F64; break;
+            case OP_AVG:
+            case OP_STDDEV: case OP_STDDEV_POP:
+            case OP_VAR: case OP_VAR_POP:
+                out_type = TD_F64; break;
             case OP_COUNT: out_type = TD_I64; break;
             case OP_SUM: case OP_PROD:
                 out_type = is_f64 ? TD_F64 : TD_I64; break;
@@ -3787,6 +3856,20 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                     case OP_MAX: v = is_f64 ? max_f64[idx] : (double)max_i64[idx]; break;
                     case OP_FIRST: case OP_LAST:
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
+                    case OP_VAR: case OP_VAR_POP:
+                    case OP_STDDEV: case OP_STDDEV_POP: {
+                        int64_t cnt = counts[gi];
+                        double sum_val = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
+                        double sq_val = sumsq_f64 ? sumsq_f64[idx] : 0.0;
+                        double mean = cnt > 0 ? sum_val / cnt : 0.0;
+                        double var_pop = cnt > 0 ? sq_val / cnt - mean * mean : 0.0;
+                        if (var_pop < 0) var_pop = 0;
+                        if (agg_op == OP_VAR_POP) v = cnt > 0 ? var_pop : NAN;
+                        else if (agg_op == OP_VAR) v = cnt > 1 ? var_pop * cnt / (cnt - 1) : NAN;
+                        else if (agg_op == OP_STDDEV_POP) v = cnt > 0 ? sqrt(var_pop) : NAN;
+                        else v = cnt > 1 ? sqrt(var_pop * cnt / (cnt - 1)) : NAN;
+                        break;
+                    }
                     default:     v = 0.0; break;
                 }
                 ((double*)td_data(new_col))[gi] = v;
@@ -3824,6 +3907,10 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                 case OP_MAX:   sfx = "_max";   slen = 4; break;
                 case OP_FIRST: sfx = "_first"; slen = 6; break;
                 case OP_LAST:  sfx = "_last";  slen = 5; break;
+                case OP_STDDEV:     sfx = "_stddev";     slen = 7; break;
+                case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
+                case OP_VAR:        sfx = "_var";        slen = 4; break;
+                case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -3849,6 +3936,10 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
                 case OP_MAX:   nsfx = "_max";   nslen = 4; break;
                 case OP_FIRST: nsfx = "_first"; nslen = 6; break;
                 case OP_LAST:  nsfx = "_last";  nslen = 5; break;
+                case OP_STDDEV:     nsfx = "_stddev";     nslen = 7; break;
+                case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
+                case OP_VAR:        nsfx = "_var";        nslen = 4; break;
+                case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = td_sym_intern(nbuf, (size_t)np + nslen);
@@ -3863,6 +3954,7 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
 #define DA_NEED_MIN   0x02  /* min_f64 + min_i64 */
 #define DA_NEED_MAX   0x04  /* max_f64 + max_i64 */
 #define DA_NEED_COUNT 0x08  /* count array */
+#define DA_NEED_SUMSQ 0x10  /* sumsq_f64 array (for STDDEV/VAR) */
 
 typedef struct {
     da_accum_t*    accums;
@@ -4089,9 +4181,10 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
             }
             uint16_t op = c->agg_ops[a];
-            if (op == OP_SUM || op == OP_AVG) {
+            if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                 acc->f64[a] += fv;
                 acc->i64[a] += iv;
+                if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
             } else if (op == OP_FIRST) {
                 if (acc->count[0] == 1) { acc->f64[a] = fv; acc->i64[a] = iv; }
             } else if (op == OP_LAST) {
@@ -4137,9 +4230,10 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 double fv; int64_t iv;
                 da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
                 uint16_t op = c->agg_ops[a];
-                if (op == OP_SUM || op == OP_AVG) {
+                if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                     acc->f64[idx] += fv;
                     acc->i64[idx] += iv;
+                    if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
                 } else if (op == OP_FIRST) {
                     if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
                 } else if (op == OP_LAST) {
@@ -4168,9 +4262,10 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             double fv; int64_t iv;
             da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
             uint16_t op = c->agg_ops[a];
-            if (op == OP_SUM || op == OP_AVG) {
+            if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                 acc->f64[idx] += fv;
                 acc->i64[idx] += iv;
+                if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
             } else if (op == OP_FIRST) {
                 if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
             } else if (op == OP_LAST) {
@@ -4331,6 +4426,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
             uint16_t op = ext->agg_ops[a];
             if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST)
                 need_flags |= DA_NEED_SUM;
+            else if (op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP)
+                { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
             else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
             else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
         }
@@ -4388,6 +4485,11 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
                     sc_acc[w].max_i64[a] = INT64_MIN;
                 }
             }
+            if (need_flags & DA_NEED_SUMSQ) {
+                sc_acc[w].sumsq_f64 = (double*)scratch_calloc(&sc_acc[w]._h_sumsq_f64,
+                    n_aggs * sizeof(double));
+                if (!sc_acc[w].sumsq_f64) { alloc_ok = false; break; }
+            }
             sc_acc[w].count = (int64_t*)scratch_calloc(&sc_acc[w]._h_count,
                 1 * sizeof(int64_t));
             if (!sc_acc[w].count) { alloc_ok = false; break; }
@@ -4442,6 +4544,10 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
                     m->i64[a] += wa->i64[a];
                 }
             }
+            if (need_flags & DA_NEED_SUMSQ) {
+                for (uint8_t a = 0; a < n_aggs; a++)
+                    m->sumsq_f64[a] += wa->sumsq_f64[a];
+            }
             if (need_flags & DA_NEED_MIN) {
                 for (uint8_t a = 0; a < n_aggs; a++) {
                     if (wa->min_f64[a] < m->min_f64[a]) m->min_f64[a] = wa->min_f64[a];
@@ -4467,7 +4573,8 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
 
         emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
                          m->f64, m->i64, m->min_f64, m->max_f64,
-                         m->min_i64, m->max_i64, m->count, agg_affine);
+                         m->min_i64, m->max_i64, m->count, agg_affine,
+                         m->sumsq_f64);
 
         da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
         for (uint8_t a = 0; a < n_aggs; a++)
@@ -4541,6 +4648,8 @@ da_path:;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t op = ext->agg_ops[a];
                 if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST) need_flags |= DA_NEED_SUM;
+                else if (op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP)
+                    { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
                 else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
             }
@@ -4550,6 +4659,7 @@ da_path:;
             if (need_flags & DA_NEED_SUM) arrays_per_agg += 2; /* f64 + i64 */
             if (need_flags & DA_NEED_MIN) arrays_per_agg += 2; /* min_f64 + min_i64 */
             if (need_flags & DA_NEED_MAX) arrays_per_agg += 2; /* max_f64 + max_i64 */
+            if (need_flags & DA_NEED_SUMSQ) arrays_per_agg += 1; /* sumsq_f64 */
             uint64_t per_worker = total_slots * (arrays_per_agg * n_aggs + 1u) * 8u;
             if (per_worker > DA_PER_WORKER_MAX)
                 da_fits = false;
@@ -4561,6 +4671,8 @@ da_path:;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t op = ext->agg_ops[a];
                 if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST) need_flags |= DA_NEED_SUM;
+                else if (op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP)
+                    { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
                 else if (op == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (op == OP_MAX) need_flags |= DA_NEED_MAX;
             }
@@ -4600,6 +4712,7 @@ da_path:;
             if (need_flags & DA_NEED_SUM) arrays_per_agg += 2;
             if (need_flags & DA_NEED_MIN) arrays_per_agg += 2;
             if (need_flags & DA_NEED_MAX) arrays_per_agg += 2;
+            if (need_flags & DA_NEED_SUMSQ) arrays_per_agg += 1;
             uint64_t per_worker_bytes = (uint64_t)n_slots * (arrays_per_agg * n_aggs + 1u) * 8u;
             if ((uint64_t)da_n_workers * per_worker_bytes > DA_MEM_BUDGET)
                 da_n_workers = 1;
@@ -4615,6 +4728,10 @@ da_path:;
                     accums[w].f64 = (double*)scratch_calloc(&accums[w]._h_f64, total * sizeof(double));
                     accums[w].i64 = (int64_t*)scratch_calloc(&accums[w]._h_i64, total * sizeof(int64_t));
                     if (!accums[w].f64 || !accums[w].i64) { alloc_ok = false; break; }
+                }
+                if (need_flags & DA_NEED_SUMSQ) {
+                    accums[w].sumsq_f64 = (double*)scratch_calloc(&accums[w]._h_sumsq_f64, total * sizeof(double));
+                    if (!accums[w].sumsq_f64) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_MIN) {
                     accums[w].min_f64 = (double*)scratch_alloc(&accums[w]._h_min_f64, total * sizeof(double));
@@ -4677,6 +4794,10 @@ da_path:;
             da_accum_t* merged = &accums[0];
             for (uint32_t w = 1; w < da_n_workers; w++) {
                 da_accum_t* wa = &accums[w];
+                if (need_flags & DA_NEED_SUMSQ) {
+                    for (size_t i = 0; i < total; i++)
+                        merged->sumsq_f64[i] += wa->sumsq_f64[i];
+                }
                 if (need_flags & DA_NEED_SUM) {
                     if (has_first_last) {
                         /* Per-slot merge: FIRST/LAST need different semantics */
@@ -4685,7 +4806,7 @@ da_path:;
                             for (uint8_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t op = ext->agg_ops[a];
-                                if (op == OP_SUM || op == OP_AVG) {
+                                if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                                     merged->f64[idx] += wa->f64[idx];
                                     merged->i64[idx] += wa->i64[idx];
                                 } else if (op == OP_FIRST) {
@@ -4734,13 +4855,14 @@ da_path:;
             for (uint32_t w = 1; w < da_n_workers; w++)
                 da_accum_free(&accums[w]);
 
-            double*  da_f64     = merged->f64;     /* may be NULL if !DA_NEED_SUM */
-            int64_t* da_i64     = merged->i64;
-            double*  da_min_f64 = merged->min_f64; /* may be NULL if !DA_NEED_MIN */
-            double*  da_max_f64 = merged->max_f64;
-            int64_t* da_min_i64 = merged->min_i64;
-            int64_t* da_max_i64 = merged->max_i64;
-            int64_t* da_count   = merged->count;
+            double*  da_f64      = merged->f64;      /* may be NULL if !DA_NEED_SUM */
+            int64_t* da_i64      = merged->i64;
+            double*  da_min_f64  = merged->min_f64;  /* may be NULL if !DA_NEED_MIN */
+            double*  da_max_f64  = merged->max_f64;
+            int64_t* da_min_i64  = merged->min_i64;
+            int64_t* da_max_i64  = merged->max_i64;
+            double*  da_sumsq    = merged->sumsq_f64; /* may be NULL if !DA_NEED_SUMSQ */
+            int64_t* da_count    = merged->count;
 
             uint32_t grp_count = 0;
             for (uint32_t s = 0; s < n_slots; s++)
@@ -4783,12 +4905,14 @@ da_path:;
             size_t dense_total = (size_t)grp_count * n_aggs;
             td_t *_h_df64 = NULL, *_h_di64 = NULL, *_h_dminf = NULL;
             td_t *_h_dmaxf = NULL, *_h_dmini = NULL, *_h_dmaxi = NULL, *_h_dcnt = NULL;
+            td_t *_h_dsq = NULL;
             double*  dense_f64     = da_f64     ? (double*)scratch_alloc(&_h_df64, dense_total * sizeof(double)) : NULL;
             int64_t* dense_i64     = da_i64     ? (int64_t*)scratch_alloc(&_h_di64, dense_total * sizeof(int64_t)) : NULL;
             double*  dense_min_f64 = da_min_f64 ? (double*)scratch_alloc(&_h_dminf, dense_total * sizeof(double)) : NULL;
             double*  dense_max_f64 = da_max_f64 ? (double*)scratch_alloc(&_h_dmaxf, dense_total * sizeof(double)) : NULL;
             int64_t* dense_min_i64 = da_min_i64 ? (int64_t*)scratch_alloc(&_h_dmini, dense_total * sizeof(int64_t)) : NULL;
             int64_t* dense_max_i64 = da_max_i64 ? (int64_t*)scratch_alloc(&_h_dmaxi, dense_total * sizeof(int64_t)) : NULL;
+            double*  dense_sumsq   = da_sumsq   ? (double*)scratch_alloc(&_h_dsq, dense_total * sizeof(double)) : NULL;
             int64_t* dense_counts  = (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t));
 
             uint32_t gi = 0;
@@ -4804,18 +4928,20 @@ da_path:;
                     if (dense_max_f64) dense_max_f64[di] = da_max_f64[si];
                     if (dense_min_i64) dense_min_i64[di] = da_min_i64[si];
                     if (dense_max_i64) dense_max_i64[di] = da_max_i64[si];
+                    if (dense_sumsq)   dense_sumsq[di]   = da_sumsq[si];
                 }
                 gi++;
             }
 
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                              dense_f64, dense_i64, dense_min_f64, dense_max_f64,
-                             dense_min_i64, dense_max_i64, dense_counts, agg_affine);
+                             dense_min_i64, dense_max_i64, dense_counts, agg_affine,
+                             dense_sumsq);
 
             scratch_free(_h_df64); scratch_free(_h_di64);
             scratch_free(_h_dminf); scratch_free(_h_dmaxf);
             scratch_free(_h_dmini); scratch_free(_h_dmaxi);
-            scratch_free(_h_dcnt);
+            scratch_free(_h_dsq); scratch_free(_h_dcnt);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
             for (uint8_t a = 0; a < n_aggs; a++)
@@ -4834,6 +4960,8 @@ ht_path:;
         uint16_t op = ext->agg_ops[a];
         if (op == OP_SUM || op == OP_AVG || op == OP_FIRST || op == OP_LAST)
             ght_need |= GHT_NEED_SUM;
+        if (op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP)
+            { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ; }
         if (op == OP_MIN) ght_need |= GHT_NEED_MIN;
         if (op == OP_MAX) ght_need |= GHT_NEED_MAX;
     }
@@ -4957,7 +5085,10 @@ ht_path:;
             bool is_f64 = agg_col && agg_col->type == TD_F64;
             int8_t out_type;
             switch (agg_op) {
-                case OP_AVG:   out_type = TD_F64; break;
+                case OP_AVG:
+                case OP_STDDEV: case OP_STDDEV_POP:
+                case OP_VAR: case OP_VAR_POP:
+                    out_type = TD_F64; break;
                 case OP_COUNT: out_type = TD_I64; break;
                 case OP_SUM: case OP_PROD:
                     out_type = is_f64 ? TD_F64 : TD_I64; break;
@@ -5022,6 +5153,10 @@ ht_path:;
                     case OP_MAX:   sfx = "_max";   slen = 4; break;
                     case OP_FIRST: sfx = "_first"; slen = 6; break;
                     case OP_LAST:  sfx = "_last";  slen = 5; break;
+                    case OP_STDDEV:     sfx = "_stddev";     slen = 7; break;
+                    case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
+                    case OP_VAR:        sfx = "_var";        slen = 4; break;
+                    case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                 }
                 char buf[256];
                 if (base && blen + slen < sizeof(buf)) {
@@ -5099,7 +5234,10 @@ sequential_fallback:;
         bool is_f64 = agg_col && agg_col->type == TD_F64;
         int8_t out_type;
         switch (agg_op) {
-            case OP_AVG:   out_type = TD_F64; break;
+            case OP_AVG:
+            case OP_STDDEV: case OP_STDDEV_POP:
+            case OP_VAR: case OP_VAR_POP:
+                out_type = TD_F64; break;
             case OP_COUNT: out_type = TD_I64; break;
             case OP_SUM: case OP_PROD:
                 out_type = is_f64 ? TD_F64 : TD_I64; break;
@@ -5135,6 +5273,20 @@ sequential_fallback:;
                         v = is_f64 ? ((const double*)(row + ly->off_max))[s]
                                    : (double)((const int64_t*)(row + ly->off_max))[s];
                         break;
+                    case OP_VAR: case OP_VAR_POP:
+                    case OP_STDDEV: case OP_STDDEV_POP: {
+                        double sum_val = is_f64 ? ((const double*)(row + ly->off_sum))[s]
+                                                : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        double sq_val = ly->off_sumsq ? ((const double*)(row + ly->off_sumsq))[s] : 0.0;
+                        double mean = cnt > 0 ? sum_val / cnt : 0.0;
+                        double var_pop = cnt > 0 ? sq_val / cnt - mean * mean : 0.0;
+                        if (var_pop < 0) var_pop = 0;
+                        if (agg_op == OP_VAR_POP) v = cnt > 0 ? var_pop : NAN;
+                        else if (agg_op == OP_VAR) v = cnt > 1 ? var_pop * cnt / (cnt - 1) : NAN;
+                        else if (agg_op == OP_STDDEV_POP) v = cnt > 0 ? sqrt(var_pop) : NAN;
+                        else v = cnt > 1 ? sqrt(var_pop * cnt / (cnt - 1)) : NAN;
+                        break;
+                    }
                     default: v = 0.0; break;
                 }
                 ((double*)td_data(new_col))[gi] = v;
@@ -5172,6 +5324,10 @@ sequential_fallback:;
                 case OP_MAX:   sfx = "_max";   slen = 4; break;
                 case OP_FIRST: sfx = "_first"; slen = 6; break;
                 case OP_LAST:  sfx = "_last";  slen = 5; break;
+                case OP_STDDEV:     sfx = "_stddev";     slen = 7; break;
+                case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
+                case OP_VAR:        sfx = "_var";        slen = 4; break;
+                case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -5197,6 +5353,10 @@ sequential_fallback:;
                 case OP_MAX:   nsfx = "_max";   nslen = 4; break;
                 case OP_FIRST: nsfx = "_first"; nslen = 6; break;
                 case OP_LAST:  nsfx = "_last";  nslen = 5; break;
+                case OP_STDDEV:     nsfx = "_stddev";     nslen = 7; break;
+                case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
+                case OP_VAR:        nsfx = "_var";        nslen = 4; break;
+                case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = td_sym_intern(nbuf, (size_t)np + nslen);
@@ -5312,6 +5472,8 @@ typedef struct {
     /* Shared output arrays (phase 2 fill) */
     int64_t*     l_idx;
     int64_t*     r_idx;
+    /* FULL OUTER: track which right rows were matched (NULL if not full) */
+    uint8_t*     matched_right;
 } join_probe_ctx_t;
 
 /* Phase 2a: count matches per morsel */
@@ -5334,7 +5496,7 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
                 matched = true;
             }
         }
-        if (!matched && c->join_type == 1) count++;
+        if (!matched && c->join_type >= 1) count++;
     }
     c->morsel_counts[tid] = count;
 }
@@ -5362,9 +5524,10 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
                 ri[off] = r;
                 off++;
                 matched = true;
+                if (c->matched_right) __atomic_store_n(&c->matched_right[r], 1, __ATOMIC_RELAXED);
             }
         }
-        if (!matched && c->join_type == 1) {
+        if (!matched && c->join_type >= 1) {
             li[off] = l;
             ri[off] = -1;
             off++;
@@ -5413,6 +5576,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* counts_hdr = NULL;
     td_t* l_idx_hdr = NULL;
     td_t* r_idx_hdr = NULL;
+    td_t* matched_right_hdr = NULL;
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     int64_t* ht_next = (int64_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(int64_t));
@@ -5449,6 +5613,14 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         return TD_ERR_PTR(TD_ERR_OOM);
     }
 
+    /* For FULL OUTER JOIN, allocate matched_right tracker */
+    uint8_t* matched_right = NULL;
+    if (join_type == 2 && right_rows > 0) {
+        matched_right = (uint8_t*)scratch_calloc(&matched_right_hdr,
+                                                  (size_t)right_rows);
+        if (!matched_right) goto join_cleanup;
+    }
+
     join_probe_ctx_t probe_ctx = {
         .ht_heads    = ht_heads,
         .ht_next     = ht_next,
@@ -5459,6 +5631,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         .join_type   = join_type,
         .left_rows   = left_rows,
         .morsel_counts = morsel_counts,
+        .matched_right = matched_right,
     };
 
     /* 2a: Count matches per morsel */
@@ -5501,6 +5674,44 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
 
     CHECK_CANCEL_GOTO(pool, join_cleanup);
 
+    /* FULL OUTER: append unmatched right rows (l_idx=-1, r_idx=r) */
+    if (join_type == 2 && matched_right) {
+        int64_t unmatched_right = 0;
+        for (int64_t r = 0; r < right_rows; r++)
+            if (!matched_right[r]) unmatched_right++;
+
+        if (unmatched_right > 0) {
+            int64_t total = pair_count + unmatched_right;
+            td_t* new_l_hdr;
+            td_t* new_r_hdr;
+            int64_t* new_l = (int64_t*)scratch_alloc(&new_l_hdr,
+                                (size_t)total * sizeof(int64_t));
+            int64_t* new_r = (int64_t*)scratch_alloc(&new_r_hdr,
+                                (size_t)total * sizeof(int64_t));
+            if (!new_l || !new_r) {
+                scratch_free(new_l_hdr); scratch_free(new_r_hdr);
+                goto join_cleanup;
+            }
+            if (pair_count > 0) {
+                memcpy(new_l, l_idx, (size_t)pair_count * sizeof(int64_t));
+                memcpy(new_r, r_idx, (size_t)pair_count * sizeof(int64_t));
+            }
+            scratch_free(l_idx_hdr);
+            scratch_free(r_idx_hdr);
+            int64_t off = pair_count;
+            for (int64_t r = 0; r < right_rows; r++) {
+                if (!matched_right[r]) {
+                    new_l[off] = -1;
+                    new_r[off] = r;
+                    off++;
+                }
+            }
+            l_idx = new_l;  r_idx = new_r;
+            l_idx_hdr = new_l_hdr;  r_idx_hdr = new_r_hdr;
+            pair_count = total;
+        }
+    }
+
     /* Phase 3: Build result table with parallel column gather */
     int64_t left_ncols = td_table_ncols(left_table);
     int64_t right_ncols = td_table_ncols(right_table);
@@ -5519,7 +5730,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         if (pair_count > 0) {
             gather_ctx_t gctx = {
                 .idx = l_idx, .src_col = col, .dst_col = new_col,
-                .esz = td_elem_size(col->type), .nullable = false,
+                .esz = td_elem_size(col->type),
+                .nullable = (join_type == 2),  /* left nullable only for FULL OUTER */
             };
             if (pool && pair_count > TD_PARALLEL_THRESHOLD)
                 td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
@@ -5552,7 +5764,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         if (pair_count > 0) {
             gather_ctx_t gctx = {
                 .idx = r_idx, .src_col = col, .dst_col = new_col,
-                .esz = td_elem_size(col->type), .nullable = (join_type == 1),
+                .esz = td_elem_size(col->type),
+                .nullable = (join_type >= 1),  /* nullable for LEFT and FULL OUTER */
             };
             if (pool && pair_count > TD_PARALLEL_THRESHOLD)
                 td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
@@ -5569,6 +5782,7 @@ join_cleanup:
     scratch_free(l_idx_hdr);
     scratch_free(r_idx_hdr);
     scratch_free(counts_hdr);
+    scratch_free(matched_right_hdr);
 
     return result;
 }
@@ -7290,7 +7504,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
 
         /* Reductions */
         case OP_SUM: case OP_PROD: case OP_MIN: case OP_MAX:
-        case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST: {
+        case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
+        case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP: {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
             td_t* result = exec_reduction(g, op, input);

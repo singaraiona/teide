@@ -729,6 +729,7 @@ fn resolve_from(
                 // We'll handle this by swapping and post-reordering
                 1
             }
+            JoinOperator::FullOuter(..) => 2,
             JoinOperator::CrossJoin => {
                 let result = exec_cross_join(ctx, &left_table, &right_table)?;
                 let merged_schema = build_schema(&result);
@@ -750,7 +751,8 @@ fn resolve_from(
         let on_expr = match &join.join_operator {
             JoinOperator::Inner(c)
             | JoinOperator::LeftOuter(c)
-            | JoinOperator::RightOuter(c) => match c {
+            | JoinOperator::RightOuter(c)
+            | JoinOperator::FullOuter(c, ..) => match c {
                 JoinConstraint::On(expr) => expr.clone(),
                 _ => {
                     return Err(SqlError::Plan(
@@ -1016,8 +1018,8 @@ fn plan_group_select(
     let mut agg_ops = Vec::new();
     let mut agg_inputs = Vec::new();
     for agg in &all_aggs {
-        let op = agg_op_from_name(&agg.func_name)?;
-        let input = plan_agg_input(&mut g, &agg.func, schema)?;
+        let base_op = agg_op_from_name(&agg.func_name)?;
+        let (op, input) = plan_agg_input(&mut g, &agg.func, base_op, schema)?;
         agg_ops.push(op);
         agg_inputs.push(input);
     }
@@ -1202,8 +1204,8 @@ fn plan_count_distinct_group(
     let mut phase1_agg_ops = Vec::new();
     let mut phase1_agg_inputs = Vec::new();
     for agg in &regular_aggs {
-        let op = agg_op_from_name(&agg.func_name)?;
-        let input = plan_agg_input(&mut g, &agg.func, schema)?;
+        let base_op = agg_op_from_name(&agg.func_name)?;
+        let (op, input) = plan_agg_input(&mut g, &agg.func, base_op, schema)?;
         phase1_agg_ops.push(op);
         phase1_agg_inputs.push(input);
     }

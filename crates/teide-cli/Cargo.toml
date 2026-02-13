@@ -10,7 +10,7 @@ name = "teide"
 path = "src/main.rs"
 
 [dependencies]
-teide-sql = { path = "../teide-sql" }
+teide-db = { path = "../teide-db" }
 teide = { path = "../teide" }
 reedline = "0.45"
 nu-ansi-term = "0.50"

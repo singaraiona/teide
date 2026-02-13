@@ -776,11 +776,11 @@ dependencies = [
  "nu-ansi-term",
  "reedline",
  "teide",
- "teide-sql",
+ "teide-db",
 ]
 
 [[package]]
-name = "teide-sql"
+name = "teide-db"
 version = "0.2.0"
 dependencies = [
  "sqlparser",

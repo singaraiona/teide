@@ -265,6 +265,7 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_FIRST        56
 #define OP_LAST         57
 #define OP_COUNT_DISTINCT 58
+#define OP_STDDEV       59
 
 /* Opcodes — Structural (pipeline breakers) */
 #define OP_FILTER       60
@@ -279,6 +280,11 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 
 /* Opcodes — Window */
 #define OP_WINDOW       72
+
+/* Opcodes — Statistical aggregates */
+#define OP_STDDEV_POP   73
+#define OP_VAR          74
+#define OP_VAR_POP      75
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -350,7 +356,7 @@ typedef struct td_op_ext {
             td_op_t**  left_keys;
             td_op_t**  right_keys;
             uint8_t    n_join_keys;
-            uint8_t    join_type;  /* 0=inner, 1=left */
+            uint8_t    join_type;  /* 0=inner, 1=left, 2=full */
         } join;
         struct {               /* OP_WINDOW: window functions */
             td_op_t**  part_keys;

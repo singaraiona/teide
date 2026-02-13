@@ -19,7 +19,7 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-// teide-sql: SQL parser and planner for the Teide columnar table engine.
+// teide-db: SQL parser and planner for the Teide columnar table engine.
 //
 // Translates SQL queries (via sqlparser with DuckDB dialect) into Teide
 // execution graphs and runs them against CSV files.

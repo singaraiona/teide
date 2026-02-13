@@ -753,7 +753,9 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
 
 /// Check if a function name is a known aggregate.
 pub fn is_aggregate_name(name: &str) -> bool {
-    matches!(name, "sum" | "avg" | "min" | "max" | "count")
+    matches!(name, "sum" | "avg" | "min" | "max" | "count"
+        | "stddev" | "stddev_samp" | "stddev_pop"
+        | "variance" | "var_samp" | "var_pop")
 }
 
 /// Check if a function is COUNT(DISTINCT ...).
@@ -1060,6 +1062,10 @@ fn predict_c_agg_name(
         "avg" => "_mean",
         "min" => "_min",
         "max" => "_max",
+        "stddev" | "stddev_samp" => "_stddev",
+        "stddev_pop" => "_stddev_pop",
+        "variance" | "var_samp" => "_var",
+        "var_pop" => "_var_pop",
         _ => return None,
     };
     if let FunctionArguments::List(args) = &func.args {
@@ -1081,11 +1087,15 @@ fn predict_c_agg_name(
 }
 
 /// Extract the column name or plan expression from an aggregate function's argument.
+/// When the function has a FILTER clause, the input is wrapped in a conditional
+/// and the AggOp may be adjusted (e.g. COUNT → SUM for filtered count).
+/// Returns (possibly-adjusted AggOp, planned input column).
 pub fn plan_agg_input(
     g: &mut Graph,
     func: &Function,
+    op: AggOp,
     schema: &HashMap<String, usize>,
-) -> Result<Column, SqlError> {
+) -> Result<(AggOp, Column), SqlError> {
     let name = func.name.to_string().to_lowercase();
 
     let args = match &func.args {
@@ -1112,10 +1122,10 @@ pub fn plan_agg_input(
         )));
     }
 
-    match &args[0] {
+    let input = match &args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
             // Plan arbitrary expression as aggregate input
-            plan_expr(g, expr, schema)
+            plan_expr(g, expr, schema)?
         }
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
             // COUNT(*) — use first column as proxy
@@ -1129,12 +1139,63 @@ pub fn plan_agg_input(
                 .min_by_key(|(_k, v)| **v)
                 .map(|(k, _)| k.clone())
                 .ok_or_else(|| SqlError::Plan("COUNT(*) on empty schema".into()))?;
-            Ok(g.scan(&first_col)?)
+            g.scan(&first_col)?
         }
-        _ => Err(SqlError::Plan(format!(
-            "Only expressions and * supported as arguments to {}()",
-            func.name
-        ))),
+        _ => {
+            return Err(SqlError::Plan(format!(
+                "Only expressions and * supported as arguments to {}()",
+                func.name
+            )));
+        }
+    };
+
+    // FILTER (WHERE cond): rewrite aggregate input so the C engine only
+    // accumulates matching rows.  The rewrite depends on the aggregate type
+    // because the C engine does NOT universally skip NaN:
+    //   SUM      → IF(cond, CAST(x, F64), 0.0)     (0 is additive identity)
+    //   MIN/MAX  → IF(cond, CAST(x, F64), NaN)      (NaN loses all comparisons)
+    //   COUNT    → SUM(IF(cond, 1.0, 0.0))           (turn count into sum-of-ones)
+    //   AVG      → not supported (would need two separate aggregates)
+    if let Some(ref filter_expr) = func.filter {
+        if op == AggOp::Avg {
+            return Err(SqlError::Plan(
+                "AVG(...) FILTER is not yet supported; use \
+                 SUM(x) FILTER(...) / COUNT(x) FILTER(...) instead"
+                    .into(),
+            ));
+        }
+
+        let pred = plan_expr(g, filter_expr, schema)?;
+
+        match op {
+            AggOp::Count => {
+                // COUNT FILTER → SUM of indicator: IF(cond, 1.0, 0.0)
+                let one = g.const_f64(1.0);
+                let zero = g.const_f64(0.0);
+                Ok((AggOp::Sum, g.if_then_else(pred, one, zero)))
+            }
+            AggOp::Sum => {
+                // Zero-fill filtered rows (0 is neutral for addition)
+                let input_f64 = g.cast(input, teide::types::F64);
+                let zero = g.const_f64(0.0);
+                Ok((op, g.if_then_else(pred, input_f64, zero)))
+            }
+            AggOp::Min | AggOp::Max => {
+                // NaN-fill filtered rows (NaN loses all < and > comparisons)
+                let input_f64 = g.cast(input, teide::types::F64);
+                let nan = g.const_f64(f64::NAN);
+                Ok((op, g.if_then_else(pred, input_f64, nan)))
+            }
+            AggOp::Avg => unreachable!(), // handled above
+            _ => {
+                return Err(SqlError::Plan(format!(
+                    "FILTER clause not supported for {}()",
+                    func.name
+                )));
+            }
+        }
+    } else {
+        Ok((op, input))
     }
 }
 
@@ -1146,6 +1207,10 @@ pub fn agg_op_from_name(name: &str) -> Result<AggOp, SqlError> {
         "min" => Ok(AggOp::Min),
         "max" => Ok(AggOp::Max),
         "count" => Ok(AggOp::Count),
+        "stddev" | "stddev_samp" => Ok(AggOp::Stddev),
+        "stddev_pop" => Ok(AggOp::StddevPop),
+        "variance" | "var_samp" => Ok(AggOp::Var),
+        "var_pop" => Ok(AggOp::VarPop),
         _ => Err(SqlError::Plan(format!(
             "Unknown aggregate function: {name}"
         ))),
@@ -1169,7 +1234,12 @@ pub fn format_agg_name(func: &Function) -> String {
         }
         _ => "*".to_string(),
     };
-    format!("{fname}({arg_str})")
+    let base = format!("{fname}({arg_str})");
+    if let Some(ref filter) = func.filter {
+        format!("{base}_filter_{filter}")
+    } else {
+        base
+    }
 }
 
 /// Get a default display name for a bare expression.

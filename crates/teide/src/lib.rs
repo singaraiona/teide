@@ -123,6 +123,10 @@ pub enum AggOp {
     First,
     Last,
     CountDistinct,
+    Stddev,
+    StddevPop,
+    Var,
+    VarPop,
 }
 
 impl AggOp {
@@ -136,6 +140,10 @@ impl AggOp {
             AggOp::First => ffi::OP_FIRST,
             AggOp::Last => ffi::OP_LAST,
             AggOp::CountDistinct => ffi::OP_COUNT_DISTINCT,
+            AggOp::Stddev => ffi::OP_STDDEV,
+            AggOp::StddevPop => ffi::OP_STDDEV_POP,
+            AggOp::Var => ffi::OP_VAR,
+            AggOp::VarPop => ffi::OP_VAR_POP,
         }
     }
 }
@@ -1261,7 +1269,7 @@ pub use ffi::td_t;
 pub use ffi::td_op_t;
 pub use ffi::td_graph_t;
 
-/// Low-level FFI access for downstream crates (e.g., teide-sql).
+/// Low-level FFI access for downstream crates (e.g., teide-db).
 pub mod raw {
     pub use super::ffi::{td_t, td_type_sizes, td_vec_new};
 

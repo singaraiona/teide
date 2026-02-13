@@ -19,7 +19,7 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! SQL integration tests for teide-sql.
+//! SQL integration tests for teide-db.
 //!
 //! Small-data tests (26) use a ~20-row inline CSV for deterministic assertions.
 //! Benchmark tests (15) use 10M-row H2OAI CSVs and are gated with `#[ignore]`.
@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
-use teide_sql::{ExecResult, Session, SqlResult};
+use teide_db::{ExecResult, Session, SqlResult};
 
 // The C engine uses global state — serialize all tests.
 static ENGINE_LOCK: Mutex<()> = Mutex::new(());
@@ -398,6 +398,35 @@ fn join_left_sql() {
             .unwrap(),
     );
     assert_eq!(r.table.nrows(), 20);
+}
+
+#[test]
+fn join_full_outer_sql() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_left_file, left_path) = create_test_csv();
+    let (_right_file, right_path) = create_join_right_csv();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(&format!("CREATE TABLE x AS SELECT * FROM '{left_path}'"))
+        .unwrap();
+    session
+        .execute(&format!("CREATE TABLE y AS SELECT * FROM '{right_path}'"))
+        .unwrap();
+
+    // Left table (csv): id001(4), id002(4), id003(4), id004(4), id005(4) = 20 rows
+    // Right table: id001, id002, id003, id006 = 4 rows
+    // FULL OUTER on id1: 12 matched + 8 unmatched left (id004,id005) + 1 unmatched right (id006) = 21
+    let r = unwrap_query(
+        session
+            .execute("SELECT * FROM x FULL OUTER JOIN y ON x.id1 = y.id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 21);
+
+    // Verify the result has columns from both sides
+    // Left table has 9 cols; right table has 2 cols (id1 = key, skipped; x1 = non-key)
+    // Total = 9 left + 1 right (x1) = 10
+    assert_eq!(r.columns.len(), 10);
 }
 
 #[test]
@@ -1392,6 +1421,97 @@ fn subquery_predicate_pushdown_sql() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Aggregate FILTER clause
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agg_filter_sum() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    // SUM(v1) FILTER (WHERE id1 = 'id001')
+    // id001 rows have v1 = 1,2,3,4 => SUM = 10
+    let r = unwrap_query(
+        session
+            .execute("SELECT SUM(v1) FILTER (WHERE id1 = 'id001') FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 1);
+    let filtered_sum = r.table.get_f64(0, 0).unwrap();
+    assert!((filtered_sum - 10.0).abs() < 1e-9, "expected 10, got {filtered_sum}");
+}
+
+#[test]
+fn agg_filter_count() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    // COUNT(v1) FILTER (WHERE id1 = 'id001') should be 4
+    // Internally rewritten to SUM(IF(cond, 1.0, 0.0)), result is f64
+    let r = unwrap_query(
+        session
+            .execute("SELECT COUNT(v1) FILTER (WHERE id1 = 'id001') FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 1);
+    let cnt = r.table.get_f64(0, 0).unwrap();
+    assert!((cnt - 4.0).abs() < 1e-9, "expected 4, got {cnt}");
+}
+
+#[test]
+fn agg_filter_with_group_by() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    // GROUP BY id2 with FILTER: SUM(v1) FILTER (WHERE id4 = 1)
+    // id2=id001 (10 rows): rows where id4=1 → v1=1,10,3 => 14
+    // id2=id002 (10 rows): rows where id4=1 → v1=4,7,6,9 => 26
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id2, SUM(v1) FILTER (WHERE id4 = 1) FROM csv GROUP BY id2 ORDER BY id2",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 2);
+    // id001 group: filtered sum of v1 where id4=1
+    let sum0 = r.table.get_f64(1, 0).unwrap();
+    let sum1 = r.table.get_f64(1, 1).unwrap();
+    // Verify both groups sum to expected totals (order may vary)
+    let pair = if sum0 < sum1 { (sum0, sum1) } else { (sum1, sum0) };
+    assert!(
+        (pair.0 - 14.0).abs() < 1e-9 && (pair.1 - 26.0).abs() < 1e-9,
+        "expected (14, 26), got ({}, {})", pair.0, pair.1
+    );
+}
+
+#[test]
+fn agg_filter_mixed_filtered_and_unfiltered() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+
+    // Mix filtered and unfiltered aggs in the same query
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT SUM(v1), SUM(v1) FILTER (WHERE id1 = 'id001') FROM csv",
+            )
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 1);
+    // Total SUM(v1) = 1+2+3+4+5+6+7+8+9+10+1+2+3+4+5+6+7+8+9+10 = 110
+    // SUM(v1) is I64 (no filter → raw column sum)
+    let total = r.table.get_i64(0, 0)
+        .map(|v| v as f64)
+        .or_else(|| r.table.get_f64(0, 0))
+        .unwrap();
+    // Filtered SUM is always F64 (because of CAST in the filter rewrite)
+    let filtered = r.table.get_f64(1, 0).unwrap();
+    assert!((total - 110.0).abs() < 1e-9, "total SUM expected 110, got {total}");
+    assert!((filtered - 10.0).abs() < 1e-9, "filtered SUM expected 10, got {filtered}");
+}
+
 #[test]
 #[ignore]
 fn bench_subquery_window_filter() {
@@ -1415,4 +1535,357 @@ fn bench_subquery_window_filter() {
     let median = times[times.len() / 2];
     let min = times[0];
     eprintln!("bench_subquery_window_filter: min={:?} median={:?}", min, median);
+}
+
+// ---------------------------------------------------------------------------
+// NULLS FIRST / NULLS LAST with radix sort (>64 rows to trigger radix path)
+// ---------------------------------------------------------------------------
+
+/// Create a CSV with 100 rows: columns "id" (i64) and "val" (f64), val = id * 1.0.
+fn create_nulls_sort_csv() -> (tempfile::NamedTempFile, String) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .unwrap();
+    writeln!(f, "id,val").unwrap();
+    for i in 1..=100 {
+        writeln!(f, "{},{}.0", i, i).unwrap();
+    }
+    f.flush().unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    (f, path)
+}
+
+#[test]
+fn nulls_first_asc_radix() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (file, path) = create_nulls_sort_csv();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(&format!("CREATE TABLE t AS SELECT * FROM '{path}'"))
+        .unwrap();
+
+    // NULLIF(val, 50.0) → NULL when val=50, else val.  ORDER BY ASC NULLS FIRST.
+    // The row with val=50 should appear first (NULL sorts first).
+    let r = unwrap_query(
+        session
+            .execute("SELECT id, val FROM t ORDER BY NULLIF(val, 50.0) ASC NULLS FIRST")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 100);
+    let val_idx = r.columns.iter().position(|c| c == "val").unwrap();
+    let first_val = r.table.get_f64(val_idx, 0).unwrap();
+    assert!(
+        (first_val - 50.0).abs() < 1e-9,
+        "ASC NULLS FIRST: expected val=50 at row 0, got {first_val}"
+    );
+    // Second row should be val=1.0 (smallest non-null)
+    let second_val = r.table.get_f64(val_idx, 1).unwrap();
+    assert!(
+        (second_val - 1.0).abs() < 1e-9,
+        "ASC NULLS FIRST: expected val=1 at row 1, got {second_val}"
+    );
+    drop(file);
+}
+
+#[test]
+fn nulls_last_asc_radix() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (file, path) = create_nulls_sort_csv();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(&format!("CREATE TABLE t AS SELECT * FROM '{path}'"))
+        .unwrap();
+
+    // ASC NULLS LAST (default behavior): NULL row should be at the end.
+    let r = unwrap_query(
+        session
+            .execute("SELECT id, val FROM t ORDER BY NULLIF(val, 50.0) ASC NULLS LAST")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 100);
+    let val_idx = r.columns.iter().position(|c| c == "val").unwrap();
+    let last_val = r.table.get_f64(val_idx, 99).unwrap();
+    assert!(
+        (last_val - 50.0).abs() < 1e-9,
+        "ASC NULLS LAST: expected val=50 at last row, got {last_val}"
+    );
+    // First row should be val=1.0
+    let first_val = r.table.get_f64(val_idx, 0).unwrap();
+    assert!(
+        (first_val - 1.0).abs() < 1e-9,
+        "ASC NULLS LAST: expected val=1 at row 0, got {first_val}"
+    );
+    drop(file);
+}
+
+#[test]
+fn nulls_first_desc_radix() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (file, path) = create_nulls_sort_csv();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(&format!("CREATE TABLE t AS SELECT * FROM '{path}'"))
+        .unwrap();
+
+    // DESC NULLS FIRST (default for DESC): NULL row should be first.
+    let r = unwrap_query(
+        session
+            .execute("SELECT id, val FROM t ORDER BY NULLIF(val, 50.0) DESC NULLS FIRST")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 100);
+    let val_idx = r.columns.iter().position(|c| c == "val").unwrap();
+    let first_val = r.table.get_f64(val_idx, 0).unwrap();
+    assert!(
+        (first_val - 50.0).abs() < 1e-9,
+        "DESC NULLS FIRST: expected val=50 at row 0, got {first_val}"
+    );
+    // Second row should be val=100.0 (largest non-null)
+    let second_val = r.table.get_f64(val_idx, 1).unwrap();
+    assert!(
+        (second_val - 100.0).abs() < 1e-9,
+        "DESC NULLS FIRST: expected val=100 at row 1, got {second_val}"
+    );
+    drop(file);
+}
+
+#[test]
+fn nulls_last_desc_radix() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (file, path) = create_nulls_sort_csv();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(&format!("CREATE TABLE t AS SELECT * FROM '{path}'"))
+        .unwrap();
+
+    // DESC NULLS LAST: NULL row should be at the end.
+    let r = unwrap_query(
+        session
+            .execute("SELECT id, val FROM t ORDER BY NULLIF(val, 50.0) DESC NULLS LAST")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 100);
+    let val_idx = r.columns.iter().position(|c| c == "val").unwrap();
+    let last_val = r.table.get_f64(val_idx, 99).unwrap();
+    assert!(
+        (last_val - 50.0).abs() < 1e-9,
+        "DESC NULLS LAST: expected val=50 at last row, got {last_val}"
+    );
+    // First row should be val=100.0 (largest non-null)
+    let first_val = r.table.get_f64(val_idx, 0).unwrap();
+    assert!(
+        (first_val - 100.0).abs() < 1e-9,
+        "DESC NULLS LAST: expected val=100 at row 0, got {first_val}"
+    );
+    drop(file);
+}
+
+// ---------------------------------------------------------------------------
+// STDDEV / VARIANCE aggregate tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn group_by_stddev() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // id001 v1 = [1,2,3,4], mean=2.5, var_pop=1.25, stddev_samp = sqrt(5/3) ~ 1.2909944
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, STDDEV(v1) as sd FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let sd_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = (5.0_f64 / 3.0).sqrt(); // sqrt(var_samp) for [1,2,3,4]
+    assert!(
+        (sd_id001 - expected).abs() < 1e-10,
+        "STDDEV(v1) for id001: expected {expected}, got {sd_id001}"
+    );
+}
+
+#[test]
+fn group_by_stddev_pop() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, STDDEV_POP(v1) as sd FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let sd_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = 1.25_f64.sqrt(); // sqrt(var_pop) for [1,2,3,4]
+    assert!(
+        (sd_id001 - expected).abs() < 1e-10,
+        "STDDEV_POP(v1) for id001: expected {expected}, got {sd_id001}"
+    );
+}
+
+#[test]
+fn group_by_variance() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // VARIANCE is an alias for VAR_SAMP
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, VARIANCE(v1) as vr FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let var_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = 5.0_f64 / 3.0; // var_samp for [1,2,3,4]
+    assert!(
+        (var_id001 - expected).abs() < 1e-10,
+        "VARIANCE(v1) for id001: expected {expected}, got {var_id001}"
+    );
+}
+
+#[test]
+fn group_by_var_pop() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, VAR_POP(v1) as vr FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let var_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = 1.25_f64; // var_pop for [1,2,3,4]
+    assert!(
+        (var_id001 - expected).abs() < 1e-10,
+        "VAR_POP(v1) for id001: expected {expected}, got {var_id001}"
+    );
+}
+
+#[test]
+fn scalar_stddev() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // Scalar aggregate (no GROUP BY): STDDEV over all 20 rows
+    // v1 = [1..10, 1..10], n=20, sum=110, mean=5.5
+    // sum_sq = 2*(1+4+9+16+25+36+49+64+81+100) = 770
+    // var_pop = 770/20 - 30.25 = 8.25
+    // var_samp = 8.25 * 20/19 = 165/19
+    let r = unwrap_query(
+        session
+            .execute("SELECT STDDEV(v1) as sd FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 1);
+    let sd = r.table.get_f64(0, 0).unwrap();
+    let expected = (165.0_f64 / 19.0).sqrt();
+    assert!(
+        (sd - expected).abs() < 1e-10,
+        "scalar STDDEV(v1): expected {expected}, got {sd}"
+    );
+}
+
+#[test]
+fn scalar_var_pop() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT VAR_POP(v1) as vr FROM csv")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 1);
+    let vr = r.table.get_f64(0, 0).unwrap();
+    let expected = 8.25_f64; // var_pop for [1..10, 1..10]
+    assert!(
+        (vr - expected).abs() < 1e-10,
+        "scalar VAR_POP(v1): expected {expected}, got {vr}"
+    );
+}
+
+#[test]
+fn stddev_with_f64_input() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // Test STDDEV on f64 column (v3) with GROUP BY
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, STDDEV_POP(v3) as sd FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    // id001 v3 = [1.5, 2.5, 3.5, 4.5], mean=3.0, var_pop = avg(sq) - mean^2
+    // sum_sq = 2.25+6.25+12.25+20.25=41.0, var_pop = 41/4 - 9 = 1.25
+    let sd_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = 1.25_f64.sqrt();
+    assert!(
+        (sd_id001 - expected).abs() < 1e-10,
+        "STDDEV_POP(v3) for id001: expected {expected}, got {sd_id001}"
+    );
+}
+
+#[test]
+fn stddev_samp_alias() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // STDDEV_SAMP should behave identically to STDDEV
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, STDDEV_SAMP(v1) as sd FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let sd_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = (5.0_f64 / 3.0).sqrt();
+    assert!(
+        (sd_id001 - expected).abs() < 1e-10,
+        "STDDEV_SAMP(v1) for id001: expected {expected}, got {sd_id001}"
+    );
+}
+
+#[test]
+fn var_samp_alias() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // VAR_SAMP should behave identically to VARIANCE
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, VAR_SAMP(v1) as vr FROM csv GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 5);
+    let var_id001 = r.table.get_f64(1, 0).unwrap();
+    let expected = 5.0_f64 / 3.0;
+    assert!(
+        (var_id001 - expected).abs() < 1e-10,
+        "VAR_SAMP(v1) for id001: expected {expected}, got {var_id001}"
+    );
+}
+
+#[test]
+fn stddev_single_element_group_returns_nan() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // STDDEV (sample) with count=1 should return NaN (NULL), not 0
+    // id3 has unique values → each group has exactly 1 row
+    let r = unwrap_query(
+        session
+            .execute("SELECT id3, STDDEV(v1) as sd FROM csv GROUP BY id3 ORDER BY id3")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    let sd = r.table.get_f64(1, 0).unwrap();
+    assert!(sd.is_nan(), "STDDEV of single-element group should be NaN, got {sd}");
+}
+
+#[test]
+fn variance_single_element_group_returns_nan() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    // VARIANCE (sample) with count=1 should return NaN (NULL), not 0
+    let r = unwrap_query(
+        session
+            .execute("SELECT id3, VARIANCE(v1) as vr FROM csv GROUP BY id3 ORDER BY id3")
+            .unwrap(),
+    );
+    assert_eq!(r.table.nrows(), 20);
+    let vr = r.table.get_f64(1, 0).unwrap();
+    assert!(vr.is_nan(), "VARIANCE of single-element group should be NaN, got {vr}");
 }

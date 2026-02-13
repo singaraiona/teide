@@ -39,10 +39,10 @@ CSV_PATH = os.path.join(os.path.dirname(__file__),
                         "G1_1e7_1e2_0_0", "G1_1e7_1e2_0_0.csv")
 
 
-def run_sort(lib, df, label, col_names, descs):
-    g = lib.graph_new(df)
+def run_sort(lib, tbl, label, col_names, descs):
+    g = lib.graph_new(tbl)
     try:
-        table_node = lib.const_table(g, df)
+        table_node = lib.const_table(g, tbl)
         keys = [lib.scan(g, c) for c in col_names]
 
         root = lib.sort_op(g, table_node, keys, descs)
@@ -59,8 +59,8 @@ def run_sort(lib, df, label, col_names, descs):
                 print(f"  {label:12s}  FAILED")
                 return
 
-            nrows = lib.df_nrows(result)
-            ncols = lib.df_ncols(result)
+            nrows = lib.table_nrows(result)
+            ncols = lib.table_ncols(result)
             lib.release(result)
 
         elapsed = sorted(times)[len(times) // 2]
@@ -80,15 +80,15 @@ def main():
 
     print(f"Loading {csv_path} ...")
     t0 = time.perf_counter()
-    df = lib.csv_read(csv_path)
+    tbl = lib.csv_read(csv_path)
     load_time = time.perf_counter() - t0
 
-    if not df or df < 32:
+    if not tbl or tbl < 32:
         print("CSV load failed!")
         sys.exit(1)
 
-    nrows = lib.df_nrows(df)
-    ncols = lib.df_ncols(df)
+    nrows = lib.table_nrows(tbl)
+    ncols = lib.table_ncols(tbl)
     print(f"Loaded: {nrows:,} rows x {ncols} cols in {load_time*1000:.0f} ms\n")
 
     print("Sort benchmarks (execution time only, excludes build/optimize):")
@@ -96,20 +96,20 @@ def main():
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
     # s1: single low-cardinality key ASC
-    run_sort(lib, df, "s1", ["id1"], [0])
+    run_sort(lib, tbl, "s1", ["id1"], [0])
     # s2: single high-cardinality key ASC
-    run_sort(lib, df, "s2", ["id3"], [0])
+    run_sort(lib, tbl, "s2", ["id3"], [0])
     # s3: integer column ASC
-    run_sort(lib, df, "s3", ["id4"], [0])
+    run_sort(lib, tbl, "s3", ["id4"], [0])
     # s4: float column DESC
-    run_sort(lib, df, "s4", ["v3"], [1])
+    run_sort(lib, tbl, "s4", ["v3"], [1])
     # s5: 2-key composite ASC
-    run_sort(lib, df, "s5", ["id1", "id2"], [0, 0])
+    run_sort(lib, tbl, "s5", ["id1", "id2"], [0, 0])
     # s6: 3-key composite ASC
-    run_sort(lib, df, "s6", ["id1", "id2", "id3"], [0, 0, 0])
+    run_sort(lib, tbl, "s6", ["id1", "id2", "id3"], [0, 0, 0])
 
     print("\nDone.")
-    lib.release(df)
+    lib.release(tbl)
 
 
 if __name__ == "__main__":

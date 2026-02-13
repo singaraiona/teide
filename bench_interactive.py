@@ -58,10 +58,10 @@ lib.sym_init()
 
 print(f"Loading {CSV_PATH} ...")
 t0 = time.perf_counter()
-df = lib.csv_read(CSV_PATH)
+tbl = lib.csv_read(CSV_PATH)
 load_ms = (time.perf_counter() - t0) * 1000
-nrows = lib.df_nrows(df)
-ncols = lib.df_ncols(df)
+nrows = lib.table_nrows(tbl)
+ncols = lib.table_ncols(tbl)
 print(f"Loaded: {nrows:,} rows x {ncols} cols in {load_ms:.0f} ms\n")
 
 # --------------------------------------------------------------------------
@@ -93,7 +93,7 @@ q1, q2, q3, q4, q5, q6, q7 = "q1", "q2", "q3", "q4", "q5", "q6", "q7"
 def run(name):
     """Run a named query once. Returns (elapsed_ms, nrows, ncols)."""
     key_names, agg_ops, agg_col_names = QUERIES[name]
-    g = lib.graph_new(df)
+    g = lib.graph_new(tbl)
     try:
         keys = [lib.scan(g, k) for k in key_names]
         agg_ins = [lib.scan(g, c) for c in agg_col_names]
@@ -110,8 +110,8 @@ def run(name):
 
         if not result or result < 32:
             return (elapsed_ms, 0, 0)
-        nr = lib.df_nrows(result)
-        nc = lib.df_ncols(result)
+        nr = lib.table_nrows(result)
+        nc = lib.table_ncols(result)
         lib.release(result)
         return (elapsed_ms, nr, nc)
     finally:

@@ -19,7 +19,7 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! teide: Safe Rust wrappers for the Teide C17 columnar dataframe engine.
+//! teide: Safe Rust wrappers for the Teide C17 columnar table engine.
 //!
 //! Provides idiomatic, safe types around the raw FFI layer.
 
@@ -680,7 +680,7 @@ impl Graph<'_> {
         })
     }
 
-    /// Create a constant DataFrame node referencing a table.
+    /// Create a constant table node referencing a table.
     pub fn const_table(&self, table: &Table) -> Column {
         Column {
             raw: unsafe { ffi::td_const_table(self.raw, table.raw) },
@@ -1090,7 +1090,7 @@ impl Graph<'_> {
         Ok(Column { raw })
     }
 
-    /// Project (select) specific columns from a DataFrame node.
+    /// Project (select) specific columns from a table node.
     pub fn project(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
         Ok(Column {
@@ -1100,7 +1100,7 @@ impl Graph<'_> {
         })
     }
 
-    /// Select specific columns from a DataFrame node (alias for project).
+    /// Select specific columns from a table node (alias for project).
     pub fn select(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
         Ok(Column {
@@ -1251,9 +1251,9 @@ pub mod raw {
 /// Returns null if not found. Caller must NOT release the result.
 ///
 /// # Safety
-/// `df` must be a valid table pointer from the current runtime.
-pub unsafe fn ffi_table_get_col(df: *mut ffi::td_t, name_id: i64) -> *mut ffi::td_t {
-    unsafe { ffi::td_table_get_col(df, name_id) }
+/// `tbl` must be a valid table pointer from the current runtime.
+pub unsafe fn ffi_table_get_col(tbl: *mut ffi::td_t, name_id: i64) -> *mut ffi::td_t {
+    unsafe { ffi::td_table_get_col(tbl, name_id) }
 }
 
 /// Low-level helper: create new table.
@@ -1267,9 +1267,9 @@ pub unsafe fn ffi_table_new(ncols: i64) -> *mut ffi::td_t {
 /// Low-level helper: add column to table.
 ///
 /// # Safety
-/// `df` and `col` must be valid pointers from the same engine runtime.
-pub unsafe fn ffi_table_add_col(df: *mut ffi::td_t, name_id: i64, col: *mut ffi::td_t) -> *mut ffi::td_t {
-    unsafe { ffi::td_table_add_col(df, name_id, col) }
+/// `tbl` and `col` must be valid pointers from the same engine runtime.
+pub unsafe fn ffi_table_add_col(tbl: *mut ffi::td_t, name_id: i64, col: *mut ffi::td_t) -> *mut ffi::td_t {
+    unsafe { ffi::td_table_add_col(tbl, name_id, col) }
 }
 
 /// Low-level helper: concatenate two vectors.

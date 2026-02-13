@@ -590,13 +590,13 @@ extern "C" {
 
     // --- Table API ---
     pub fn td_table_new(ncols: i64) -> *mut td_t;
-    pub fn td_table_add_col(df: *mut td_t, name_id: i64, col_vec: *mut td_t) -> *mut td_t;
-    pub fn td_table_get_col(df: *mut td_t, name_id: i64) -> *mut td_t;
-    pub fn td_table_get_col_idx(df: *mut td_t, idx: i64) -> *mut td_t;
-    pub fn td_table_col_name(df: *mut td_t, idx: i64) -> i64;
-    pub fn td_table_ncols(df: *mut td_t) -> i64;
-    pub fn td_table_nrows(df: *mut td_t) -> i64;
-    pub fn td_table_schema(df: *mut td_t) -> *mut td_t;
+    pub fn td_table_add_col(tbl: *mut td_t, name_id: i64, col_vec: *mut td_t) -> *mut td_t;
+    pub fn td_table_get_col(tbl: *mut td_t, name_id: i64) -> *mut td_t;
+    pub fn td_table_get_col_idx(tbl: *mut td_t, idx: i64) -> *mut td_t;
+    pub fn td_table_col_name(tbl: *mut td_t, idx: i64) -> i64;
+    pub fn td_table_ncols(tbl: *mut td_t) -> i64;
+    pub fn td_table_nrows(tbl: *mut td_t) -> i64;
+    pub fn td_table_schema(tbl: *mut td_t) -> *mut td_t;
 
     // --- Morsel Iterator API ---
     pub fn td_morsel_init(m: *mut td_morsel_t, vec: *mut td_t);
@@ -604,7 +604,7 @@ extern "C" {
     pub fn td_morsel_next(m: *mut td_morsel_t) -> bool;
 
     // --- Operation Graph API ---
-    pub fn td_graph_new(df: *mut td_t) -> *mut td_graph_t;
+    pub fn td_graph_new(tbl: *mut td_t) -> *mut td_graph_t;
     pub fn td_graph_free(g: *mut td_graph_t);
 
     // Source ops
@@ -781,7 +781,7 @@ extern "C" {
     // --- Storage API ---
     pub fn td_col_save(vec: *mut td_t, path: *const c_char) -> td_err_t;
     pub fn td_col_load(path: *const c_char) -> *mut td_t;
-    pub fn td_splay_save(df: *mut td_t, dir: *const c_char) -> td_err_t;
+    pub fn td_splay_save(tbl: *mut td_t, dir: *const c_char) -> td_err_t;
     pub fn td_splay_load(dir: *const c_char) -> *mut td_t;
     pub fn td_part_load(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
     pub fn td_meta_save_d(schema: *mut td_t, path: *const c_char) -> td_err_t;

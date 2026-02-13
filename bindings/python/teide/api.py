@@ -26,9 +26,9 @@ Usage:
     from teide.api import Context, col, lit
 
     with Context() as ctx:
-        df = ctx.read_csv("data.csv")
+        tbl = ctx.read_csv("data.csv")
         result = (
-            df.filter(col("v1") > 0)
+            tbl.filter(col("v1") > 0)
               .group_by("id1")
               .agg(col("v1").sum(), col("v3").mean())
               .sort("v1_sum", descending=True)
@@ -257,16 +257,16 @@ class Series:
 class Table:
     """Materialized table backed by a C td_t (type=TD_TABLE)."""
 
-    def __init__(self, lib, df_ptr):
+    def __init__(self, lib, tbl_ptr):
         self._lib = lib
-        self._ptr = df_ptr
+        self._ptr = tbl_ptr
 
     @property
     def columns(self):
-        ncols = self._lib.df_ncols(self._ptr)
+        ncols = self._lib.table_ncols(self._ptr)
         names = []
         for i in range(ncols):
-            name_id = self._lib.df_col_name(self._ptr, i)
+            name_id = self._lib.table_col_name(self._ptr, i)
             sym_ptr = self._lib.sym_str(name_id)
             if sym_ptr:
                 s = self._lib.str_ptr(sym_ptr)
@@ -277,10 +277,10 @@ class Table:
 
     @property
     def shape(self):
-        return (self._lib.df_nrows(self._ptr), self._lib.df_ncols(self._ptr))
+        return (self._lib.table_nrows(self._ptr), self._lib.table_ncols(self._ptr))
 
     def __len__(self):
-        return self._lib.df_nrows(self._ptr)
+        return self._lib.table_nrows(self._ptr)
 
     def __getitem__(self, name):
         """Get a Series by column name."""
@@ -294,18 +294,18 @@ class Table:
 
     def head(self, n=10):
         """Return a new Table with only the first n rows."""
-        nrows = self._lib.df_nrows(self._ptr)
+        nrows = self._lib.table_nrows(self._ptr)
         if n >= nrows:
             return self
-        ncols = self._lib.df_ncols(self._ptr)
-        new_df = self._lib.df_new(ncols)
+        ncols = self._lib.table_ncols(self._ptr)
+        new_tbl = self._lib.table_new(ncols)
         for i in range(ncols):
-            col_ptr = self._lib.df_get_col_idx(self._ptr, i)
-            name_id = self._lib.df_col_name(self._ptr, i)
+            col_ptr = self._lib.table_get_col_idx(self._ptr, i)
+            name_id = self._lib.table_col_name(self._ptr, i)
             sliced = self._lib._lib.td_vec_slice(col_ptr, 0, n)
-            new_df = self._lib._lib.td_table_add_col(new_df, name_id, sliced)
+            new_tbl = self._lib._lib.td_table_add_col(new_tbl, name_id, sliced)
             self._lib._lib.td_release(sliced)
-        return Table(self._lib, new_df)
+        return Table(self._lib, new_tbl)
 
     def to_dict(self):
         """Convert to dict of column_name -> list."""
@@ -465,9 +465,9 @@ class Table:
 class GroupBy:
     """Intermediate state from .group_by(). Call .agg() to produce a Query."""
 
-    def __init__(self, lib, df_ptr, key_cols, prior_ops):
+    def __init__(self, lib, tbl_ptr, key_cols, prior_ops):
         self._lib = lib
-        self._ptr = df_ptr
+        self._ptr = tbl_ptr
         self._key_cols = key_cols
         self._prior_ops = prior_ops
 
@@ -482,9 +482,9 @@ class GroupBy:
 class Query:
     """Lazy computation builder. Records ops, executes on .collect()."""
 
-    def __init__(self, lib, df_ptr):
+    def __init__(self, lib, tbl_ptr):
         self._lib = lib
-        self._ptr = df_ptr
+        self._ptr = tbl_ptr
         self._ops = []
 
     def filter(self, expr):
@@ -727,10 +727,10 @@ class Context:
 
     def read_csv(self, path):
         """Read a CSV file into a Table."""
-        df_ptr = self._lib.csv_read(path)
-        if not df_ptr or df_ptr < 32:
+        tbl_ptr = self._lib.csv_read(path)
+        if not tbl_ptr or tbl_ptr < 32:
             raise RuntimeError(f"Failed to read CSV: {path}")
-        return Table(self._lib, df_ptr)
+        return Table(self._lib, tbl_ptr)
 
     def splay_save(self, table, path):
         """Save a Table as a splayed directory (one file per column)."""

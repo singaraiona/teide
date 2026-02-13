@@ -72,8 +72,8 @@ def run_join(lib, left_table, right_table, label, key_names, join_type):
                 print(f"  {label:12s}  FAILED")
                 return
 
-            nrows = lib.df_nrows(result)
-            ncols = lib.df_ncols(result)
+            nrows = lib.table_nrows(result)
+            ncols = lib.table_ncols(result)
             lib.release(result)
 
         elapsed = sorted(times)[len(times) // 2]
@@ -95,12 +95,12 @@ def main():
     print(f"Loading x: {os.path.abspath(X_CSV)} ...")
     t0 = time.perf_counter()
     x = lib.csv_read(os.path.abspath(X_CSV))
-    print(f"  {lib.df_nrows(x):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms")
+    print(f"  {lib.table_nrows(x):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms")
 
     print(f"Loading y: {os.path.abspath(Y_CSV)} ...")
     t0 = time.perf_counter()
     y = lib.csv_read(os.path.abspath(Y_CSV))
-    print(f"  {lib.df_nrows(y):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms\n")
+    print(f"  {lib.table_nrows(y):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms\n")
 
     print("Join benchmarks (execution time only, excludes build/optimize):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")

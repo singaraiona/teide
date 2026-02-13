@@ -50,10 +50,10 @@ static MunitResult test_parallel_sum(const void* params, void* data) {
     int64_t expected = n * (n + 1) / 2;
 
     int64_t col_name = td_sym_intern("val", 3);
-    td_t* df = td_table_new(1);
-    df = td_table_add_col(df, col_name, vec);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, col_name, vec);
 
-    td_graph_t* g = td_graph_new(df);
+    td_graph_t* g = td_graph_new(tbl);
     td_op_t* scan = td_scan(g, "val");
     td_op_t* sum_op = td_sum(g, scan);
 
@@ -64,7 +64,7 @@ static MunitResult test_parallel_sum(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_release(vec);
     td_sym_destroy();
     td_arena_destroy_all();
@@ -94,11 +94,11 @@ static MunitResult test_parallel_add(const void* params, void* data) {
 
     int64_t name_a = td_sym_intern("a", 1);
     int64_t name_b = td_sym_intern("b", 1);
-    td_t* df = td_table_new(2);
-    df = td_table_add_col(df, name_a, a_vec);
-    df = td_table_add_col(df, name_b, b_vec);
+    td_t* tbl = td_table_new(2);
+    tbl = td_table_add_col(tbl, name_a, a_vec);
+    tbl = td_table_add_col(tbl, name_b, b_vec);
 
-    td_graph_t* g = td_graph_new(df);
+    td_graph_t* g = td_graph_new(tbl);
     td_op_t* sa = td_scan(g, "a");
     td_op_t* sb = td_scan(g, "b");
     td_op_t* add = td_add(g, sa, sb);
@@ -116,7 +116,7 @@ static MunitResult test_parallel_add(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_release(a_vec);
     td_release(b_vec);
     td_sym_destroy();
@@ -159,11 +159,11 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
 
     int64_t name_id = td_sym_intern("id", 2);
     int64_t name_v  = td_sym_intern("v", 1);
-    td_t* df = td_table_new(2);
-    df = td_table_add_col(df, name_id, id_vec);
-    df = td_table_add_col(df, name_v, v_vec);
+    td_t* tbl = td_table_new(2);
+    tbl = td_table_add_col(tbl, name_id, id_vec);
+    tbl = td_table_add_col(tbl, name_v, v_vec);
 
-    td_graph_t* g = td_graph_new(df);
+    td_graph_t* g = td_graph_new(tbl);
 
     /* Build group-by using the same API as test_graph.c */
     td_op_t* key = td_scan(g, "id");
@@ -203,7 +203,7 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
 
     td_release(result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_release(id_vec);
     td_release(v_vec);
     td_sym_destroy();
@@ -230,11 +230,11 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
     /* Range: -50000.0 to 49999.0 */
 
     int64_t col_name = td_sym_intern("x", 1);
-    td_t* df = td_table_new(1);
-    df = td_table_add_col(df, col_name, vec);
+    td_t* tbl = td_table_new(1);
+    tbl = td_table_add_col(tbl, col_name, vec);
 
     /* Test min */
-    td_graph_t* g = td_graph_new(df);
+    td_graph_t* g = td_graph_new(tbl);
     td_op_t* scan = td_scan(g, "x");
     td_op_t* min_op = td_min_op(g, scan);
 
@@ -247,7 +247,7 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
     td_graph_free(g);
 
     /* Test max (new graph, since execute consumes the graph) */
-    g = td_graph_new(df);
+    g = td_graph_new(tbl);
     scan = td_scan(g, "x");
     td_op_t* max_op = td_max_op(g, scan);
 
@@ -258,7 +258,7 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
 
     td_release(max_result);
     td_graph_free(g);
-    td_release(df);
+    td_release(tbl);
     td_release(vec);
     td_sym_destroy();
     td_arena_destroy_all();

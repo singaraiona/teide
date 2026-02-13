@@ -20,14 +20,14 @@
 #   SOFTWARE.
 
 """
-Teide — Fast columnar dataframe library for Python.
+Teide — Fast columnar table engine for Python.
 
 Usage:
     from teide import Context, col, lit
 
     with Context() as ctx:
-        df = ctx.read_csv("data.csv")
-        result = df.group_by("id1").agg(col("v1").sum()).collect()
+        tbl = ctx.read_csv("data.csv")
+        result = tbl.group_by("id1").agg(col("v1").sum()).collect()
         print(result)
 """
 
@@ -317,8 +317,8 @@ class TeideLib:
     def csv_read(self, path):
         return self._lib.td_csv_read(path.encode('utf-8'))
 
-    def graph_new(self, df):
-        return self._lib.td_graph_new(df)
+    def graph_new(self, tbl):
+        return self._lib.td_graph_new(tbl)
 
     def graph_free(self, g):
         self._lib.td_graph_free(g)
@@ -335,8 +335,8 @@ class TeideLib:
     def const_vec(self, g, vec):
         return self._lib.td_const_vec(g, vec)
 
-    def const_table(self, g, df):
-        return self._lib.td_const_table(g, df)
+    def const_table(self, g, tbl):
+        return self._lib.td_const_table(g, tbl)
 
     def add(self, g, a, b):  return self._lib.td_add(g, a, b)
     def sub(self, g, a, b):  return self._lib.td_sub(g, a, b)
@@ -393,17 +393,17 @@ class TeideLib:
     def execute(self, g, root):
         return self._lib.td_execute(g, root)
 
-    def df_ncols(self, df):
-        return self._lib.td_table_ncols(df)
+    def table_ncols(self, tbl):
+        return self._lib.td_table_ncols(tbl)
 
-    def df_nrows(self, df):
-        return self._lib.td_table_nrows(df)
+    def table_nrows(self, tbl):
+        return self._lib.td_table_nrows(tbl)
 
-    def df_get_col_idx(self, df, idx):
-        return self._lib.td_table_get_col_idx(df, idx)
+    def table_get_col_idx(self, tbl, idx):
+        return self._lib.td_table_get_col_idx(tbl, idx)
 
-    def df_col_name(self, df, idx):
-        return self._lib.td_table_col_name(df, idx)
+    def table_col_name(self, tbl, idx):
+        return self._lib.td_table_col_name(tbl, idx)
 
     def sym_str(self, sym_id):
         return self._lib.td_sym_str(sym_id)
@@ -426,14 +426,14 @@ class TeideLib:
         arr = (ctypes.c_double * len(data))(*data)
         return self._lib.td_vec_from_raw(7, arr, len(data))  # TD_F64 = 7
 
-    def df_new(self, ncols):
+    def table_new(self, ncols):
         return self._lib.td_table_new(ncols)
 
-    def df_add_col(self, df, name_id, col):
-        return self._lib.td_table_add_col(df, name_id, col)
+    def table_add_col(self, tbl, name_id, col):
+        return self._lib.td_table_add_col(tbl, name_id, col)
 
-    def splay_save(self, df, path):
-        return self._lib.td_splay_save(df, path.encode('utf-8'))
+    def splay_save(self, tbl, path):
+        return self._lib.td_splay_save(tbl, path.encode('utf-8'))
 
     def splay_load(self, path):
         return self._lib.td_splay_load(path.encode('utf-8'))

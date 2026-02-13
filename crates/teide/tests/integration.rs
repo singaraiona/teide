@@ -140,11 +140,11 @@ fn scan_and_filter() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let v1 = g.scan("v1").unwrap();
     let three = g.const_i64(3);
     let pred = g.gt(v1, three);
-    let filtered = g.filter(df, pred);
+    let filtered = g.filter(tbl, pred);
     let result = g.execute(filtered).unwrap();
 
     // v1 values > 3: 4,5,6,7,8,9,10 appear twice each = 14 rows
@@ -160,13 +160,13 @@ fn arithmetic() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let v1 = g.scan("v1").unwrap();
     let v2 = g.scan("v2").unwrap();
     let sum_col = g.add(v1, v2);
     let aliased = g.alias(sum_col, "v1_plus_v2").unwrap();
-    let result_df = g.select(df, &[aliased]).unwrap();
-    let result = g.execute(result_df).unwrap();
+    let result_tbl = g.select(tbl, &[aliased]).unwrap();
+    let result = g.execute(result_tbl).unwrap();
 
     assert_eq!(result.nrows(), 20);
     assert_eq!(result.ncols(), 1);
@@ -280,9 +280,9 @@ fn sort_single_asc() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let id4 = g.scan("id4").unwrap();
-    let sorted = g.sort(df, &[id4], &[false], None).unwrap();
+    let sorted = g.sort(tbl, &[id4], &[false], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -303,9 +303,9 @@ fn sort_single_desc() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let v3 = g.scan("v3").unwrap();
-    let sorted = g.sort(df, &[v3], &[true], None).unwrap();
+    let sorted = g.sort(tbl, &[v3], &[true], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -326,10 +326,10 @@ fn sort_multi_key() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let id1 = g.scan("id1").unwrap();
     let id4 = g.scan("id4").unwrap();
-    let sorted = g.sort(df, &[id1, id4], &[false, false], None).unwrap();
+    let sorted = g.sort(tbl, &[id1, id4], &[false, false], None).unwrap();
     let result = g.execute(sorted).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -357,9 +357,9 @@ fn sort_with_limit() {
     let table = ctx.read_csv(&path).unwrap();
     let mut g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let id4 = g.scan("id4").unwrap();
-    let sorted = g.sort(df, &[id4], &[false], None).unwrap();
+    let sorted = g.sort(tbl, &[id4], &[false], None).unwrap();
     let limited = g.head(sorted, 3);
     let result = g.execute(limited).unwrap();
 
@@ -430,8 +430,8 @@ fn head_tail() {
     let g = ctx.graph(&table).unwrap();
 
     // head(5)
-    let df = g.const_table(&table);
-    let h = g.head(df, 5);
+    let tbl = g.const_table(&table);
+    let h = g.head(tbl, 5);
     let result = g.execute(h).unwrap();
     assert_eq!(result.nrows(), 5);
     assert_eq!(result.ncols(), 9);
@@ -457,10 +457,10 @@ fn project() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let id1 = g.scan("id1").unwrap();
     let v1 = g.scan("v1").unwrap();
-    let projected = g.select(df, &[id1, v1]).unwrap();
+    let projected = g.select(tbl, &[id1, v1]).unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -477,10 +477,10 @@ fn alias_column() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let v1 = g.scan("v1").unwrap();
     let aliased = g.alias(v1, "my_v1").unwrap();
-    let projected = g.select(df, &[aliased]).unwrap();
+    let projected = g.select(tbl, &[aliased]).unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.ncols(), 1);
@@ -497,7 +497,7 @@ fn string_ops() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let id1 = g.scan("id1").unwrap();
     let upper_col = g.upper(id1);
     let upper_aliased = g.alias(upper_col, "upper_id1").unwrap();
@@ -510,7 +510,7 @@ fn string_ops() {
     let lower_col = g.lower(id1c);
     let lower_aliased = g.alias(lower_col, "lower_id1").unwrap();
 
-    let projected = g.select(df, &[upper_aliased, len_aliased, lower_aliased]).unwrap();
+    let projected = g.select(tbl, &[upper_aliased, len_aliased, lower_aliased]).unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -532,7 +532,7 @@ fn concat_many_args() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let mut args = Vec::new();
     args.push(g.scan("id1").unwrap());
     for _ in 0..19 {
@@ -541,7 +541,7 @@ fn concat_many_args() {
 
     let concat_col = g.concat(&args);
     let aliased = g.alias(concat_col, "concat_many").unwrap();
-    let projected = g.select(df, &[aliased]).unwrap();
+    let projected = g.select(tbl, &[aliased]).unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -558,11 +558,11 @@ fn cast_i64_to_f64() {
     let table = ctx.read_csv(&path).unwrap();
     let g = ctx.graph(&table).unwrap();
 
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let v1 = g.scan("v1").unwrap();
     let casted = g.cast(v1, teide::types::F64);
     let aliased = g.alias(casted, "v1_f64").unwrap();
-    let projected = g.select(df, &[aliased]).unwrap();
+    let projected = g.select(tbl, &[aliased]).unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.ncols(), 1);
@@ -596,13 +596,13 @@ fn window_row_number() {
 
     // ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1 ASC)
     let mut g = ctx.graph(&table).unwrap();
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let part_key = g.scan("id1").unwrap();
     let order_key = g.scan("v1").unwrap();
     let dummy_input = g.scan("v1").unwrap();
 
     let win = g.window_op(
-        df,
+        tbl,
         &[part_key],
         &[order_key],
         &[false], // ASC
@@ -643,13 +643,13 @@ fn window_rank_with_ties() {
     // RANK() OVER (PARTITION BY id2 ORDER BY id4 ASC)
     // id2 has 2 distinct values, id4 has values 1-3 (with ties)
     let mut g = ctx.graph(&table).unwrap();
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let part_key = g.scan("id2").unwrap();
     let order_key = g.scan("id4").unwrap();
     let dummy = g.scan("id4").unwrap();
 
     let win = g.window_op(
-        df,
+        tbl,
         &[part_key],
         &[order_key],
         &[false], // ASC
@@ -685,12 +685,12 @@ fn window_running_sum() {
     // SUM(v1) OVER (ORDER BY v1 ASC ROWS UNBOUNDED PRECEDING TO CURRENT ROW)
     // No partition → entire table is one partition
     let mut g = ctx.graph(&table).unwrap();
-    let df = g.const_table(&table);
+    let tbl = g.const_table(&table);
     let order_key = g.scan("v1").unwrap();
     let sum_input = g.scan("v1").unwrap();
 
     let win = g.window_op(
-        df,
+        tbl,
         &[],     // no partition
         &[order_key],
         &[false], // ASC

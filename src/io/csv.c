@@ -811,17 +811,17 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
 
     if (n_rows == 0) {
         /* Empty file → empty table */
-        td_t* df = td_table_new(ncols);
-        if (!df || TD_IS_ERR(df)) goto fail_unmap;
+        td_t* tbl = td_table_new(ncols);
+        if (!tbl || TD_IS_ERR(tbl)) goto fail_unmap;
         for (int c = 0; c < ncols; c++) {
             td_t* empty_vec = td_vec_new(TD_F64, 0);
             if (empty_vec && !TD_IS_ERR(empty_vec)) {
-                df = td_table_add_col(df, col_name_ids[c], empty_vec);
+                tbl = td_table_add_col(tbl, col_name_ids[c], empty_vec);
                 td_release(empty_vec);
             }
         }
         munmap(buf, file_size);
-        return df;
+        return tbl;
     }
 
     /* ---- 7. Sample-based type inference ---- */
@@ -930,18 +930,18 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header) {
 
     /* ---- 11. Build table ---- */
     {
-        td_t* df = td_table_new(ncols);
-        if (!df || TD_IS_ERR(df)) {
+        td_t* tbl = td_table_new(ncols);
+        if (!tbl || TD_IS_ERR(tbl)) {
             for (int c = 0; c < ncols; c++) td_release(col_vecs[c]);
             goto fail_offsets;
         }
 
         for (int c = 0; c < ncols; c++) {
-            df = td_table_add_col(df, col_name_ids[c], col_vecs[c]);
+            tbl = td_table_add_col(tbl, col_name_ids[c], col_vecs[c]);
             td_release(col_vecs[c]);
         }
 
-        result = df;
+        result = tbl;
     }
 
     /* ---- 12. Cleanup ---- */

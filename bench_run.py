@@ -48,8 +48,8 @@ def const_col(lib, g, df_ptr, name):
     return lib.const_vec(g, col_vec)
 
 
-def run_groupby(lib, df, label, key_names, agg_ops, agg_col_names):
-    g = lib.graph_new(df)
+def run_groupby(lib, tbl, label, key_names, agg_ops, agg_col_names):
+    g = lib.graph_new(tbl)
     try:
         keys = [lib.scan(g, k) for k in key_names]
         agg_ins = [lib.scan(g, c) for c in agg_col_names]
@@ -74,8 +74,8 @@ def run_groupby(lib, df, label, key_names, agg_ops, agg_col_names):
                 print(f"  {label:12s}  FAILED")
                 return
 
-            nrows = lib.df_nrows(result)
-            ncols = lib.df_ncols(result)
+            nrows = lib.table_nrows(result)
+            ncols = lib.table_ncols(result)
             lib.release(result)
 
         elapsed = sorted(times)[len(times) // 2]  # median
@@ -96,33 +96,33 @@ def main():
 
     print(f"Loading {csv_path} ...")
     t0 = time.perf_counter()
-    df = lib.csv_read(csv_path)
+    tbl = lib.csv_read(csv_path)
     load_time = time.perf_counter() - t0
 
-    if not df or df < 32:
+    if not tbl or tbl < 32:
         print("CSV load failed!")
         sys.exit(1)
 
-    nrows = lib.df_nrows(df)
-    ncols = lib.df_ncols(df)
+    nrows = lib.table_nrows(tbl)
+    ncols = lib.table_ncols(tbl)
     print(f"Loaded: {nrows:,} rows x {ncols} cols in {load_time*1000:.0f} ms\n")
 
     print("Groupby benchmarks (execution time only, excludes build/optimize):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
-    run_groupby(lib, df, "q1", ["id1"], [OP_SUM], ["v1"])
-    run_groupby(lib, df, "q2", ["id1", "id2"], [OP_SUM], ["v1"])
-    run_groupby(lib, df, "q3", ["id3"], [OP_SUM, OP_AVG], ["v1", "v3"])
-    run_groupby(lib, df, "q4", ["id4"], [OP_AVG, OP_AVG, OP_AVG], ["v1", "v2", "v3"])
-    run_groupby(lib, df, "q5", ["id6"], [OP_SUM, OP_SUM, OP_SUM], ["v1", "v2", "v3"])
-    run_groupby(lib, df, "q6", ["id3"], [OP_MAX, OP_MIN], ["v1", "v2"])
-    run_groupby(lib, df, "q7",
+    run_groupby(lib, tbl, "q1", ["id1"], [OP_SUM], ["v1"])
+    run_groupby(lib, tbl, "q2", ["id1", "id2"], [OP_SUM], ["v1"])
+    run_groupby(lib, tbl, "q3", ["id3"], [OP_SUM, OP_AVG], ["v1", "v3"])
+    run_groupby(lib, tbl, "q4", ["id4"], [OP_AVG, OP_AVG, OP_AVG], ["v1", "v2", "v3"])
+    run_groupby(lib, tbl, "q5", ["id6"], [OP_SUM, OP_SUM, OP_SUM], ["v1", "v2", "v3"])
+    run_groupby(lib, tbl, "q6", ["id3"], [OP_MAX, OP_MIN], ["v1", "v2"])
+    run_groupby(lib, tbl, "q7",
                 ["id1", "id2", "id3", "id4", "id5", "id6"],
                 [OP_SUM, OP_COUNT], ["v3", "v1"])
 
     print("\nDone.")
-    lib.release(df)
+    lib.release(tbl)
     lib.sym_destroy()
     lib.arena_destroy_all()
 

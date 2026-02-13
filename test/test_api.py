@@ -78,9 +78,9 @@ def table(ctx, csv_path):
 class TestContext:
     def test_context_manager(self, csv_path):
         with Context() as ctx:
-            df = ctx.read_csv(csv_path)
-            assert df is not None
-            assert len(df) == 10
+            tbl = ctx.read_csv(csv_path)
+            assert tbl is not None
+            assert len(tbl) == 10
 
     def test_read_csv(self, table):
         assert table is not None

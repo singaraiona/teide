@@ -19,7 +19,7 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! Teide — Fast columnar dataframe library.
+//! Teide — Fast columnar table engine.
 //!
 //! Rust bindings for the Teide C17 engine. Coming soon.
 

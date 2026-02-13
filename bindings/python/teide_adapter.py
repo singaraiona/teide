@@ -71,8 +71,8 @@ class TeideAdapter:
         if isinstance(csv_paths, str):
             csv_paths = [csv_paths]
         # Load first CSV; ignore additional paths for now
-        df = self._ctx.read_csv(csv_paths[0])
-        self._tables[table_name] = df
+        tbl = self._ctx.read_csv(csv_paths[0])
+        self._tables[table_name] = tbl
 
     def run(self, task, params=None):
         try:

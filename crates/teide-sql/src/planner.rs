@@ -198,11 +198,7 @@ fn plan_query(
             left,
             right,
         } => {
-            if !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All) {
-                return Err(SqlError::Plan(
-                    "UNION (without ALL) not supported yet; use UNION ALL".into(),
-                ));
-            }
+            let is_all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
             // Execute both sides
             let left_query = Query {
                 with: None,
@@ -235,7 +231,7 @@ fn plan_query(
 
             if left_result.columns.len() != right_result.columns.len() {
                 return Err(SqlError::Plan(format!(
-                    "UNION ALL: column count mismatch ({} vs {})",
+                    "UNION: column count mismatch ({} vs {})",
                     left_result.columns.len(),
                     right_result.columns.len()
                 )));
@@ -243,6 +239,18 @@ fn plan_query(
 
             // Concatenate tables column by column
             let result = concat_tables(ctx, &left_result.table, &right_result.table)?;
+
+            // Without ALL: apply DISTINCT
+            let result = if !is_all {
+                let aliases: Vec<String> = (0..result.ncols() as usize)
+                    .map(|i| result.col_name_str(i).to_string())
+                    .collect();
+                let schema = build_schema(&result);
+                let (distinct_result, _) = plan_distinct(ctx, &result, &aliases, &schema)?;
+                distinct_result
+            } else {
+                result
+            };
 
             // Apply ORDER BY and LIMIT from the outer query
             return apply_post_processing(ctx, query, result, left_result.columns, effective_tables);

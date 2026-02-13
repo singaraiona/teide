@@ -1922,6 +1922,7 @@ typedef struct {
     const void*     data;      /* raw column data */
     int8_t          type;      /* column type */
     bool            desc;
+    bool            nulls_first; /* for single-key F64: 1=nulls first */
     /* ENUM rank mapping (NULL if not ENUM): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */
@@ -1954,12 +1955,27 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
         }
         case TD_F64: {
             const double* d = (const double*)c->data;
+            bool nf   = c->nulls_first;
+            bool desc = c->desc;
+            /* NaN override: encode NaN so it sorts first or last.
+             * For ASC  NULLS FIRST → e=0            (smallest key)
+             * For ASC  NULLS LAST  → e=UINT64_MAX   (largest key)
+             * For DESC NULLS FIRST → e=UINT64_MAX   (~e=0, smallest)
+             * For DESC NULLS LAST  → e=0            (~e=UINT64_MAX, largest)
+             * Pattern: e = (nf ^ desc) ? 0 : UINT64_MAX */
+            uint64_t nan_e = (nf ^ desc) ? 0 : UINT64_MAX;
             for (int64_t i = start; i < end; i++) {
                 uint64_t bits;
                 memcpy(&bits, &d[i], 8);
-                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                uint64_t e = bits ^ mask;
-                c->keys[i] = c->desc ? ~e : e;
+                /* NaN: exponent all-1s (0x7FF) and mantissa non-zero */
+                if ((bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL &&
+                    (bits & 0x000FFFFFFFFFFFFFULL)) {
+                    c->keys[i] = desc ? ~nan_e : nan_e;
+                } else {
+                    uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
+                    uint64_t e = bits ^ mask;
+                    c->keys[i] = desc ? ~e : e;
+                }
             }
             break;
         }
@@ -2624,9 +2640,12 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                                     (size_t)nrows * sizeof(uint64_t));
                 if (keys) {
                     bool desc = ext->sort.desc ? ext->sort.desc[0] : 0;
+                    /* Default: ASC → nulls last (nf=0), DESC → nulls first (nf=1) */
+                    bool nf = ext->sort.nulls_first ? ext->sort.nulls_first[0] : desc;
                     radix_encode_ctx_t enc = {
                         .keys = keys, .data = td_data(sort_vecs[0]),
                         .type = sort_vecs[0]->type, .desc = desc,
+                        .nulls_first = nf,
                         .enum_rank = enum_ranks[0], .n_keys = 1,
                     };
                     if (pool)
@@ -6814,6 +6833,7 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
                     radix_encode_ctx_t enc = {
                         .keys = keys, .data = td_data(sort_vecs[0]),
                         .type = sort_vecs[0]->type, .desc = sort_descs[0],
+                        .nulls_first = sort_descs[0], /* default: NULLS FIRST for DESC */
                         .enum_rank = enum_ranks[0], .n_keys = 1,
                     };
                     if (pool)

@@ -435,6 +435,23 @@ fn union_all() {
 }
 
 #[test]
+fn union_distinct() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute(
+                "SELECT id1 FROM csv WHERE v1 = 1 \
+                 UNION \
+                 SELECT id1 FROM csv WHERE v1 = 2",
+            )
+            .unwrap(),
+    );
+    // v1=1 → id001,id003; v1=2 → id001,id003; UNION deduplicates to 2
+    assert_eq!(r.table.nrows(), 2);
+}
+
+#[test]
 fn union_all_literal_column_from_table() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();

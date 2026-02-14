@@ -54,16 +54,7 @@ static int8_t promote_type(int8_t a, int8_t b) {
     return TD_BOOL;
 }
 
-static void pass_type_inference(td_graph_t* g, td_op_t* node) {
-    if (!node || node->flags & OP_FLAG_DEAD) return;
-
-    /* Recurse into inputs first (bottom-up) */
-    for (int i = 0; i < 2 && i < node->arity; i++) {
-        if (node->inputs[i])
-            pass_type_inference(g, node->inputs[i]);
-    }
-
-    /* Re-derive type if not set */
+static void infer_type_for_node(td_op_t* node) {
     if (node->out_type == 0 && node->opcode != OP_SCAN && node->opcode != OP_CONST) {
         if (node->arity >= 2 && node->inputs[0] && node->inputs[1]) {
             node->out_type = promote_type(node->inputs[0]->out_type,
@@ -72,6 +63,45 @@ static void pass_type_inference(td_graph_t* g, td_op_t* node) {
             node->out_type = node->inputs[0]->out_type;
         }
     }
+}
+
+static void pass_type_inference(td_graph_t* g, td_op_t* root) {
+    if (!root || root->flags & OP_FLAG_DEAD) return;
+
+    /* Iterative post-order: collect nodes into an order array, then
+       process in reverse (children before parents). */
+    uint32_t nc = g->node_count;
+    uint32_t stack[256];
+    uint32_t order[256];
+    bool visited_stack[256];
+    bool* visited;
+    if (nc <= 256) {
+        visited = visited_stack;
+    } else {
+        visited = (bool*)td_sys_alloc(nc * sizeof(bool));
+        if (!visited) return;
+    }
+    memset(visited, 0, nc * sizeof(bool));
+
+    int sp = 0, oc = 0;
+    stack[sp++] = root->id;
+    while (sp > 0 && oc < 256) {
+        uint32_t nid = stack[--sp];
+        td_op_t* n = &g->nodes[nid];
+        if (!n || n->flags & OP_FLAG_DEAD) continue;
+        if (visited[nid]) continue;
+        visited[nid] = true;
+        order[oc++] = nid;
+        for (int i = 0; i < 2 && i < n->arity; i++) {
+            if (n->inputs[i] && sp < 256)
+                stack[sp++] = n->inputs[i]->id;
+        }
+    }
+    /* Process in reverse order (children before parents) */
+    for (int i = oc - 1; i >= 0; i--)
+        infer_type_for_node(&g->nodes[order[i]]);
+
+    if (nc > 256) td_sys_free(visited);
 }
 
 /* --------------------------------------------------------------------------
@@ -221,9 +251,9 @@ static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
             int64_t rv = r_is_f64 ? (int64_t)rf : ri;
             int64_t r = 0;
             switch (node->opcode) {
-                case OP_ADD: r = lv + rv; break;
-                case OP_SUB: r = lv - rv; break;
-                case OP_MUL: r = lv * rv; break;
+                case OP_ADD: r = (int64_t)((uint64_t)lv + (uint64_t)rv); break;
+                case OP_SUB: r = (int64_t)((uint64_t)lv - (uint64_t)rv); break;
+                case OP_MUL: r = (int64_t)((uint64_t)lv * (uint64_t)rv); break;
                 case OP_DIV: r = rv != 0 ? lv / rv : 0; break;
                 case OP_MOD: r = rv != 0 ? lv % rv : 0; break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
@@ -311,21 +341,52 @@ static bool fold_filter_const_predicate(td_graph_t* g, td_op_t* node) {
     return true;
 }
 
-static void pass_constant_fold(td_graph_t* g, td_op_t* node) {
-    if (!node || node->flags & OP_FLAG_DEAD) return;
-
-    for (int i = 0; i < 2 && i < node->arity; i++) {
-        if (node->inputs[i])
-            pass_constant_fold(g, node->inputs[i]);
-    }
-
+static void fold_node(td_graph_t* g, td_op_t* node) {
     /* Only fold element-wise binary ops with two const inputs */
     if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
         (void)fold_binary_const(g, node);
     }
-
     /* FILTER with constant predicate can be reduced to pass-through/empty. */
     (void)fold_filter_const_predicate(g, node);
+}
+
+static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
+    if (!root || root->flags & OP_FLAG_DEAD) return;
+
+    /* Iterative post-order: collect nodes, then process in reverse
+       (children before parents). */
+    uint32_t nc = g->node_count;
+    uint32_t stack[256];
+    uint32_t order[256];
+    bool visited_stack[256];
+    bool* visited;
+    if (nc <= 256) {
+        visited = visited_stack;
+    } else {
+        visited = (bool*)td_sys_alloc(nc * sizeof(bool));
+        if (!visited) return;
+    }
+    memset(visited, 0, nc * sizeof(bool));
+
+    int sp = 0, oc = 0;
+    stack[sp++] = root->id;
+    while (sp > 0 && oc < 256) {
+        uint32_t nid = stack[--sp];
+        td_op_t* n = &g->nodes[nid];
+        if (!n || n->flags & OP_FLAG_DEAD) continue;
+        if (visited[nid]) continue;
+        visited[nid] = true;
+        order[oc++] = nid;
+        for (int i = 0; i < 2 && i < n->arity; i++) {
+            if (n->inputs[i] && sp < 256)
+                stack[sp++] = n->inputs[i]->id;
+        }
+    }
+    /* Process in reverse order (children before parents) */
+    for (int i = oc - 1; i >= 0; i--)
+        fold_node(g, &g->nodes[order[i]]);
+
+    if (nc > 256) td_sys_free(visited);
 }
 
 /* --------------------------------------------------------------------------
@@ -334,28 +395,44 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* node) {
  * Mark nodes unreachable from root as DEAD.
  * -------------------------------------------------------------------------- */
 
-static void mark_live(td_op_t* node, bool* live) {
-    if (!node) return;
-    if (live[node->id]) return;
-    live[node->id] = true;
-    for (int i = 0; i < 2; i++) {
-        if (node->inputs[i])
-            mark_live(node->inputs[i], live);
+static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
+    if (!root) return;
+
+    uint32_t stack[256];
+    int sp = 0;
+    stack[sp++] = root->id;
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (live[nid]) continue;
+        live[nid] = true;
+        td_op_t* n = &g->nodes[nid];
+        for (int i = 0; i < 2; i++) {
+            if (n->inputs[i] && sp < 256)
+                stack[sp++] = n->inputs[i]->id;
+        }
     }
 }
 
 static void pass_dce(td_graph_t* g, td_op_t* root) {
     uint32_t nc = g->node_count;
-    bool live[nc];
+    bool* live;
+    bool live_stack[256];
+    if (nc <= 256) {
+        live = live_stack;
+    } else {
+        live = (bool*)td_sys_alloc(nc * sizeof(bool));
+        if (!live) return;
+    }
     memset(live, 0, nc * sizeof(bool));
 
-    mark_live(root, live);
+    mark_live(g, root, live);
 
     for (uint32_t i = 0; i < nc; i++) {
         if (!live[i]) {
             g->nodes[i].flags |= OP_FLAG_DEAD;
         }
     }
+    if (nc > 256) td_sys_free(live);
 }
 
 /* --------------------------------------------------------------------------

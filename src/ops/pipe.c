@@ -24,7 +24,9 @@
 #include "pipe.h"
 #include "mem/sys.h"
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * td_pipe_new

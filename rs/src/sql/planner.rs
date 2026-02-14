@@ -876,31 +876,14 @@ fn plan_query(
         plan_distinct(ctx, &working_table, &aliases, &schema)?
     } else {
         let aliases = extract_projection_aliases(select_items, &schema)?;
-        // Check if projection needs expression evaluation (CAST, arithmetic, etc.)
-        // Force projection when window functions added extra columns,
-        // or when SELECT items contain expressions needing evaluation.
-        let needs_expr = has_windows || select_items.iter().any(|item| match item {
-            SelectItem::Wildcard(_) => false,
-            SelectItem::UnnamedExpr(Expr::Identifier(_)) => false,
-            SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(_),
-                ..
-            } => false,
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_)) => false,
-            SelectItem::ExprWithAlias {
-                expr: Expr::CompoundIdentifier(_),
-                ..
-            } => false,
-            _ => true, // CAST, arithmetic, function calls, etc.
-        });
-        if needs_expr || working_table.ncols() as usize != aliases.len() {
-            // Expression evaluation needed, OR simple column selection from a wider
-            // table (e.g. SELECT id1, v1 FROM 9-col table). The projection ensures
-            // the result table's column count matches the alias list — required for
-            // subquery/CTE materialization with with_column_names().
-            plan_expr_select(ctx, &working_table, select_items, &schema)?
-        } else {
+        // Skip projection only for true identity projections (`SELECT *` or
+        // selecting all base columns in table order). This prevents silently
+        // returning wrong columns for reordered/missing identifiers.
+        let can_passthrough = !has_windows && is_identity_projection(select_items, &schema);
+        if can_passthrough {
             (working_table, aliases)
+        } else {
+            plan_expr_select(ctx, &working_table, select_items, &schema)?
         }
     };
 
@@ -1730,6 +1713,18 @@ fn plan_distinct(
     col_names: &[String],
     schema: &HashMap<String, usize>,
 ) -> Result<(Table, Vec<String>), SqlError> {
+    if col_names.is_empty() {
+        return Err(SqlError::Plan("DISTINCT on empty projection".into()));
+    }
+    for name in col_names {
+        if !schema.contains_key(name) {
+            return Err(SqlError::Plan(format!(
+                "DISTINCT column '{}' not found",
+                name
+            )));
+        }
+    }
+
     // GROUP BY all selected columns with a dummy COUNT(*) aggregate
     let mut g = ctx.graph(working_table)?;
     let key_nodes: Vec<Column> = col_names
@@ -2879,6 +2874,53 @@ fn extract_projection_aliases(
     }
 
     Ok(aliases)
+}
+
+/// Source column name for projection passthrough checks.
+/// Returns `None` for computed expressions.
+fn projection_source_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| p.value.to_lowercase())
+        }
+        Expr::Nested(inner) => projection_source_name(inner),
+        _ => None,
+    }
+}
+
+/// True when SELECT items are an identity projection over the current schema.
+/// Allows `SELECT *` and selecting all base columns in table order.
+fn is_identity_projection(
+    select_items: &[SelectItem],
+    schema: &HashMap<String, usize>,
+) -> bool {
+    if select_items.len() == 1 && matches!(select_items[0], SelectItem::Wildcard(_)) {
+        return true;
+    }
+
+    let mut schema_cols: Vec<_> = schema.iter().collect();
+    schema_cols.sort_by_key(|(_name, idx)| **idx);
+    let schema_names: Vec<String> = schema_cols
+        .into_iter()
+        .map(|(name, _idx)| name.clone())
+        .collect();
+
+    let mut projected_names: Vec<String> = Vec::with_capacity(select_items.len());
+    for item in select_items {
+        let src = match item {
+            SelectItem::UnnamedExpr(expr) => projection_source_name(expr),
+            SelectItem::ExprWithAlias { expr, .. } => projection_source_name(expr),
+            SelectItem::Wildcard(_) => None, // wildcard mixed with others is not identity
+            _ => None,
+        };
+        let Some(name) = src else {
+            return false;
+        };
+        projected_names.push(name);
+    }
+
+    projected_names == schema_names
 }
 
 /// An ORDER BY item: either a column name, positional index, or arbitrary expression.

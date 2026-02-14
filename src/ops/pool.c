@@ -235,7 +235,7 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
     }
 
     pool->task_head = n_tasks;
-    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_relaxed);
+    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_release);
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
@@ -265,7 +265,11 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
     /* Spin-wait for workers to finish remaining tasks.
      * No semaphore — avoids surplus-signal bug between consecutive dispatches. */
     while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-        /* Workers are active; spin is brief (<1µs per remaining task) */
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
     }
 }
 
@@ -304,7 +308,7 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
     }
 
     pool->task_head = n_tasks;
-    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_relaxed);
+    atomic_store_explicit(&pool->task_count, n_tasks, memory_order_release);
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
@@ -333,7 +337,11 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
 
     /* Spin-wait for workers to finish remaining tasks */
     while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-        /* Workers are active; spin is brief */
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
     }
 }
 
@@ -363,10 +371,17 @@ td_pool_t* td_pool_get(void) {
         }
     }
     /* Spin while another thread initializes */
-    while (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) != 2) {
-        /* busy wait — only happens once during first call */
+    for (;;) {
+        uint32_t s = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
+        if (s == 2) return &g_pool;
+        if (s == 0) return NULL;  /* init failed or not started */
+        /* s == 1: still initializing, spin */
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
     }
-    return &g_pool;
 }
 
 /* --------------------------------------------------------------------------

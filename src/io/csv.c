@@ -39,12 +39,15 @@
 
 #include "csv.h"
 #include "ops/pool.h"
+#include "ops/hash.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <sys/mman.h>
 
 /* --------------------------------------------------------------------------
@@ -93,18 +96,8 @@ static inline void scratch_free(td_t* hdr) {
     if (hdr) td_free(hdr);
 }
 
-/* --------------------------------------------------------------------------
- * FNV-1a 32-bit hash
- * -------------------------------------------------------------------------- */
-
-static uint32_t fnv1a(const char* data, size_t len) {
-    uint32_t h = 0x811c9dc5u;
-    for (size_t i = 0; i < len; i++) {
-        h ^= (uint8_t)data[i];
-        h *= 0x01000193u;
-    }
-    return h;
-}
+/* Hash uses wyhash from ops/hash.h (td_hash_bytes) — much faster than FNV-1a
+ * for short strings typical in CSV columns. */
 
 /* --------------------------------------------------------------------------
  * Per-worker local symbol table
@@ -198,7 +191,7 @@ static void local_sym_rehash(local_sym_t* ls) {
 static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
     if (TD_UNLIKELY(!ls->buckets || !ls->offsets || !ls->lens || !ls->arena))
         return 0;
-    uint32_t hash = fnv1a(str, len);
+    uint32_t hash = (uint32_t)td_hash_bytes(str, len);
     uint32_t mask = ls->bucket_cap - 1;
     uint32_t slot = hash & mask;
 
@@ -688,9 +681,33 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
  * (which outlives workers). Uses VLAs for small arrays.
  * -------------------------------------------------------------------------- */
 
+/* Context for parallel sym fixup dispatch */
+typedef struct {
+    uint32_t*  data;
+    int64_t**  mappings;
+    uint32_t   n_workers;
+} sym_fixup_ctx_t;
+
+static void sym_fixup_fn(void* arg, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    sym_fixup_ctx_t* c = (sym_fixup_ctx_t*)arg;
+    uint32_t* restrict data = c->data;
+    int64_t** restrict mappings = c->mappings;
+    for (int64_t r = start; r < end; r++) {
+        uint32_t packed = data[r];
+        uint32_t wid = UNPACK_WID(packed);
+        uint32_t lid = UNPACK_LID(packed);
+        if (mappings[wid])
+            data[r] = (uint32_t)mappings[wid][lid];
+        else
+            data[r] = 0;
+    }
+}
+
 static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
                               int n_cols, const csv_type_t* col_types,
-                              void** col_data, int64_t n_rows) {
+                              void** col_data, int64_t n_rows,
+                              td_pool_t* pool) {
     for (int c = 0; c < n_cols; c++) {
         if (col_types[c] != CSV_TYPE_STR) continue;
 
@@ -716,16 +733,23 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
             }
         }
 
-        /* Fix up column data: unpack (wid, lid) → global sym_id */
+        /* Fix up column data: parallel unpack (wid, lid) → global sym_id.
+         * Mappings are read-only at this point — no contention. */
         uint32_t* data = (uint32_t*)col_data[c];
-        for (int64_t r = 0; r < n_rows; r++) {
-            uint32_t packed = data[r];
-            uint32_t wid = UNPACK_WID(packed);
-            uint32_t lid = UNPACK_LID(packed);
-            if (mappings[wid])
-                data[r] = (uint32_t)mappings[wid][lid];
-            else
-                data[r] = 0;
+        if (pool && n_rows > 1024) {
+            sym_fixup_ctx_t ctx = { .data = data, .mappings = mappings,
+                                    .n_workers = n_workers };
+            td_pool_dispatch(pool, sym_fixup_fn, &ctx, n_rows);
+        } else {
+            for (int64_t r = 0; r < n_rows; r++) {
+                uint32_t packed = data[r];
+                uint32_t wid = UNPACK_WID(packed);
+                uint32_t lid = UNPACK_LID(packed);
+                if (mappings[wid])
+                    data[r] = (uint32_t)mappings[wid][lid];
+                else
+                    data[r] = 0;
+            }
         }
 
         for (uint32_t w = 0; w < n_workers; w++) scratch_free(map_hdrs[w]);
@@ -1067,7 +1091,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
                 /* Merge local sym tables into global (main thread — safe) */
                 if (has_str_cols && local_syms) {
                     merge_local_syms(local_syms, n_workers, ncols,
-                                     parse_types, col_data, n_rows);
+                                     parse_types, col_data, n_rows, pool);
 
                     for (uint32_t w = 0; w < n_workers; w++) {
                         for (int c = 0; c < ncols; c++) {

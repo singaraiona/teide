@@ -1484,7 +1484,7 @@ typedef struct {
 static void multi_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     multi_gather_ctx_t* c = (multi_gather_ctx_t*)raw;
-    const int64_t* idx = c->idx;
+    const int64_t* restrict idx = c->idx;
     int64_t nc = c->ncols;
 
     /* Process one column at a time per batch of rows.
@@ -1501,10 +1501,28 @@ static void multi_gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
             uint8_t e = c->esz[col];
             char* src = c->srcs[col];
             char* dst = c->dsts[col];
-            for (int64_t i = bstart; i < bend; i++) {
-                if (i + MG_PF < bend)
-                    __builtin_prefetch(src + idx[i + MG_PF] * e, 0, 0);
-                memcpy(dst + i * e, src + idx[i] * e, e);
+            if (e == 8) {
+                const uint64_t* restrict s8 = (const uint64_t*)src;
+                uint64_t* restrict d8 = (uint64_t*)dst;
+                for (int64_t i = bstart; i < bend; i++) {
+                    if (i + MG_PF < bend)
+                        __builtin_prefetch(&s8[idx[i + MG_PF]], 0, 0);
+                    d8[i] = s8[idx[i]];
+                }
+            } else if (e == 4) {
+                const uint32_t* restrict s4 = (const uint32_t*)src;
+                uint32_t* restrict d4 = (uint32_t*)dst;
+                for (int64_t i = bstart; i < bend; i++) {
+                    if (i + MG_PF < bend)
+                        __builtin_prefetch(&s4[idx[i + MG_PF]], 0, 0);
+                    d4[i] = s4[idx[i]];
+                }
+            } else {
+                for (int64_t i = bstart; i < bend; i++) {
+                    if (i + MG_PF < bend)
+                        __builtin_prefetch(src + idx[i + MG_PF] * e, 0, 0);
+                    memcpy(dst + i * e, src + idx[i] * e, e);
+                }
             }
         }
     }
@@ -1524,10 +1542,10 @@ typedef struct {
 static void gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     gather_ctx_t* c = (gather_ctx_t*)raw;
-    char* src = (char*)td_data(c->src_col);
-    char* dst = (char*)td_data(c->dst_col);
+    char* restrict src = (char*)td_data(c->src_col);
+    char* restrict dst = (char*)td_data(c->dst_col);
     uint8_t esz = c->esz;
-    const int64_t* idx = c->idx;
+    const int64_t* restrict idx = c->idx;
 #define GATHER_PF 16
 
     if (c->nullable) {
@@ -2734,9 +2752,16 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
 
                 if (n_sort <= MK_PRESCAN_MAX_KEYS && pool) {
                     uint32_t nw = td_pool_total_workers(pool);
-                    int64_t pw_mins[nw * n_sort];
-                    int64_t pw_maxs[nw * n_sort];
-                    for (uint32_t i = 0; i < nw * (uint32_t)n_sort; i++) {
+                    size_t pw_count = (size_t)nw * n_sort;
+                    int64_t pw_mins_stack[512], pw_maxs_stack[512];
+                    td_t *pw_mins_hdr = NULL, *pw_maxs_hdr = NULL;
+                    int64_t* pw_mins = (pw_count <= 512)
+                        ? pw_mins_stack
+                        : (int64_t*)scratch_alloc(&pw_mins_hdr, pw_count * sizeof(int64_t));
+                    int64_t* pw_maxs = (pw_count <= 512)
+                        ? pw_maxs_stack
+                        : (int64_t*)scratch_alloc(&pw_maxs_hdr, pw_count * sizeof(int64_t));
+                    for (size_t i = 0; i < pw_count; i++) {
                         pw_mins[i] = INT64_MAX;
                         pw_maxs[i] = INT64_MIN;
                     }
@@ -2764,6 +2789,8 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                             bits++;
                         total_bits += bits;
                     }
+                    if (pw_mins_hdr) scratch_free(pw_mins_hdr);
+                    if (pw_maxs_hdr) scratch_free(pw_maxs_hdr);
                 } else {
                     /* Sequential fallback (no pool or too many keys) */
                     for (uint8_t k = 0; k < n_sort; k++) {
@@ -3481,7 +3508,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     int64_t agg_vals[8];
 
     for (int64_t row = start; row < end; row++) {
-        if (mask && !mask[row]) continue;
+        if (TD_UNLIKELY(mask && !mask[row])) continue;
         uint64_t h = 0;
         for (uint8_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
@@ -3753,14 +3780,14 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP) {
         const int64_t* kd = (const int64_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
-            if (mask && !mask[r]) continue;
+            if (TD_UNLIKELY(mask && !mask[r])) continue;
             if (kd[r] < kmin) kmin = kd[r];
             if (kd[r] > kmax) kmax = kd[r];
         }
     } else if (t == TD_ENUM) {
         const uint32_t* kd = (const uint32_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
-            if (mask && !mask[r]) continue;
+            if (TD_UNLIKELY(mask && !mask[r])) continue;
             int64_t v = (int64_t)kd[r];
             if (v < kmin) kmin = v;
             if (v > kmax) kmax = v;
@@ -3768,7 +3795,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     } else { /* TD_I32, TD_DATE, TD_TIME */
         const int32_t* kd = (const int32_t*)c->key_data;
         for (int64_t r = start; r < end; r++) {
-            if (mask && !mask[r]) continue;
+            if (TD_UNLIKELY(mask && !mask[r])) continue;
             int64_t v = (int64_t)kd[r];
             if (v < kmin) kmin = v;
             if (v > kmax) kmax = v;
@@ -4110,7 +4137,7 @@ static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
 static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
-    const int64_t* data = (const int64_t*)c->agg_ptrs[0];
+    const int64_t* restrict data = (const int64_t*)c->agg_ptrs[0];
     int64_t sum = 0;
     for (int64_t r = start; r < end; r++)
         sum += data[r];
@@ -4123,7 +4150,7 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
 static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
-    const double* data = (const double*)c->agg_ptrs[0];
+    const double* restrict data = (const double*)c->agg_ptrs[0];
     double sum = 0.0;
     for (int64_t r = start; r < end; r++)
         sum += data[r];
@@ -4164,7 +4191,7 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     const uint8_t* mask = c->mask;
 
     for (int64_t r = start; r < end; r++) {
-        if (mask && !mask[r]) continue;
+        if (TD_UNLIKELY(mask && !mask[r])) continue;
         acc->count[0]++;
         for (uint8_t a = 0; a < n_aggs; a++) {
             double fv; int64_t iv;
@@ -4213,7 +4240,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         int8_t kt = c->key_types[0];
         int64_t kmin = c->key_mins[0];
         for (int64_t r = start; r < end; r++) {
-            if (mask && !mask[r]) continue;
+            if (TD_UNLIKELY(mask && !mask[r])) continue;
             int64_t kv;
             if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
                 kv = ((const int64_t*)kptr)[r];
@@ -4252,7 +4279,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
 
     /* Multi-key composite GID path */
     for (int64_t r = start; r < end; r++) {
-        if (mask && !mask[r]) continue;
+        if (TD_UNLIKELY(mask && !mask[r])) continue;
         int32_t gid = da_composite_gid(c, r);
         acc->count[gid]++;
         size_t base = (size_t)gid * n_aggs;
@@ -5441,10 +5468,14 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     join_build_ctx_t* c = (join_build_ctx_t*)raw;
     int64_t* heads = c->ht_heads;
-    int64_t* next  = c->ht_next;
+    int64_t* restrict next  = c->ht_next;
     uint32_t mask  = c->ht_mask;
 
     for (int64_t r = start; r < end; r++) {
+        if (r + 8 < end) {
+            uint64_t pf_h = hash_row_keys(c->r_key_vecs, c->n_keys, r + 8);
+            __builtin_prefetch(&heads[(uint32_t)(pf_h & mask)], 1, 1);
+        }
         uint64_t h = hash_row_keys(c->r_key_vecs, c->n_keys, r);
         uint32_t slot = (uint32_t)(h & mask);
         int64_t old = __atomic_load_n(&heads[slot], __ATOMIC_RELAXED);
@@ -5486,9 +5517,14 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
     if (row_end > c->left_rows) row_end = c->left_rows;
 
     int64_t count = 0;
+    uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
+        if (l + 8 < row_end) {
+            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8);
+            __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
+        }
         uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l);
-        uint32_t slot = (uint32_t)(h & (c->ht_cap - 1));
+        uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
         for (int64_t r = c->ht_heads[slot]; r >= 0; r = c->ht_next[r]) {
             if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, r)) {
@@ -5511,12 +5547,17 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
     if (row_end > c->left_rows) row_end = c->left_rows;
 
     int64_t off = c->morsel_offsets[tid];
-    int64_t* li = c->l_idx;
-    int64_t* ri = c->r_idx;
+    int64_t* restrict li = c->l_idx;
+    int64_t* restrict ri = c->r_idx;
 
+    uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
+        if (l + 8 < row_end) {
+            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8);
+            __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
+        }
         uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l);
-        uint32_t slot = (uint32_t)(h & (c->ht_cap - 1));
+        uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
         for (int64_t r = c->ht_heads[slot]; r >= 0; r = c->ht_next[r]) {
             if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, r)) {
@@ -7079,9 +7120,16 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
 
                 if (n_sort <= MK_PRESCAN_MAX_KEYS && pool2) {
                     uint32_t nw = td_pool_total_workers(pool2);
-                    int64_t pw_mins[nw * n_sort];
-                    int64_t pw_maxs[nw * n_sort];
-                    for (uint32_t i = 0; i < nw * (uint32_t)n_sort; i++) {
+                    size_t pw_count = (size_t)nw * n_sort;
+                    int64_t pw_mins_stack[512], pw_maxs_stack[512];
+                    td_t *pw_mins_hdr = NULL, *pw_maxs_hdr = NULL;
+                    int64_t* pw_mins = (pw_count <= 512)
+                        ? pw_mins_stack
+                        : (int64_t*)scratch_alloc(&pw_mins_hdr, pw_count * sizeof(int64_t));
+                    int64_t* pw_maxs = (pw_count <= 512)
+                        ? pw_maxs_stack
+                        : (int64_t*)scratch_alloc(&pw_maxs_hdr, pw_count * sizeof(int64_t));
+                    for (size_t i = 0; i < pw_count; i++) {
                         pw_mins[i] = INT64_MAX;
                         pw_maxs[i] = INT64_MIN;
                     }
@@ -7108,6 +7156,8 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
                             bits++;
                         total_bits += bits;
                     }
+                    if (pw_mins_hdr) scratch_free(pw_mins_hdr);
+                    if (pw_maxs_hdr) scratch_free(pw_maxs_hdr);
                 } else {
                     for (uint8_t k = 0; k < n_sort; k++) {
                         td_t* col = sort_vecs[k];

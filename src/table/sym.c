@@ -24,6 +24,7 @@
 #include "sym.h"
 #include "mem/sys.h"
 #include <string.h>
+#include <stdatomic.h>
 
 /* --------------------------------------------------------------------------
  * FNV-1a 32-bit hash
@@ -58,14 +59,14 @@ typedef struct {
 } sym_table_t;
 
 static sym_table_t g_sym;
-static bool        g_sym_inited = false;
+static _Atomic(bool) g_sym_inited = false;
 
 /* --------------------------------------------------------------------------
  * td_sym_init
  * -------------------------------------------------------------------------- */
 
 void td_sym_init(void) {
-    if (g_sym_inited) return;
+    if (atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
 
     g_sym.bucket_cap = SYM_INIT_CAP;
     g_sym.buckets = (uint64_t*)td_sys_alloc(g_sym.bucket_cap * sizeof(uint64_t));
@@ -76,7 +77,7 @@ void td_sym_init(void) {
     g_sym.strings = (td_t**)td_sys_alloc(g_sym.str_cap * sizeof(td_t*));
     if (!g_sym.strings) { td_sys_free(g_sym.buckets); g_sym.buckets = NULL; return; }
 
-    g_sym_inited = true;
+    atomic_store_explicit(&g_sym_inited, true, memory_order_release);
 }
 
 /* --------------------------------------------------------------------------
@@ -84,7 +85,7 @@ void td_sym_init(void) {
  * -------------------------------------------------------------------------- */
 
 void td_sym_destroy(void) {
-    if (!g_sym_inited) return;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
 
     /* Release all interned string atoms */
     for (uint32_t i = 0; i < g_sym.str_count; i++) {
@@ -97,7 +98,7 @@ void td_sym_destroy(void) {
     td_sys_free(g_sym.buckets);
 
     memset(&g_sym, 0, sizeof(g_sym));
-    g_sym_inited = false;
+    atomic_store_explicit(&g_sym_inited, false, memory_order_release);
 }
 
 /* --------------------------------------------------------------------------
@@ -142,7 +143,7 @@ static void ht_grow(void) {
  * -------------------------------------------------------------------------- */
 
 int64_t td_sym_intern(const char* str, size_t len) {
-    if (!g_sym_inited) return -1;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
     uint32_t hash = fnv1a(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
     uint32_t slot = hash & mask;
@@ -204,7 +205,7 @@ int64_t td_sym_intern(const char* str, size_t len) {
  * -------------------------------------------------------------------------- */
 
 int64_t td_sym_find(const char* str, size_t len) {
-    if (!g_sym_inited) return -1;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
 
     uint32_t hash = fnv1a(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
@@ -232,7 +233,7 @@ int64_t td_sym_find(const char* str, size_t len) {
  * -------------------------------------------------------------------------- */
 
 td_t* td_sym_str(int64_t id) {
-    if (!g_sym_inited) return NULL;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return NULL;
     if (id < 0 || (uint32_t)id >= g_sym.str_count) return NULL;
     return g_sym.strings[id];
 }
@@ -242,6 +243,6 @@ td_t* td_sym_str(int64_t id) {
  * -------------------------------------------------------------------------- */
 
 uint32_t td_sym_count(void) {
-    if (!g_sym_inited) return 0;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return 0;
     return g_sym.str_count;
 }

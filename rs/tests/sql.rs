@@ -289,6 +289,44 @@ fn distinct() {
 }
 
 #[test]
+fn distinct_parenthesized_identifier() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(session.execute("SELECT DISTINCT(id1) FROM csv").unwrap());
+    assert_eq!(r.table.nrows(), 5);
+    assert_eq!(r.columns.len(), 1);
+}
+
+#[test]
+fn select_unknown_projection_column_errors() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let mut session = Session::new().unwrap();
+    session.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    session.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let err = match session.execute("SELECT b FROM t") {
+        Ok(_) => panic!("expected unknown projection column to error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("Column 'b' not found"));
+}
+
+#[test]
+fn projection_reorder_is_respected() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let mut session = Session::new().unwrap();
+    session.execute("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+    session.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+
+    let r = unwrap_query(session.execute("SELECT b, a FROM t").unwrap());
+    assert_eq!(r.columns.len(), 2);
+    assert_eq!(r.columns[0], "b");
+    assert_eq!(r.columns[1], "a");
+    assert_eq!(r.table.get_i64(0, 0).unwrap(), 2);
+    assert_eq!(r.table.get_i64(1, 0).unwrap(), 1);
+}
+
+#[test]
 fn count_star() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();

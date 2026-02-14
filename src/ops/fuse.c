@@ -22,6 +22,7 @@
  */
 
 #include "fuse.h"
+#include "mem/sys.h"
 #include <string.h>
 #include <teide/td.h>
 
@@ -41,14 +42,22 @@ static bool is_elementwise(uint16_t opcode) {
            (opcode >= OP_ADD && opcode <= OP_MAX2);
 }
 
-/* Count references to each node */
-static void count_refs(td_graph_t* g, td_op_t* node, uint32_t* ref_counts) {
-    if (!node) return;
-    ref_counts[node->id]++;
-    if (ref_counts[node->id] > 1) return;  /* already counted children */
-    for (int i = 0; i < node->arity && i < 2; i++) {
-        if (node->inputs[i])
-            count_refs(g, node->inputs[i], ref_counts);
+/* Count references to each node (iterative) */
+static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
+    if (!root) return;
+
+    uint32_t stack[256];
+    int sp = 0;
+    stack[sp++] = root->id;
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        td_op_t* n = &g->nodes[nid];
+        ref_counts[nid]++;
+        if (ref_counts[nid] > 1) continue;  /* already counted children */
+        for (int i = 0; i < n->arity && i < 2; i++) {
+            if (n->inputs[i] && sp < 256)
+                stack[sp++] = n->inputs[i]->id;
+        }
     }
 }
 
@@ -56,7 +65,14 @@ void td_fuse_pass(td_graph_t* g, td_op_t* root) {
     if (!g || !root || g->node_count == 0) return;
 
     uint32_t nc = g->node_count;
-    uint32_t ref_counts[nc];
+    uint32_t* ref_counts;
+    uint32_t ref_counts_stack[256];
+    if (nc <= 256) {
+        ref_counts = ref_counts_stack;
+    } else {
+        ref_counts = (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+        if (!ref_counts) return;
+    }
     memset(ref_counts, 0, nc * sizeof(uint32_t));
 
     count_refs(g, root, ref_counts);
@@ -80,4 +96,5 @@ void td_fuse_pass(td_graph_t* g, td_op_t* root) {
             n->flags |= OP_FLAG_FUSED;
         }
     }
+    if (nc > 256) td_sys_free(ref_counts);
 }

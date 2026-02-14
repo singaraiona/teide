@@ -100,6 +100,9 @@ td_arena_t* td_arena_create(size_t size) {
     if (idx < TD_ARENA_REGISTRY_CAP) {
         g_arena_registry[idx] = a;
         atomic_store_explicit(&g_arena_registry_len, idx + 1, memory_order_relaxed);
+    } else {
+        /* Registry full — cross-thread frees to this arena will leak.
+           Increase TD_ARENA_REGISTRY_CAP if this fires frequently. */
     }
     arena_registry_unlock();
 
@@ -469,6 +472,10 @@ void td_free(td_t* v) {
         do {
             old_head = atomic_load_explicit(&a->return_queue,
                                             memory_order_relaxed);
+            /* INVARIANT: next-pointer overlay clobbers bytes 0-7 of the block header
+               (nullmap[0..7]), but order (byte 17) and other header fields remain intact.
+               The drain path reads head->order after this overlay — safe as long as
+               td_t layout keeps order at offset >= 8. */
             *(td_t**)v = old_head;  /* reuse bytes 0-7 as next pointer */
         } while (!atomic_compare_exchange_weak_explicit(
                     &a->return_queue, &old_head, v,

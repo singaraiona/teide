@@ -26,6 +26,31 @@ INSERT INTO csv VALUES
 ('id005','id002','id0000000019',1,10,100,9,10,7.5),
 ('id005','id002','id0000000020',2,20,200,10,11,8.5)
 
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT(id1) FROM csv)
+----
+5
+
+statement ok
+CREATE TABLE onecol (a INTEGER)
+
+statement ok
+INSERT INTO onecol VALUES (1)
+
+statement error
+SELECT b FROM onecol
+
+statement ok
+CREATE TABLE twocol (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO twocol VALUES (1, 2)
+
+query II
+SELECT b, a FROM twocol
+----
+2 1
+
 statement error
 SELECT 'x' AS s FROM csv
 

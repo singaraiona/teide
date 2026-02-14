@@ -1267,6 +1267,8 @@ pub fn expr_default_name(expr: &Expr) -> String {
             // Return just the column name, not the full qualified name
             parts.last().map(|p| p.value.to_lowercase()).unwrap_or_default()
         }
+        // Parenthesized identifiers should keep the underlying column name.
+        Expr::Nested(inner) => expr_default_name(inner),
         _ => format!("{expr}").to_lowercase(),
     }
 }

@@ -25,9 +25,6 @@
 #include "arena.h"
 #include <stdatomic.h>
 
-/* Defined in arena.c (non-static). 0 = sequential, 1 = parallel. */
-extern _Atomic(uint32_t) td_parallel_flag;
-
 /* --------------------------------------------------------------------------
  * td_retain
  * -------------------------------------------------------------------------- */
@@ -43,12 +40,7 @@ void td_retain(td_t* v) {
 
 void td_release(td_t* v) {
     if (!v || TD_IS_ERR(v)) return;
-    uint32_t prev;
-    if (TD_LIKELY(!td_parallel_flag)) {
-        prev = atomic_fetch_sub_explicit(&v->rc, 1, memory_order_relaxed);
-    } else {
-        prev = atomic_fetch_sub_explicit(&v->rc, 1, memory_order_acq_rel);
-    }
+    uint32_t prev = atomic_fetch_sub_explicit(&v->rc, 1, memory_order_acq_rel);
     if (prev == 1) td_free(v);
 }
 

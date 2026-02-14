@@ -1,0 +1,146 @@
+Start testing: Feb 14 17:31 CET
+----------------------------------------------------------
+1/1 Testing: test_teide
+1/1 Test: test_teide
+Command: "/home/hetoku/data/work/teide/build-audit/test_teide"
+Directory: /home/hetoku/data/work/teide/build-audit
+"test_teide" start time: Feb 14 17:31 CET
+Output:
+----------------------------------------------------------
+
+Running tests...
+  /err/str_ok                                                  [ OK ]
+  /err/str_all                                                 [ OK ]
+  /err/str_unknown                                             [ OK ]
+  /err/ptr_encoding                                            [ OK ]
+  /err/valid_ptr_not_err                                       [ OK ]
+  /block/type_macros                                           [ OK ]
+  /block/td_data                                               [ OK ]
+  /block/elem_size                                             [ OK ]
+  /block/block_size_atom                                       [ OK ]
+  /block/block_size_vec                                        [ OK ]
+  /block/block_size_bool                                       [ OK ]
+  /block/block_size_empty                                      [ OK ]
+  /block/td_t_size                                             [ OK ]
+  /buddy/alloc_basic                                           [ OK ]
+  /buddy/alloc_small_atom                                      [ OK ]
+  /buddy/alloc_medium_vec                                      [ OK ]
+  /buddy/alloc_large                                           [ OK ]
+  /buddy/header_zeroed                                         [ OK ]
+  /buddy/small_reuse                                           [ OK ]
+  /buddy/arena_growth                                          [ OK ]
+  /buddy/mem_stats                                             [ OK ]
+  /buddy/coalescing                                            [ OK ]
+  /buddy/alloc_copy                                            [ OK ]
+  /buddy/alloc_free_cycles                                     [ OK ]
+  /buddy/various_sizes                                         [ OK ]
+  /buddy/order_for_size                                        [ OK ]
+  /cow/retain_release                                          [ OK ]
+  /cow/cow_sole_owner                                          [ OK ]
+  /cow/cow_shared                                              [ OK ]
+  /cow/null_error_safety                                       [ OK ]
+  /cow/cow_vector                                              [ OK ]
+  /atom/bool                                                   [ OK ]
+  /atom/u8                                                     [ OK ]
+  /atom/char                                                   [ OK ]
+  /atom/i16                                                    [ OK ]
+  /atom/i32                                                    [ OK ]
+  /atom/i64                                                    [ OK ]
+  /atom/f64                                                    [ OK ]
+  /atom/str_sso                                                [ OK ]
+  /atom/str_long                                               [ OK ]
+  /atom/sym                                                    [ OK ]
+  /atom/enum                                                   [ OK ]
+  /atom/date                                                   [ OK ]
+  /atom/time                                                   [ OK ]
+  /atom/timestamp                                              [ OK ]
+  /atom/guid                                                   [ OK ]
+  /atom/is_atom                                                [ OK ]
+  /vec/new                                                     [ OK ]
+  /vec/new_invalid                                             [ OK ]
+  /vec/append                                                  [ OK ]
+  /vec/get                                                     [ OK ]
+  /vec/set                                                     [ OK ]
+  /vec/from_raw                                                [ OK ]
+  /vec/slice_basic                                             [ OK ]
+  /vec/slice_access                                            [ OK ]
+  /vec/concat                                                  [ OK ]
+  /vec/null_inline                                             [ OK ]
+  /vec/null_external                                           [ OK ]
+  /vec/slice_release_parent_ref                                [ OK ]
+  /vec/null_external_release_ext_ref                           [ OK ]
+  /vec/append_grow                                             [ OK ]
+  /vec/type_correctness                                        [ OK ]
+  /vec/empty                                                   [ OK ]
+  /vec/bool                                                    [ OK ]
+  /vec/concat_type_mismatch                                    [ OK ]
+  /vec/slice_range                                             [ OK ]
+  /str/ptr_sso                                                 [ OK ]
+  /str/ptr_long                                                [ OK ]
+  /str/len                                                     [ OK ]
+  /str/cmp_equal                                               [ OK ]
+  /str/cmp_different                                           [ OK ]
+  /str/cmp_prefix                                              [ OK ]
+  /list/new                                                    [ OK ]
+  /list/append_get                                             [ OK ]
+  /list/set                                                    [ OK ]
+  /list/grow                                                   [ OK ]
+  /list/empty                                                  [ OK ]
+  /list/mixed_types                                            [ OK ]
+  /list/release_drops_item_ref                                 [ OK ]
+  /morsel/init                                                 [ OK ]
+  /morsel/single                                               [ OK ]
+  /morsel/exact                                                [ OK ]
+  /morsel/multiple                                             [ OK ]
+  /morsel/empty                                                [ OK ]
+  /morsel/data_access                                          [ OK ]
+  /morsel/f64                                                  [ OK ]
+  /morsel/bool                                                 [ OK ]
+  /sym/init_destroy                                            [ OK ]
+  /sym/intern_basic                                            [ OK ]
+  /sym/intern_duplicate                                        [ OK ]
+  /sym/find_existing                                           [ OK ]
+  /sym/find_missing                                            [ OK ]
+  /sym/str_roundtrip                                           [ OK ]
+  /sym/count                                                   [ OK ]
+  /sym/many                                                    [ OK ]
+  /table/new                                                   [ OK ]
+  /table/add_col                                               [ OK ]
+  /table/get_col_by_name                                       [ OK ]
+  /table/get_col_by_idx                                        [ OK ]
+  /table/col_name                                              [ OK ]
+  /table/nrows                                                 [ OK ]
+  /table/schema                                                [ OK ]
+  /table/multiple_cols                                         [ OK ]
+  /table/realloc_preserves_all_cols                            [ OK ]
+  /table/release_drops_col_ref                                 [ OK ]
+  /graph/lifecycle                                             [ OK ]
+  /graph/scan_sum                                              [ OK ]
+  /graph/filter_count                                          [ OK ]
+  /graph/arithmetic                                            [ OK ]
+  /graph/group_sum                                             [ OK ]
+  /graph/opt_fold                                              [ OK ]
+  /graph/opt_filter_const                                      [ OK ]
+  /graph/group_affine_agg                                      /home/hetoku/data/work/teide/src/ops/exec.c:4303:11: runtime error: variable length array bound evaluates to non-positive value 0
+/home/hetoku/data/work/teide/src/ops/exec.c:4306:13: runtime error: variable length array bound evaluates to non-positive value 0
+/home/hetoku/data/work/teide/src/ops/exec.c:4410:11: runtime error: variable length array bound evaluates to non-positive value 0
+/home/hetoku/data/work/teide/src/ops/exec.c:4411:12: runtime error: variable length array bound evaluates to non-positive value 0
+[ OK ]
+  /pool/parallel_sum                                           /home/hetoku/data/work/teide/src/ops/exec.c:1325:25: runtime error: signed integer overflow: 24581 * 364940025027280920 cannot be represented in type 'long int'
+[ OK ]
+  /pool/parallel_add                                           [ OK ]
+  /pool/parallel_group_sum                                     [ OK ]
+  /pool/parallel_min_max                                       [ OK ]
+  /pool/cancel                                                 [ OK ]
+
+118 of 118 tests passed
+
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_teide" end time: Feb 14 17:31 CET
+"test_teide" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Feb 14 17:31 CET

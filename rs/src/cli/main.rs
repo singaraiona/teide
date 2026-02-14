@@ -84,7 +84,7 @@ fn run_single_query(sql: &str) {
             std::process::exit(1);
         }
     };
-    match teide_db::execute_sql(&ctx, sql) {
+    match teide::sql::execute_sql(&ctx, sql) {
         Ok(result) => print_result(&result, &OutputFormat::Table),
         Err(e) => {
             eprintln!("{}Error: {e}{}", theme::ERROR, theme::R);
@@ -98,7 +98,7 @@ fn run_sql_file(path: &PathBuf) {
         eprintln!("Error reading {}: {e}", path.display());
         std::process::exit(1);
     });
-    let mut session = match teide_db::Session::new() {
+    let mut session = match teide::sql::Session::new() {
         Ok(session) => session,
         Err(e) => {
             eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
@@ -111,10 +111,10 @@ fn run_sql_file(path: &PathBuf) {
             continue;
         }
         match session.execute(sql) {
-            Ok(teide_db::ExecResult::Query(result)) => {
+            Ok(teide::sql::ExecResult::Query(result)) => {
                 print_result(&result, &OutputFormat::Table);
             }
-            Ok(teide_db::ExecResult::Ddl(msg)) => {
+            Ok(teide::sql::ExecResult::Ddl(msg)) => {
                 println!("{}{msg}{}", theme::SUCCESS, theme::R)
             }
             Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
@@ -123,7 +123,7 @@ fn run_sql_file(path: &PathBuf) {
 }
 
 fn run_repl(preload_csv: Option<&str>) {
-    let mut session = match teide_db::Session::new() {
+    let mut session = match teide::sql::Session::new() {
         Ok(session) => session,
         Err(e) => {
             eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
@@ -136,7 +136,7 @@ fn run_repl(preload_csv: Option<&str>) {
     if let Some(csv_path) = preload_csv {
         let sql = format!("CREATE TABLE t AS SELECT * FROM '{csv_path}'");
         match session.execute(&sql) {
-            Ok(teide_db::ExecResult::Ddl(msg)) => println!("{msg}"),
+            Ok(teide::sql::ExecResult::Ddl(msg)) => println!("{msg}"),
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Error loading {csv_path}: {e}");
@@ -236,7 +236,7 @@ fn run_repl(preload_csv: Option<&str>) {
 
                 let start = std::time::Instant::now();
                 match session.execute(sql) {
-                    Ok(teide_db::ExecResult::Query(result)) => {
+                    Ok(teide::sql::ExecResult::Query(result)) => {
                         let elapsed = start.elapsed();
                         update_columns(&comp_updater, &result);
                         print_result(&result, &format);
@@ -249,7 +249,7 @@ fn run_repl(preload_csv: Option<&str>) {
                             );
                         }
                     }
-                    Ok(teide_db::ExecResult::Ddl(msg)) => {
+                    Ok(teide::sql::ExecResult::Ddl(msg)) => {
                         let elapsed = start.elapsed();
                         println!("{}{msg}{}", theme::SUCCESS, theme::R);
                         update_tables(&comp_updater, &session);
@@ -279,7 +279,7 @@ fn run_repl(preload_csv: Option<&str>) {
 // Completer updates (via shared Arc<Mutex<>> state)
 // ---------------------------------------------------------------------------
 
-fn update_columns(updater: &CompletionUpdater, result: &teide_db::SqlResult) {
+fn update_columns(updater: &CompletionUpdater, result: &teide::sql::SqlResult) {
     let table = &result.table;
     let ncols = table.ncols() as usize;
     let mut columns = Vec::with_capacity(ncols);
@@ -297,7 +297,7 @@ fn update_columns(updater: &CompletionUpdater, result: &teide_db::SqlResult) {
     updater.set_columns(columns);
 }
 
-fn update_tables(updater: &CompletionUpdater, session: &teide_db::Session) {
+fn update_tables(updater: &CompletionUpdater, session: &teide::sql::Session) {
     let names = session.table_names();
     let tables: Vec<TableInfo> = names
         .iter()
@@ -316,7 +316,7 @@ fn update_tables(updater: &CompletionUpdater, session: &teide_db::Session) {
 // Column index resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_col_indices(result: &teide_db::SqlResult) -> Vec<usize> {
+fn resolve_col_indices(result: &teide::sql::SqlResult) -> Vec<usize> {
     let table = &result.table;
     let ncols = table.ncols() as usize;
 
@@ -349,7 +349,7 @@ fn resolve_col_indices(result: &teide_db::SqlResult) -> Vec<usize> {
 // Output formatting
 // ---------------------------------------------------------------------------
 
-fn print_result(result: &teide_db::SqlResult, format: &OutputFormat) {
+fn print_result(result: &teide::sql::SqlResult, format: &OutputFormat) {
     match format {
         OutputFormat::Table => print_table(result),
         OutputFormat::Csv => print_csv(result),
@@ -373,7 +373,7 @@ fn type_name(typ: i8) -> &'static str {
     }
 }
 
-fn print_table(result: &teide_db::SqlResult) {
+fn print_table(result: &teide::sql::SqlResult) {
     use std::fmt::Write;
     use std::io::Write as IoWrite;
     use theme::*;
@@ -589,7 +589,7 @@ fn print_table(result: &teide_db::SqlResult) {
     let _ = lock.write_all(out.as_bytes());
 }
 
-fn print_csv(result: &teide_db::SqlResult) {
+fn print_csv(result: &teide::sql::SqlResult) {
     let table = &result.table;
     let col_indices = resolve_col_indices(result);
 
@@ -615,7 +615,7 @@ fn print_csv(result: &teide_db::SqlResult) {
     }
 }
 
-fn print_json(result: &teide_db::SqlResult) {
+fn print_json(result: &teide::sql::SqlResult) {
     let table = &result.table;
     let nrows = table.nrows() as usize;
     let col_indices = resolve_col_indices(result);
@@ -725,7 +725,7 @@ fn handle_dot_command(
     cmd: &str,
     format: &mut OutputFormat,
     timer: &mut bool,
-    session: &teide_db::Session,
+    session: &teide::sql::Session,
 ) {
     use theme::*;
 

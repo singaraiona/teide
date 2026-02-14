@@ -20,13 +20,14 @@
 //   SOFTWARE.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
+    // --- Compile the C engine ---
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src_dir = manifest_dir.join("../../src");
-    let include_dir = manifest_dir.join("../../include");
+    let src_dir = manifest_dir.join("../src");
+    let include_dir = manifest_dir.join("../include");
 
-    // Collect all .c files recursively under src/
     let c_files: Vec<PathBuf> = walkdir(&src_dir);
 
     let mut build = cc::Build::new();
@@ -44,7 +45,6 @@ fn main() {
 
     build.compile("teide");
 
-    // Link system libraries on Linux/Unix
     if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=pthread");
@@ -52,6 +52,19 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", src_dir.display());
     println!("cargo:rerun-if-changed={}", include_dir.display());
+
+    // --- Embed git commit hash for CLI banner ---
+    let hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=GIT_HASH={}", hash.trim());
+
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/heads/");
 }
 
 /// Recursively collect all `.c` files under `dir`.

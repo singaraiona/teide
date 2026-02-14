@@ -19,7 +19,7 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-// teide-sys: Raw FFI bindings to the Teide C17 engine
+// Raw FFI bindings to the Teide C17 engine
 // Hand-written from include/teide/td.h
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 

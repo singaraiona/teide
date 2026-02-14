@@ -81,8 +81,8 @@ def _find_lib():
 
     # 3. Source-tree build directories
     search_dirs = [
-        os.path.join(_pkg_dir, "..", "..", "..", "build_release"),
-        os.path.join(_pkg_dir, "..", "..", "..", "build"),
+        os.path.join(_pkg_dir, "..", "..", "build_release"),
+        os.path.join(_pkg_dir, "..", "..", "build"),
         ".",
     ]
     for d in search_dirs:

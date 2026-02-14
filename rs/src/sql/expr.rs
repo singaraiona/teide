@@ -29,9 +29,9 @@ use sqlparser::ast::{
     WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
-use teide::{AggOp, Column, FrameBound, FrameType, Graph, WindowFunc};
+use crate::{AggOp, Column, FrameBound, FrameType, Graph, WindowFunc};
 
-use crate::SqlError;
+use super::SqlError;
 
 /// Recursively plan a scalar expression into a Teide DAG column node.
 pub fn plan_expr(
@@ -332,15 +332,15 @@ pub fn plan_expr(
 /// Map sqlparser DateTimeField to Teide extract_field constants.
 fn map_datetime_field(field: &DateTimeField) -> Result<i64, SqlError> {
     match field {
-        DateTimeField::Year => Ok(teide::extract_field::YEAR),
-        DateTimeField::Month => Ok(teide::extract_field::MONTH),
-        DateTimeField::Day => Ok(teide::extract_field::DAY),
-        DateTimeField::Hour => Ok(teide::extract_field::HOUR),
-        DateTimeField::Minute => Ok(teide::extract_field::MINUTE),
-        DateTimeField::Second => Ok(teide::extract_field::SECOND),
-        DateTimeField::Dow | DateTimeField::DayOfWeek => Ok(teide::extract_field::DOW),
-        DateTimeField::Doy | DateTimeField::DayOfYear => Ok(teide::extract_field::DOY),
-        DateTimeField::Epoch => Ok(teide::extract_field::EPOCH),
+        DateTimeField::Year => Ok(crate::extract_field::YEAR),
+        DateTimeField::Month => Ok(crate::extract_field::MONTH),
+        DateTimeField::Day => Ok(crate::extract_field::DAY),
+        DateTimeField::Hour => Ok(crate::extract_field::HOUR),
+        DateTimeField::Minute => Ok(crate::extract_field::MINUTE),
+        DateTimeField::Second => Ok(crate::extract_field::SECOND),
+        DateTimeField::Dow | DateTimeField::DayOfWeek => Ok(crate::extract_field::DOW),
+        DateTimeField::Doy | DateTimeField::DayOfYear => Ok(crate::extract_field::DOY),
+        DateTimeField::Epoch => Ok(crate::extract_field::EPOCH),
         _ => Err(SqlError::Plan(format!(
             "Unsupported EXTRACT field: {field}"
         ))),
@@ -400,7 +400,7 @@ fn plan_scalar_function(
             let a = plan_expr(g, &args[0], schema)?;
             // Helper: round_val = IF(val >= 0, FLOOR(val + 0.5), CEIL(val - 0.5))
             // This handles negative numbers correctly (banker's-style half-away-from-zero)
-            let build_round = |g: &mut teide::Graph, val: teide::Column| {
+            let build_round = |g: &mut crate::Graph, val: crate::Column| {
                 let zero = g.const_f64(0.0);
                 let half = g.const_f64(0.5);
                 let cond = g.ge(val, zero);
@@ -611,32 +611,32 @@ fn plan_scalar_function(
                     let diff = g.sub(end, start);
                     let divisor = g.const_i64(1_000_000);
                     let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                    Ok(g.cast(g.floor(fv), crate::types::I64))
                 }
                 "minute" => {
                     let diff = g.sub(end, start);
                     let divisor = g.const_i64(60_000_000);
                     let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                    Ok(g.cast(g.floor(fv), crate::types::I64))
                 }
                 "hour" => {
                     let diff = g.sub(end, start);
                     let divisor = g.const_i64(3_600_000_000);
                     let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                    Ok(g.cast(g.floor(fv), crate::types::I64))
                 }
                 "day" => {
                     let diff = g.sub(end, start);
                     let divisor = g.const_i64(86_400_000_000);
                     let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), teide::types::I64))
+                    Ok(g.cast(g.floor(fv), crate::types::I64))
                 }
                 "month" => {
                     // (year2*12+month2) - (year1*12+month1)
-                    let y1 = g.extract(start, teide::extract_field::YEAR);
-                    let m1 = g.extract(start, teide::extract_field::MONTH);
-                    let y2 = g.extract(end, teide::extract_field::YEAR);
-                    let m2 = g.extract(end, teide::extract_field::MONTH);
+                    let y1 = g.extract(start, crate::extract_field::YEAR);
+                    let m1 = g.extract(start, crate::extract_field::MONTH);
+                    let y2 = g.extract(end, crate::extract_field::YEAR);
+                    let m2 = g.extract(end, crate::extract_field::MONTH);
                     let twelve = g.const_i64(12);
                     let twelve2 = g.const_i64(12);
                     let ym1 = g.add(g.mul(y1, twelve), m1);
@@ -644,8 +644,8 @@ fn plan_scalar_function(
                     Ok(g.sub(ym2, ym1))
                 }
                 "year" => {
-                    let y1 = g.extract(start, teide::extract_field::YEAR);
-                    let y2 = g.extract(end, teide::extract_field::YEAR);
+                    let y1 = g.extract(start, crate::extract_field::YEAR);
+                    let y2 = g.extract(end, crate::extract_field::YEAR);
                     Ok(g.sub(y2, y1))
                 }
                 _ => Err(SqlError::Plan(format!(
@@ -672,15 +672,15 @@ fn parse_field_arg(arg: &Expr) -> Result<String, SqlError> {
 /// Resolve a field name string to a Teide extract_field constant.
 fn resolve_field_name(name: &str) -> Result<i64, SqlError> {
     match name {
-        "year" => Ok(teide::extract_field::YEAR),
-        "month" => Ok(teide::extract_field::MONTH),
-        "day" => Ok(teide::extract_field::DAY),
-        "hour" => Ok(teide::extract_field::HOUR),
-        "minute" => Ok(teide::extract_field::MINUTE),
-        "second" => Ok(teide::extract_field::SECOND),
-        "dow" | "dayofweek" => Ok(teide::extract_field::DOW),
-        "doy" | "dayofyear" => Ok(teide::extract_field::DOY),
-        "epoch" => Ok(teide::extract_field::EPOCH),
+        "year" => Ok(crate::extract_field::YEAR),
+        "month" => Ok(crate::extract_field::MONTH),
+        "day" => Ok(crate::extract_field::DAY),
+        "hour" => Ok(crate::extract_field::HOUR),
+        "minute" => Ok(crate::extract_field::MINUTE),
+        "second" => Ok(crate::extract_field::SECOND),
+        "dow" | "dayofweek" => Ok(crate::extract_field::DOW),
+        "doy" | "dayofyear" => Ok(crate::extract_field::DOY),
+        "epoch" => Ok(crate::extract_field::EPOCH),
         _ => Err(SqlError::Plan(format!(
             "Unsupported date/time field: {name}"
         ))),
@@ -729,20 +729,20 @@ fn check_arg_count(name: &str, args: &[Expr], expected: usize) -> Result<(), Sql
 
 fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
     match dt {
-        DataType::Boolean | DataType::Bool => Ok(teide::types::BOOL),
+        DataType::Boolean | DataType::Bool => Ok(crate::types::BOOL),
         DataType::Int(None) | DataType::Integer(None) | DataType::Int4(_) => {
-            Ok(teide::types::I32)
+            Ok(crate::types::I32)
         }
-        DataType::BigInt(None) | DataType::Int8(_) | DataType::Int64 => Ok(teide::types::I64),
+        DataType::BigInt(None) | DataType::Int8(_) | DataType::Int64 => Ok(crate::types::I64),
         DataType::Float(None)
         | DataType::Float64
         | DataType::Double
         | DataType::DoublePrecision
-        | DataType::Real => Ok(teide::types::F64),
-        DataType::Varchar(_) | DataType::Text | DataType::String(_) => Ok(teide::types::STR),
-        DataType::Date => Ok(teide::types::DATE),
-        DataType::Time(_, _) => Ok(teide::types::TIME),
-        DataType::Timestamp(_, _) => Ok(teide::types::TIMESTAMP),
+        | DataType::Real => Ok(crate::types::F64),
+        DataType::Varchar(_) | DataType::Text | DataType::String(_) => Ok(crate::types::STR),
+        DataType::Date => Ok(crate::types::DATE),
+        DataType::Time(_, _) => Ok(crate::types::TIME),
+        DataType::Timestamp(_, _) => Ok(crate::types::TIMESTAMP),
         _ => Err(SqlError::Plan(format!("Unsupported CAST target type: {dt}"))),
     }
 }
@@ -1176,13 +1176,13 @@ pub fn plan_agg_input(
             }
             AggOp::Sum => {
                 // Zero-fill filtered rows (0 is neutral for addition)
-                let input_f64 = g.cast(input, teide::types::F64);
+                let input_f64 = g.cast(input, crate::types::F64);
                 let zero = g.const_f64(0.0);
                 Ok((op, g.if_then_else(pred, input_f64, zero)))
             }
             AggOp::Min | AggOp::Max => {
                 // NaN-fill filtered rows (NaN loses all < and > comparisons)
-                let input_f64 = g.cast(input, teide::types::F64);
+                let input_f64 = g.cast(input, crate::types::F64);
                 let nan = g.const_f64(f64::NAN);
                 Ok((op, g.if_then_else(pred, input_f64, nan)))
             }

@@ -28,7 +28,7 @@ pub mod expr;
 pub mod planner;
 
 use std::collections::HashMap;
-use teide::{Context, Table};
+use crate::{Context, Table};
 
 /// Errors produced by the SQL layer.
 #[derive(Debug)]
@@ -38,7 +38,7 @@ pub enum SqlError {
     /// Planning error (unknown column, unsupported feature, etc.).
     Plan(String),
     /// Teide engine execution error.
-    Engine(teide::Error),
+    Engine(crate::Error),
 }
 
 impl std::fmt::Display for SqlError {
@@ -60,8 +60,8 @@ impl std::error::Error for SqlError {
     }
 }
 
-impl From<teide::Error> for SqlError {
-    fn from(err: teide::Error) -> Self {
+impl From<crate::Error> for SqlError {
+    fn from(err: crate::Error) -> Self {
         SqlError::Engine(err)
     }
 }

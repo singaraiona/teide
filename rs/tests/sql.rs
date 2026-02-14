@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
-use teide_db::{ExecResult, Session, SqlResult};
+use teide::sql::{ExecResult, Session, SqlResult};
 
 // The C engine uses global state — serialize all tests.
 static ENGINE_LOCK: Mutex<()> = Mutex::new(());

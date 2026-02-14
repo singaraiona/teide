@@ -19,20 +19,15 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-use std::process::Command;
+//! teide: Fast columnar computation engine powered by a zero-dependency C17 core.
+//!
+//! Provides safe Rust wrappers around the C engine, plus a SQL parser/planner.
 
-fn main() {
-    // Embed short git commit hash
-    let hash = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=GIT_HASH={}", hash.trim());
+pub mod ffi;
+pub mod engine;
+pub mod sql;
 
-    // Rebuild when HEAD changes (new commit or branch switch)
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/heads/");
-}
+// Re-export everything from engine at crate root
+pub use engine::*;
+// Re-export sql module types
+pub use sql::{Session, SqlResult, ExecResult, SqlError, execute_sql};

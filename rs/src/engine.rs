@@ -19,27 +19,17 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! teide: Safe Rust wrappers for the Teide C17 columnar table engine.
+//! Safe Rust wrappers for the Teide C17 columnar table engine.
 //!
 //! Provides idiomatic, safe types around the raw FFI layer.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// Force linkage of the Teide C static library via teide-sys's build script.
-extern crate teide_sys;
-
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-// ---------------------------------------------------------------------------
-// FFI bridge backed by `teide-sys`.
-// ---------------------------------------------------------------------------
-
-#[allow(non_camel_case_types, dead_code)]
-mod ffi {
-    pub use teide_sys::*;
-}
+use crate::ffi;
 
 // ---------------------------------------------------------------------------
 // Public API types

@@ -1,0 +1,42 @@
+[package]
+name = "teide"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/singaraiona/teide"
+description = "Fast columnar computation engine powered by a zero-dependency C17 core"
+readme = "../README.md"
+keywords = ["dataframe", "columnar", "analytics"]
+categories = ["database", "science"]
+links = "teide"
+
+[features]
+default = []
+cli = ["reedline", "clap", "nu-ansi-term"]
+
+[dependencies]
+sqlparser = { version = "0.53", features = ["visitor"] }
+
+[dependencies.reedline]
+version = "0.45"
+optional = true
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.nu-ansi-term]
+version = "0.50"
+optional = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "teide"
+path = "src/cli/main.rs"
+required-features = ["cli"]

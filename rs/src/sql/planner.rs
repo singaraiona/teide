@@ -24,8 +24,9 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName,
-    ObjectType, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
+    BinaryOperator, ColumnDef, DataType, Distinct, Expr, GroupByExpr, Ident, Insert,
+    JoinConstraint, JoinOperator, ObjectName, ObjectType, Query, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins, UnaryOperator, Value, Values,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -63,10 +64,6 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
         }
 
         Statement::CreateTable(create) => {
-            let query = create
-                .query
-                .ok_or_else(|| SqlError::Plan("CREATE TABLE requires AS SELECT".into()))?;
-
             let table_name = object_name_to_string(&create.name).to_lowercase();
 
             if session.tables.contains_key(&table_name) && !create.or_replace {
@@ -80,23 +77,41 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
                 )));
             }
 
-            let result = plan_query(&session.ctx, &query, Some(&session.tables))?;
-            let nrows = result.table.nrows();
-            let ncols = result.columns.len();
+            if let Some(query) = &create.query {
+                // CREATE TABLE ... AS SELECT
+                let result = plan_query(&session.ctx, query, Some(&session.tables))?;
+                let nrows = result.table.nrows();
+                let ncols = result.columns.len();
 
-            // Rename table columns to match SQL aliases so downstream scans work
-            let table = result.table.with_column_names(&result.columns)?;
-            session.tables.insert(
-                table_name.clone(),
-                StoredTable {
-                    table,
-                    columns: result.columns,
-                },
-            );
+                let table = result.table.with_column_names(&result.columns)?;
+                session.tables.insert(
+                    table_name.clone(),
+                    StoredTable {
+                        table,
+                        columns: result.columns,
+                    },
+                );
 
-            Ok(ExecResult::Ddl(format!(
-                "Created table '{table_name}' ({nrows} rows, {ncols} cols)"
-            )))
+                Ok(ExecResult::Ddl(format!(
+                    "Created table '{table_name}' ({nrows} rows, {ncols} cols)"
+                )))
+            } else if !create.columns.is_empty() {
+                // CREATE TABLE t (col1 TYPE, col2 TYPE, ...)
+                let (table, columns) = create_empty_table(&create.columns)?;
+                let ncols = columns.len();
+                session.tables.insert(
+                    table_name.clone(),
+                    StoredTable { table, columns },
+                );
+
+                Ok(ExecResult::Ddl(format!(
+                    "Created table '{table_name}' (0 rows, {ncols} cols)"
+                )))
+            } else {
+                Err(SqlError::Plan(
+                    "CREATE TABLE requires column definitions or AS SELECT".into(),
+                ))
+            }
         }
 
         Statement::Drop {
@@ -119,10 +134,395 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
             Ok(ExecResult::Ddl(msgs.join("\n")))
         }
 
+        Statement::Insert(insert) => plan_insert(session, &insert),
+
         _ => Err(SqlError::Plan(
-            "Only SELECT, CREATE TABLE AS, and DROP TABLE are supported".into(),
+            "Only SELECT, CREATE TABLE AS, DROP TABLE, and INSERT INTO are supported".into(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// CREATE TABLE (col TYPE, ...) — bare table creation with schema
+// ---------------------------------------------------------------------------
+
+/// Map a SQL DataType to a Teide type tag.
+fn sql_type_to_td(dt: &DataType) -> Result<i8, SqlError> {
+    use crate::ffi;
+    match dt {
+        DataType::Int(_) | DataType::Integer(_) | DataType::BigInt(_)
+        | DataType::SmallInt(_) | DataType::TinyInt(_) => Ok(ffi::TD_I64),
+        DataType::Real | DataType::Float(_) | DataType::Double | DataType::DoublePrecision
+        | DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => Ok(ffi::TD_F64),
+        DataType::Boolean => Ok(ffi::TD_BOOL),
+        DataType::Varchar(_) | DataType::Text | DataType::Char(_)
+        | DataType::CharVarying(_) | DataType::String(_) => Ok(ffi::TD_SYM),
+        _ => Err(SqlError::Plan(format!(
+            "CREATE TABLE: unsupported column type {dt}"
+        ))),
+    }
+}
+
+/// Create an empty table from column definitions.
+fn create_empty_table(columns: &[ColumnDef]) -> Result<(Table, Vec<String>), SqlError> {
+    let ncols = columns.len();
+    if ncols == 0 {
+        return Err(SqlError::Plan("CREATE TABLE: no columns defined".into()));
+    }
+
+    let mut col_names = Vec::with_capacity(ncols);
+    let mut builder = RawTableBuilder::new(ncols as i64)?;
+
+    for col_def in columns {
+        let name = col_def.name.value.to_lowercase();
+        let typ = sql_type_to_td(&col_def.data_type)?;
+
+        // Create an empty vector with capacity 0
+        let vec = unsafe { crate::raw::td_vec_new(typ, 0) };
+        if vec.is_null() {
+            return Err(SqlError::Engine(crate::Error::Oom));
+        }
+        if crate::ffi_is_err(vec) {
+            return Err(engine_err_from_raw(vec));
+        }
+
+        let name_id = crate::sym_intern(&name);
+        let res = builder.add_col(name_id, vec);
+        unsafe { crate::ffi_release(vec) };
+        res?;
+
+        col_names.push(name);
+    }
+
+    let table = builder.finish()?;
+    Ok((table, col_names))
+}
+
+// ---------------------------------------------------------------------------
+// INSERT INTO
+// ---------------------------------------------------------------------------
+
+fn plan_insert(session: &mut Session, insert: &Insert) -> Result<ExecResult, SqlError> {
+    let table_name = object_name_to_string(&insert.table_name).to_lowercase();
+
+    let stored = session.tables.get(&table_name).ok_or_else(|| {
+        SqlError::Plan(format!("Table '{table_name}' not found"))
+    })?;
+
+    let target_types: Vec<i8> = (0..stored.table.ncols())
+        .map(|c| stored.table.col_type(c as usize))
+        .collect();
+    let target_cols = stored.columns.clone();
+
+    let source_query = insert.source.as_ref().ok_or_else(|| {
+        SqlError::Plan("INSERT INTO requires VALUES or SELECT".into())
+    })?;
+
+    // Build source table from VALUES or SELECT
+    let (source_table, source_cols) = match source_query.body.as_ref() {
+        SetExpr::Values(values) => {
+            let tbl = build_table_from_values(values, &target_types, &target_cols)?;
+            let cols = target_cols.clone();
+            (tbl, cols)
+        }
+        _ => {
+            // Treat as a subquery (SELECT ...)
+            let result = plan_query(&session.ctx, source_query, Some(&session.tables))?;
+            (result.table, result.columns)
+        }
+    };
+
+    // Handle optional column list reordering
+    let source_table = if !insert.columns.is_empty() {
+        reorder_insert_columns(&insert.columns, &target_cols, &target_types, &source_table, &source_cols)?
+    } else {
+        if source_table.ncols() != stored.table.ncols() {
+            return Err(SqlError::Plan(format!(
+                "INSERT INTO: source has {} columns but target '{}' has {}",
+                source_table.ncols(), table_name, stored.table.ncols()
+            )));
+        }
+        source_table
+    };
+
+    let nrows = source_table.nrows();
+
+    // Concatenate with existing table
+    let existing = &stored.table;
+    let merged = concat_tables(&session.ctx, existing, &source_table)?;
+
+    // Rename columns to match target schema
+    let merged = merged.with_column_names(&target_cols)?;
+
+    session.tables.insert(
+        table_name.clone(),
+        StoredTable {
+            table: merged,
+            columns: target_cols,
+        },
+    );
+
+    Ok(ExecResult::Ddl(format!(
+        "Inserted {nrows} rows into '{table_name}'"
+    )))
+}
+
+/// Build a Table from VALUES (...), (...) literal rows.
+fn build_table_from_values(
+    values: &Values,
+    target_types: &[i8],
+    target_cols: &[String],
+) -> Result<Table, SqlError> {
+    let nrows = values.rows.len();
+    let ncols = target_types.len();
+
+    if nrows == 0 {
+        return Err(SqlError::Plan("INSERT INTO: empty VALUES".into()));
+    }
+
+    // Validate row widths
+    for (i, row) in values.rows.iter().enumerate() {
+        if row.len() != ncols {
+            return Err(SqlError::Plan(format!(
+                "INSERT INTO: row {} has {} values but expected {}",
+                i, row.len(), ncols
+            )));
+        }
+    }
+
+    // Create column vectors
+    let mut col_vecs: Vec<*mut crate::td_t> = Vec::with_capacity(ncols);
+    for &typ in target_types {
+        let vec = unsafe { crate::raw::td_vec_new(typ, nrows as i64) };
+        if vec.is_null() {
+            // Release already-allocated vectors
+            for v in &col_vecs {
+                unsafe { crate::ffi_release(*v) };
+            }
+            return Err(SqlError::Engine(crate::Error::Oom));
+        }
+        if crate::ffi_is_err(vec) {
+            for v in &col_vecs {
+                unsafe { crate::ffi_release(*v) };
+            }
+            return Err(engine_err_from_raw(vec));
+        }
+        col_vecs.push(vec);
+    }
+
+    // Fill column data
+    for row in &values.rows {
+        for (c, expr) in row.iter().enumerate() {
+            let typ = target_types[c];
+            let vec = col_vecs[c];
+            let result = append_value_to_vec(vec, typ, expr, c, target_cols);
+            if let Err(e) = result {
+                for v in &col_vecs {
+                    unsafe { crate::ffi_release(*v) };
+                }
+                return Err(e);
+            }
+            col_vecs[c] = result.unwrap();
+        }
+    }
+
+    // Build table
+    let mut builder = RawTableBuilder::new(ncols as i64)?;
+    for (c, vec) in col_vecs.iter().enumerate() {
+        let name_id = crate::sym_intern(&target_cols[c]);
+        let res = builder.add_col(name_id, *vec);
+        unsafe { crate::ffi_release(*vec) };
+        res?;
+    }
+    builder.finish()
+}
+
+/// Append a single literal value to a vector, returning the (possibly reallocated) vector.
+fn append_value_to_vec(
+    vec: *mut crate::td_t,
+    typ: i8,
+    expr: &Expr,
+    col_idx: usize,
+    col_names: &[String],
+) -> Result<*mut crate::td_t, SqlError> {
+    use crate::ffi;
+    use std::ffi::c_void;
+
+    match typ {
+        // Integer types (I32, I64, SYM-as-integer, BOOL)
+        ffi::TD_I32 | ffi::TD_I64 | ffi::TD_BOOL => {
+            let val = eval_i64_literal(expr).map_err(|e| {
+                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
+            })?;
+            match typ {
+                ffi::TD_I64 => {
+                    let next = unsafe { ffi::td_vec_append(vec, &val as *const i64 as *const c_void) };
+                    check_vec_append(next)
+                }
+                ffi::TD_I32 => {
+                    let v32 = val as i32;
+                    let next = unsafe { ffi::td_vec_append(vec, &v32 as *const i32 as *const c_void) };
+                    check_vec_append(next)
+                }
+                ffi::TD_BOOL => {
+                    let b = if val != 0 { 1u8 } else { 0u8 };
+                    let next = unsafe { ffi::td_vec_append(vec, &b as *const u8 as *const c_void) };
+                    check_vec_append(next)
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        ffi::TD_F64 => {
+            let val = eval_f64_literal(expr).map_err(|e| {
+                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
+            })?;
+            let next = unsafe { ffi::td_vec_append(vec, &val as *const f64 as *const c_void) };
+            check_vec_append(next)
+        }
+
+        ffi::TD_SYM | ffi::TD_ENUM => {
+            let s = eval_str_literal(expr).map_err(|e| {
+                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
+            })?;
+            let sym_id = crate::sym_intern(&s);
+            if typ == ffi::TD_SYM {
+                let next = unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
+                check_vec_append(next)
+            } else {
+                // ENUM uses u32 indices
+                let idx = sym_id as u32;
+                let next = unsafe { ffi::td_vec_append(vec, &idx as *const u32 as *const c_void) };
+                check_vec_append(next)
+            }
+        }
+
+        _ => Err(SqlError::Plan(format!(
+            "INSERT INTO: unsupported column type {} for '{}'",
+            typ, col_names[col_idx]
+        ))),
+    }
+}
+
+fn check_vec_append(next: *mut crate::td_t) -> Result<*mut crate::td_t, SqlError> {
+    if next.is_null() {
+        return Err(SqlError::Engine(crate::Error::Oom));
+    }
+    if crate::ffi_is_err(next) {
+        return Err(engine_err_from_raw(next));
+    }
+    Ok(next)
+}
+
+/// Evaluate a literal expression to an i64 value.
+fn eval_i64_literal(expr: &Expr) -> Result<i64, String> {
+    match expr {
+        Expr::Value(Value::Number(s, _)) => {
+            s.parse::<i64>().map_err(|e| format!("invalid integer '{s}': {e}"))
+        }
+        Expr::Value(Value::Boolean(b)) => Ok(if *b { 1 } else { 0 }),
+        Expr::Value(Value::Null) => Ok(0), // null sentinel for integer
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            let val = eval_i64_literal(expr)?;
+            Ok(-val)
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => eval_i64_literal(expr),
+        _ => Err(format!("expected integer literal, got {expr}")),
+    }
+}
+
+/// Evaluate a literal expression to an f64 value.
+fn eval_f64_literal(expr: &Expr) -> Result<f64, String> {
+    match expr {
+        Expr::Value(Value::Number(s, _)) => {
+            s.parse::<f64>().map_err(|e| format!("invalid float '{s}': {e}"))
+        }
+        Expr::Value(Value::Null) => Ok(f64::NAN), // null sentinel for float
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            let val = eval_f64_literal(expr)?;
+            Ok(-val)
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => eval_f64_literal(expr),
+        _ => Err(format!("expected numeric literal, got {expr}")),
+    }
+}
+
+/// Evaluate a literal expression to a string value.
+fn eval_str_literal(expr: &Expr) -> Result<String, String> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s)) => Ok(s.clone()),
+        Expr::Value(Value::DoubleQuotedString(s)) => Ok(s.clone()),
+        Expr::Value(Value::Null) => Ok(String::new()), // null sentinel for string
+        _ => Err(format!("expected string literal, got {expr}")),
+    }
+}
+
+/// Reorder source columns to match target schema when INSERT specifies an explicit column list.
+fn reorder_insert_columns(
+    insert_cols: &[Ident],
+    target_cols: &[String],
+    target_types: &[i8],
+    source: &Table,
+    source_cols: &[String],
+) -> Result<Table, SqlError> {
+    let _ = source_cols;
+    let ncols = target_cols.len();
+    let nrows = source.nrows() as usize;
+
+    if insert_cols.len() != source.ncols() as usize {
+        return Err(SqlError::Plan(format!(
+            "INSERT INTO: column list has {} entries but source has {} columns",
+            insert_cols.len(), source.ncols()
+        )));
+    }
+
+    // Map insert column names to target column indices
+    let mut col_map: Vec<Option<usize>> = vec![None; ncols]; // target_idx -> source_idx
+    for (src_idx, ident) in insert_cols.iter().enumerate() {
+        let name = ident.value.to_lowercase();
+        let tgt_idx = target_cols.iter().position(|c| c.to_lowercase() == name)
+            .ok_or_else(|| SqlError::Plan(format!(
+                "INSERT INTO: column '{}' not found in target table", name
+            )))?;
+        if col_map[tgt_idx].is_some() {
+            return Err(SqlError::Plan(format!(
+                "INSERT INTO: duplicate column '{name}' in column list"
+            )));
+        }
+        col_map[tgt_idx] = Some(src_idx);
+    }
+
+    // Build new table: for each target column, either copy from source or fill with defaults
+    let mut builder = RawTableBuilder::new(ncols as i64)?;
+    for tgt_idx in 0..ncols {
+        let name_id = crate::sym_intern(&target_cols[tgt_idx]);
+        let typ = target_types[tgt_idx];
+
+        let col = if let Some(src_idx) = col_map[tgt_idx] {
+            // Copy column from source
+            source.get_col_idx(src_idx as i64).ok_or_else(|| {
+                SqlError::Plan("INSERT INTO: source column missing".into())
+            })?
+        } else {
+            // Create a default-filled column (zeros/empty)
+            let new_col = unsafe { crate::raw::td_vec_new(typ, nrows as i64) };
+            if new_col.is_null() {
+                return Err(SqlError::Engine(crate::Error::Oom));
+            }
+            unsafe { crate::raw::td_set_len(new_col, nrows as i64) };
+            // Zero-initialized by td_vec_new — acceptable default
+            let res = builder.add_col(name_id, new_col);
+            unsafe { crate::ffi_release(new_col) };
+            res?;
+            continue;
+        };
+
+        unsafe { crate::ffi_retain(col) };
+        let res = builder.add_col(name_id, col);
+        unsafe { crate::ffi_release(col) };
+        res?;
+    }
+    builder.finish()
 }
 
 // ---------------------------------------------------------------------------

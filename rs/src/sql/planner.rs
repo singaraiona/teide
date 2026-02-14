@@ -912,9 +912,17 @@ fn plan_query(
         for (i, alias) in result_aliases.iter().enumerate() {
             having_schema.entry(alias.clone()).or_insert(i);
         }
+        // Build a map from schema index → native column name so that
+        // plan_having_expr can resolve aliases back to the actual column
+        // names in the result table (e.g. "sum(val)" → "val_sum").
+        let native_names: Vec<String> = (0..result_table.ncols() as usize)
+            .map(|i| result_table.col_name_str(i).to_string())
+            .collect();
         let mut g = ctx.graph(&result_table)?;
         let table_node = g.const_table(&result_table);
-        let pred = plan_having_expr(&mut g, having_expr, &having_schema, &schema)?;
+        let pred = plan_having_expr(
+            &mut g, having_expr, &having_schema, &schema, &native_names,
+        )?;
         let filtered = g.filter(table_node, pred);
         g.execute(filtered)?
     } else {

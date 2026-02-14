@@ -140,3 +140,53 @@ fn slt_insert() {
 fn slt_basic() {
     run_slt("tests/slt/basic.slt");
 }
+
+#[test]
+fn slt_aggregate() {
+    run_slt("tests/slt/aggregate.slt");
+}
+
+#[test]
+fn slt_join() {
+    run_slt("tests/slt/join.slt");
+}
+
+#[test]
+fn slt_window() {
+    run_slt("tests/slt/window.slt");
+}
+
+#[test]
+fn slt_set_ops() {
+    run_slt("tests/slt/set_ops.slt");
+}
+
+#[test]
+fn slt_subquery() {
+    run_slt("tests/slt/subquery.slt");
+}
+
+#[test]
+fn slt_functions() {
+    run_slt("tests/slt/functions.slt");
+}
+
+#[test]
+fn slt_types() {
+    run_slt("tests/slt/types.slt");
+}
+
+#[test]
+fn slt_ddl() {
+    run_slt("tests/slt/ddl.slt");
+}
+
+#[test]
+fn slt_sort() {
+    run_slt("tests/slt/sort.slt");
+}
+
+#[test]
+fn slt_where() {
+    run_slt("tests/slt/where.slt");
+}

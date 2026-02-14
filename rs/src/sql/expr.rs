@@ -325,6 +325,16 @@ pub fn plan_expr(
             Ok(g.extract(col, field_id))
         }
 
+        // sqlparser v0.53+ parses CEIL/FLOOR as dedicated Expr variants
+        Expr::Ceil { expr, .. } => {
+            let a = plan_expr(g, expr, schema)?;
+            Ok(g.ceil(a))
+        }
+        Expr::Floor { expr, .. } => {
+            let a = plan_expr(g, expr, schema)?;
+            Ok(g.floor(a))
+        }
+
         _ => Err(SqlError::Plan(format!("Unsupported expression: {expr}"))),
     }
 }
@@ -976,13 +986,15 @@ pub fn plan_post_agg_expr(
     }
 }
 
-/// Plan a HAVING expression. Like plan_post_agg_expr but also resolves aggregates
-/// via C engine naming convention ({col}_{suffix}) when the SQL-style alias isn't found.
+/// Plan a HAVING expression. Resolves aggregates via the result schema, then
+/// scans using the native column name (the actual name in the result table).
+/// `native_names[i]` is the real column name at index `i` in the result table.
 pub fn plan_having_expr(
     g: &mut Graph,
     expr: &Expr,
     result_schema: &HashMap<String, usize>,
     original_schema: &HashMap<String, usize>,
+    native_names: &[String],
 ) -> Result<Column, SqlError> {
     match expr {
         Expr::Function(f) => {
@@ -990,13 +1002,15 @@ pub fn plan_having_expr(
             if is_aggregate_name(&name) {
                 // Try format_agg_name alias first ("sum(v1)")
                 let alias = format_agg_name(f);
-                if result_schema.contains_key(&alias) {
-                    return Ok(g.scan(&alias)?);
+                if let Some(&idx) = result_schema.get(&alias) {
+                    let col_name = &native_names[idx];
+                    return Ok(g.scan(col_name)?);
                 }
                 // Try C engine naming convention ("v1_sum")
                 if let Some(native) = predict_c_agg_name(f, original_schema) {
-                    if result_schema.contains_key(&native) {
-                        return Ok(g.scan(&native)?);
+                    if let Some(&idx) = result_schema.get(&native) {
+                        let col_name = &native_names[idx];
+                        return Ok(g.scan(col_name)?);
                     }
                 }
                 return Err(SqlError::Plan(format!(
@@ -1006,8 +1020,8 @@ pub fn plan_having_expr(
             plan_expr(g, expr, result_schema)
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = plan_having_expr(g, left, result_schema, original_schema)?;
-            let r = plan_having_expr(g, right, result_schema, original_schema)?;
+            let l = plan_having_expr(g, left, result_schema, original_schema, native_names)?;
+            let r = plan_having_expr(g, right, result_schema, original_schema, native_names)?;
             match op {
                 BinaryOperator::Plus => Ok(g.add(l, r)),
                 BinaryOperator::Minus => Ok(g.sub(l, r)),
@@ -1026,19 +1040,22 @@ pub fn plan_having_expr(
             }
         }
         Expr::UnaryOp { op, expr: inner } => {
-            let e = plan_having_expr(g, inner, result_schema, original_schema)?;
+            let e = plan_having_expr(g, inner, result_schema, original_schema, native_names)?;
             match op {
                 UnaryOperator::Not => Ok(g.not(e)),
                 UnaryOperator::Minus => Ok(g.neg(e)),
                 _ => Err(SqlError::Plan(format!("Unsupported unary operator: {op}"))),
             }
         }
-        Expr::Nested(inner) => plan_having_expr(g, inner, result_schema, original_schema),
+        Expr::Nested(inner) => {
+            plan_having_expr(g, inner, result_schema, original_schema, native_names)
+        }
         Expr::Value(_) => plan_expr(g, expr, result_schema),
         Expr::Identifier(ident) => {
             let name = ident.value.to_lowercase();
-            if result_schema.contains_key(&name) {
-                return Ok(g.scan(&name)?);
+            if let Some(&idx) = result_schema.get(&name) {
+                let col_name = &native_names[idx];
+                return Ok(g.scan(col_name)?);
             }
             Err(SqlError::Plan(format!(
                 "Column '{}' not found in HAVING result",

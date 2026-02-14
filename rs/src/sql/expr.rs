@@ -1205,10 +1205,10 @@ pub fn plan_agg_input(
             }
             AggOp::Avg => unreachable!(), // handled above
             _ => {
-                return Err(SqlError::Plan(format!(
+                Err(SqlError::Plan(format!(
                     "FILTER clause not supported for {}()",
                     func.name
-                )));
+                )))
             }
         }
     } else {

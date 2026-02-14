@@ -23,6 +23,7 @@
 
 #include "munit.h"
 #include <teide/td.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
@@ -200,9 +201,13 @@ static MunitResult test_atom_str_long(const void* params, void* fixture) {
     munit_assert_int(chars->len, ==, (int64_t)len);
     munit_assert_memory_equal(len, td_data(chars), s);
 
-    /* Clean up: release atom (which owns the CHAR vector) */
-    td_free(chars);
-    td_free(v);
+    /* Keep one guard ref so we can observe atom-owned release. */
+    td_retain(chars);
+    munit_assert_uint(atomic_load_explicit(&chars->rc, memory_order_relaxed), ==, 2);
+
+    td_release(v);
+    munit_assert_uint(atomic_load_explicit(&chars->rc, memory_order_relaxed), ==, 1);
+    td_release(chars);
 
     return MUNIT_OK;
 }
@@ -304,8 +309,12 @@ static MunitResult test_atom_guid(const void* params, void* fixture) {
     munit_assert_int(vec->len, ==, 16);
     munit_assert_memory_equal(16, td_data(vec), bytes);
 
-    td_free(vec);
-    td_free(v);
+    td_retain(vec);
+    munit_assert_uint(atomic_load_explicit(&vec->rc, memory_order_relaxed), ==, 2);
+
+    td_release(v);
+    munit_assert_uint(atomic_load_explicit(&vec->rc, memory_order_relaxed), ==, 1);
+    td_release(vec);
 
     return MUNIT_OK;
 }

@@ -70,7 +70,6 @@ td_t* td_table_new(int64_t ncols) {
         td_free(tbl);
         return schema;
     }
-    td_retain(schema);
     *tbl_schema_slot(tbl) = schema;
 
     return tbl;
@@ -108,13 +107,7 @@ td_t* td_table_add_col(td_t* tbl, int64_t name_id, td_t* col_vec) {
     schema = td_vec_append(schema, &name_id);
     if (!schema || TD_IS_ERR(schema)) return TD_ERR_PTR(TD_ERR_OOM);
 
-    /* Update schema pointer (vec_append may realloc) */
-    /* Release old schema ref, retain new */
-    td_t* old_schema = *tbl_schema_slot(tbl);
-    if (old_schema != schema) {
-        td_retain(schema);
-        td_release(old_schema);
-    }
+    /* vec_append returns the owned schema reference (possibly moved). */
     *tbl_schema_slot(tbl) = schema;
 
     /* Store column vector pointer and retain it */

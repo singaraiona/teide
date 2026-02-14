@@ -23,6 +23,7 @@
 
 #include "munit.h"
 #include <teide/td.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
@@ -216,6 +217,31 @@ static MunitResult test_list_mixed_types(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
+/* ---- list_release_drops_item_ref ---------------------------------------- */
+
+static MunitResult test_list_release_drops_item_ref(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    td_t* list = td_list_new(1);
+    munit_assert_ptr_not_null(list);
+    munit_assert_false(TD_IS_ERR(list));
+
+    td_t* item = td_i64(42);
+    munit_assert_ptr_not_null(item);
+    munit_assert_false(TD_IS_ERR(item));
+
+    list = td_list_append(list, item);
+    munit_assert_ptr_not_null(list);
+    munit_assert_false(TD_IS_ERR(list));
+    munit_assert_uint(atomic_load_explicit(&item->rc, memory_order_relaxed), ==, 2);
+
+    td_release(list);
+    munit_assert_uint(atomic_load_explicit(&item->rc, memory_order_relaxed), ==, 1);
+
+    td_release(item);
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest list_tests[] = {
@@ -225,6 +251,7 @@ static MunitTest list_tests[] = {
     { "/grow",         test_list_grow,         list_setup, list_teardown, 0, NULL },
     { "/empty",        test_list_empty,        list_setup, list_teardown, 0, NULL },
     { "/mixed_types",  test_list_mixed_types,  list_setup, list_teardown, 0, NULL },
+    { "/release_drops_item_ref", test_list_release_drops_item_ref, list_setup, list_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

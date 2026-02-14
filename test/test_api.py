@@ -34,7 +34,7 @@ import tempfile
 import pytest
 
 # Ensure bindings are importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bindings", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py"))
 
 from teide.api import Context, Table, Query, Expr, GroupBy, Series, col, lit
 

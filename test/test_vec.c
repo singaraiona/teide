@@ -23,6 +23,7 @@
 
 #include "munit.h"
 #include <teide/td.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
@@ -294,10 +295,62 @@ static MunitResult test_vec_null_external(const void* params, void* fixture) {
     munit_assert_false(td_vec_is_null(v, 0));
     munit_assert_false(td_vec_is_null(v, 149));
 
-    /* Clean up: free external nullmap, then vector */
-    td_t* ext = v->ext_nullmap;
-    if (ext) td_release(ext);
+    /* External nullmap is owned by the vector and released with it. */
     td_release(v);
+    return MUNIT_OK;
+}
+
+/* ---- slice_release_parent_ref ------------------------------------------- */
+
+static MunitResult test_vec_slice_release_parent_ref(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    int64_t raw[] = {10, 20, 30};
+    td_t* v = td_vec_from_raw(TD_I64, raw, 3);
+    munit_assert_ptr_not_null(v);
+
+    td_retain(v); /* guard ref for observing parent rc after slice release */
+    munit_assert_uint(atomic_load_explicit(&v->rc, memory_order_relaxed), ==, 2);
+
+    td_t* s = td_vec_slice(v, 1, 2);
+    munit_assert_ptr_not_null(s);
+    munit_assert_false(TD_IS_ERR(s));
+    munit_assert_uint(atomic_load_explicit(&v->rc, memory_order_relaxed), ==, 3);
+
+    td_release(s);
+    munit_assert_uint(atomic_load_explicit(&v->rc, memory_order_relaxed), ==, 2);
+
+    td_release(v);
+    td_release(v);
+    return MUNIT_OK;
+}
+
+/* ---- null_external_release_ext_ref -------------------------------------- */
+
+static MunitResult test_vec_null_external_release_ext_ref(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    td_t* v = td_vec_new(TD_U8, 200);
+    munit_assert_ptr_not_null(v);
+
+    for (int i = 0; i < 200; i++) {
+        uint8_t val = (uint8_t)(i & 0xFF);
+        v = td_vec_append(v, &val);
+        munit_assert_false(TD_IS_ERR(v));
+    }
+
+    td_vec_set_null(v, 150, true);
+    munit_assert_true(v->attrs & TD_ATTR_NULLMAP_EXT);
+    td_t* ext = v->ext_nullmap;
+    munit_assert_ptr_not_null(ext);
+
+    td_retain(ext); /* guard ref */
+    munit_assert_uint(atomic_load_explicit(&ext->rc, memory_order_relaxed), ==, 2);
+
+    td_release(v);
+    munit_assert_uint(atomic_load_explicit(&ext->rc, memory_order_relaxed), ==, 1);
+
+    td_release(ext);
     return MUNIT_OK;
 }
 
@@ -442,6 +495,8 @@ static MunitTest vec_tests[] = {
     { "/concat",             test_vec_concat,              vec_setup, vec_teardown, 0, NULL },
     { "/null_inline",        test_vec_null_inline,         vec_setup, vec_teardown, 0, NULL },
     { "/null_external",      test_vec_null_external,       vec_setup, vec_teardown, 0, NULL },
+    { "/slice_release_parent_ref", test_vec_slice_release_parent_ref, vec_setup, vec_teardown, 0, NULL },
+    { "/null_external_release_ext_ref", test_vec_null_external_release_ext_ref, vec_setup, vec_teardown, 0, NULL },
     { "/append_grow",        test_vec_append_grow,         vec_setup, vec_teardown, 0, NULL },
     { "/type_correctness",   test_vec_type_correctness,    vec_setup, vec_teardown, 0, NULL },
     { "/empty",              test_vec_empty,               vec_setup, vec_teardown, 0, NULL },

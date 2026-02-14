@@ -68,9 +68,7 @@ static MunitResult test_str_ptr_long(const void* params, void* fixture) {
     munit_assert_ptr_not_null(p);
     munit_assert_memory_equal(len, p, text);
 
-    /* Clean up long string: free CHAR vector and atom */
-    td_free(s->obj);
-    td_free(s);
+    td_release(s);
     return MUNIT_OK;
 }
 
@@ -94,8 +92,7 @@ static MunitResult test_str_len(const void* params, void* fixture) {
     size_t len = strlen(text);
     td_t* s3 = td_str(text, len);
     munit_assert_size(td_str_len(s3), ==, len);
-    td_free(s3->obj);
-    td_free(s3);
+    td_release(s3);
 
     return MUNIT_OK;
 }

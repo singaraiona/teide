@@ -291,11 +291,144 @@ td_t* td_alloc(size_t data_size) {
 }
 
 /* --------------------------------------------------------------------------
+ * Owned-reference helpers
+ * -------------------------------------------------------------------------- */
+
+static bool td_atom_str_is_sso(const td_t* s) {
+    if (s->slen >= 1 && s->slen <= 7) return true;
+    if (s->slen == 0 && s->obj == NULL) return true;
+    return false;
+}
+
+static bool td_atom_owns_obj(const td_t* v) {
+    if (v->type == TD_ATOM_GUID) return v->obj != NULL;
+    if (v->type == TD_ATOM_STR) return !td_atom_str_is_sso(v);
+    return false;
+}
+
+static void td_release_owned_refs(td_t* v) {
+    if (!v || TD_IS_ERR(v)) return;
+
+    if (td_is_atom(v)) {
+        if (td_atom_owns_obj(v) && v->obj && !TD_IS_ERR(v->obj))
+            td_release(v->obj);
+        return;
+    }
+
+    if (v->attrs & TD_ATTR_SLICE) {
+        if (v->slice_parent && !TD_IS_ERR(v->slice_parent))
+            td_release(v->slice_parent);
+        return;
+    }
+
+    if ((v->attrs & TD_ATTR_NULLMAP_EXT) &&
+        v->ext_nullmap && !TD_IS_ERR(v->ext_nullmap))
+        td_release(v->ext_nullmap);
+
+    if (v->type == TD_TABLE) {
+        td_t** slots = (td_t**)td_data(v);
+        td_t* schema = slots[0];
+        if (schema && !TD_IS_ERR(schema)) td_release(schema);
+
+        td_t** cols = slots + 1;
+        for (int64_t i = 0; i < v->len; i++) {
+            td_t* col = cols[i];
+            if (col && !TD_IS_ERR(col)) td_release(col);
+        }
+        return;
+    }
+
+    if (v->type == TD_LIST || v->type == TD_STR) {
+        td_t** ptrs = (td_t**)td_data(v);
+        for (int64_t i = 0; i < v->len; i++) {
+            td_t* child = ptrs[i];
+            if (child && !TD_IS_ERR(child)) td_release(child);
+        }
+    }
+}
+
+static void td_retain_owned_refs(td_t* v) {
+    if (!v || TD_IS_ERR(v)) return;
+
+    if (td_is_atom(v)) {
+        if (td_atom_owns_obj(v) && v->obj && !TD_IS_ERR(v->obj))
+            td_retain(v->obj);
+        return;
+    }
+
+    if (v->attrs & TD_ATTR_SLICE) {
+        if (v->slice_parent && !TD_IS_ERR(v->slice_parent))
+            td_retain(v->slice_parent);
+        return;
+    }
+
+    if ((v->attrs & TD_ATTR_NULLMAP_EXT) &&
+        v->ext_nullmap && !TD_IS_ERR(v->ext_nullmap))
+        td_retain(v->ext_nullmap);
+
+    if (v->type == TD_TABLE) {
+        td_t** slots = (td_t**)td_data(v);
+        td_t* schema = slots[0];
+        if (schema && !TD_IS_ERR(schema)) td_retain(schema);
+
+        td_t** cols = slots + 1;
+        for (int64_t i = 0; i < v->len; i++) {
+            td_t* col = cols[i];
+            if (col && !TD_IS_ERR(col)) td_retain(col);
+        }
+        return;
+    }
+
+    if (v->type == TD_LIST || v->type == TD_STR) {
+        td_t** ptrs = (td_t**)td_data(v);
+        for (int64_t i = 0; i < v->len; i++) {
+            td_t* child = ptrs[i];
+            if (child && !TD_IS_ERR(child)) td_retain(child);
+        }
+    }
+}
+
+/* Detach owned refs before freeing a moved-from object (realloc move path). */
+static void td_detach_owned_refs(td_t* v) {
+    if (!v || TD_IS_ERR(v)) return;
+
+    if (td_is_atom(v)) {
+        if (td_atom_owns_obj(v)) v->obj = NULL;
+        return;
+    }
+
+    if (v->attrs & TD_ATTR_SLICE) {
+        v->slice_parent = NULL;
+        v->slice_offset = 0;
+        v->attrs &= (uint8_t)~TD_ATTR_SLICE;
+        return;
+    }
+
+    if (v->attrs & TD_ATTR_NULLMAP_EXT) {
+        v->ext_nullmap = NULL;
+        v->attrs &= (uint8_t)~TD_ATTR_NULLMAP_EXT;
+    }
+
+    if (v->type == TD_TABLE) {
+        td_t** slots = (td_t**)td_data(v);
+        slots[0] = NULL;
+        v->len = 0;
+        return;
+    }
+
+    if (v->type == TD_LIST || v->type == TD_STR) {
+        v->len = 0;
+    }
+}
+
+/* --------------------------------------------------------------------------
  * td_free
  * -------------------------------------------------------------------------- */
 
 void td_free(td_t* v) {
     if (!v || TD_IS_ERR(v)) return;
+
+    td_release_owned_refs(v);
 
     if (v->mmod == 2) {
         td_direct_block_t** pp = &td_tl_direct_blocks;
@@ -357,6 +490,8 @@ td_t* td_alloc_copy(td_t* v) {
     size_t data_size;
     if (td_is_atom(v)) {
         data_size = 0;
+    } else if (v->type == TD_TABLE) {
+        data_size = (size_t)(td_len(v) + 1) * sizeof(td_t*);
     } else {
         int8_t t = td_type(v);
         if (t <= 0 || t >= TD_TYPE_COUNT)
@@ -372,6 +507,7 @@ td_t* td_alloc_copy(td_t* v) {
     copy->order = td_order_for_size(data_size);
     if (copy->order < TD_ORDER_MIN) copy->order = TD_ORDER_MIN;
     atomic_store_explicit(&copy->rc, 1, memory_order_relaxed);
+    td_retain_owned_refs(copy);
     return copy;
 }
 
@@ -390,8 +526,10 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
         size_t old_data;
         if (td_is_atom(v))
             old_data = 0;
-        else if (v->type == TD_LIST || v->type == TD_TABLE)
+        else if (v->type == TD_LIST)
             old_data = (size_t)td_len(v) * sizeof(td_t*);
+        else if (v->type == TD_TABLE)
+            old_data = (size_t)(td_len(v) + 1) * sizeof(td_t*);
         else {
             int8_t t = td_type(v);
             old_data = (t > 0 && t < TD_TYPE_COUNT) ?
@@ -403,6 +541,7 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
         new_v->order = td_order_for_size(new_data_size);
         if (new_v->order < TD_ORDER_MIN) new_v->order = TD_ORDER_MIN;
         atomic_store_explicit(&new_v->rc, 1, memory_order_relaxed);
+        td_detach_owned_refs(v);
         td_free(v);
     }
     return new_v;

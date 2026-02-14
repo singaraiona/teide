@@ -32,6 +32,7 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [build-dependencies]
 cc = "1"
@@ -40,3 +41,7 @@ cc = "1"
 name = "teide"
 path = "src/cli/main.rs"
 required-features = ["cli"]
+
+[[bench]]
+name = "h2oai"
+harness = false

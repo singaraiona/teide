@@ -46,6 +46,9 @@ struct Args {
     /// Execute SQL from file
     #[arg(short, long)]
     file: Option<PathBuf>,
+    /// Execute SQL init script before entering REPL
+    #[arg(short, long)]
+    init: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,22 +61,45 @@ enum OutputFormat {
 fn main() {
     let args = Args::parse();
 
-    // Non-interactive: execute single query
+    // Non-interactive: execute single query (with optional --init)
     if let Some(ref input) = args.input {
         if !input.ends_with(".csv") {
-            run_single_query(input);
+            if let Some(ref init) = args.init {
+                let mut session = make_session();
+                run_init_script(&mut session, init);
+                run_session_query(&mut session, input);
+            } else {
+                run_single_query(input);
+            }
             return;
         }
     }
 
-    // Non-interactive: execute SQL from file
+    // Non-interactive: execute SQL from file (with optional --init)
     if let Some(ref file) = args.file {
-        run_sql_file(file);
+        run_sql_file(file, args.init.as_deref());
         return;
     }
 
     // Interactive REPL
-    run_repl(args.input.as_deref());
+    run_repl(args.input.as_deref(), args.init.as_deref());
+}
+
+fn make_session() -> teide::sql::Session {
+    match teide::sql::Session::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_init_script(session: &mut teide::sql::Session, path: &PathBuf) {
+    if let Err(e) = session.execute_script_file(path.as_path()) {
+        eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, path.display(), theme::R);
+        std::process::exit(1);
+    }
 }
 
 fn run_single_query(sql: &str) {
@@ -93,18 +119,29 @@ fn run_single_query(sql: &str) {
     }
 }
 
-fn run_sql_file(path: &PathBuf) {
+fn run_session_query(session: &mut teide::sql::Session, sql: &str) {
+    match session.execute(sql) {
+        Ok(teide::sql::ExecResult::Query(result)) => print_result(&result, &OutputFormat::Table),
+        Ok(teide::sql::ExecResult::Ddl(msg)) => println!("{}{msg}{}", theme::SUCCESS, theme::R),
+        Err(e) => {
+            eprintln!("{}Error: {e}{}", theme::ERROR, theme::R);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>) {
+    let mut session = make_session();
+    if let Some(init_path) = init {
+        if let Err(e) = session.execute_script_file(init_path) {
+            eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, init_path.display(), theme::R);
+            std::process::exit(1);
+        }
+    }
     let contents = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Error reading {}: {e}", path.display());
         std::process::exit(1);
     });
-    let mut session = match teide::sql::Session::new() {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
-            std::process::exit(1);
-        }
-    };
     for stmt in contents.split(';') {
         let sql = stmt.trim();
         if sql.is_empty() {
@@ -122,16 +159,17 @@ fn run_sql_file(path: &PathBuf) {
     }
 }
 
-fn run_repl(preload_csv: Option<&str>) {
-    let mut session = match teide::sql::Session::new() {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
-            return;
-        }
-    };
+fn run_repl(preload_csv: Option<&str>, init: Option<&std::path::Path>) {
+    let mut session = make_session();
 
     print_banner();
+
+    if let Some(init_path) = init {
+        if let Err(e) = session.execute_script_file(init_path) {
+            eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, init_path.display(), theme::R);
+            return;
+        }
+    }
 
     if let Some(csv_path) = preload_csv {
         let sql = format!("CREATE TABLE t AS SELECT * FROM '{csv_path}'");

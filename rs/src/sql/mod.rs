@@ -118,6 +118,27 @@ impl Session {
         planner::session_execute(self, sql)
     }
 
+    /// Execute a multi-statement SQL script (statements separated by `;`).
+    /// Returns the result of the last statement.
+    pub fn execute_script(&mut self, sql: &str) -> Result<ExecResult, SqlError> {
+        let mut last = None;
+        for stmt in sql.split(';') {
+            let s = stmt.trim();
+            if s.is_empty() {
+                continue;
+            }
+            last = Some(self.execute(s)?);
+        }
+        last.ok_or_else(|| SqlError::Plan("Empty script".into()))
+    }
+
+    /// Execute a SQL script from a file path.
+    pub fn execute_script_file(&mut self, path: &std::path::Path) -> Result<ExecResult, SqlError> {
+        let sql = std::fs::read_to_string(path)
+            .map_err(|e| SqlError::Plan(format!("Failed to read {}: {e}", path.display())))?;
+        self.execute_script(&sql)
+    }
+
     /// List stored table names.
     pub fn table_names(&self) -> Vec<&str> {
         self.tables.keys().map(|s| s.as_str()).collect()

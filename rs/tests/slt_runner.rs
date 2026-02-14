@@ -190,3 +190,23 @@ fn slt_sort() {
 fn slt_where() {
     run_slt("tests/slt/where.slt");
 }
+
+#[test]
+fn slt_agg_filter() {
+    run_slt("tests/slt/agg_filter.slt");
+}
+
+#[test]
+fn slt_nulls_order() {
+    run_slt("tests/slt/nulls_order.slt");
+}
+
+#[test]
+fn slt_stats() {
+    run_slt("tests/slt/stats.slt");
+}
+
+#[test]
+fn slt_regressions() {
+    run_slt("tests/slt/regressions.slt");
+}

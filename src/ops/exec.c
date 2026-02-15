@@ -4818,14 +4818,14 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
             da_accum_t* wa = &sc_acc[w];
             if (need_flags & DA_NEED_SUM) {
                 for (uint8_t a = 0; a < n_aggs; a++) {
-                    uint16_t op = ext->agg_ops[a];
-                    if (op == OP_FIRST) {
+                    uint16_t merge_op = ext->agg_ops[a];
+                    if (merge_op == OP_FIRST) {
                         /* Keep value from lowest worker_id that has count > 0 */
                         if (m->count[0] == 0 && wa->count[0] > 0) {
                             m->f64[a] = wa->f64[a];
                             m->i64[a] = wa->i64[a];
                         }
-                    } else if (op == OP_LAST) {
+                    } else if (merge_op == OP_LAST) {
                         /* Take value from highest worker_id that saw rows */
                         if (wa->count[0] > 0) {
                             m->f64[a] = wa->f64[a];
@@ -5558,39 +5558,42 @@ sequential_fallback:;
         new_col->len = (int64_t)grp_count;
 
         int8_t s = ly->agg_val_slot[a]; /* unified accum slot */
+        /* Row-layout accessors: offsets are 8-byte aligned by construction */
+        #define ROW_F64(row, off, slot) (((const double*)((const void*)((row) + (off))))[(slot)])
+        #define ROW_I64(row, off, slot) (((const int64_t*)((const void*)((row) + (off))))[(slot)])
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
-            int64_t cnt = *(const int64_t*)row;
+            int64_t cnt = *(const int64_t*)(const void*)row;
             if (out_type == TD_F64) {
                 double v;
                 switch (agg_op) {
                     case OP_SUM:
-                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s]
-                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        v = is_f64 ? ROW_F64(row, ly->off_sum, s)
+                                   : (double)ROW_I64(row, ly->off_sum, s);
                         if (agg_affine[a].enabled) v += agg_affine[a].bias_f64 * cnt;
                         break;
                     case OP_AVG:
-                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s] / cnt
-                                   : (double)((const int64_t*)(row + ly->off_sum))[s] / cnt;
+                        v = is_f64 ? ROW_F64(row, ly->off_sum, s) / cnt
+                                   : (double)ROW_I64(row, ly->off_sum, s) / cnt;
                         if (agg_affine[a].enabled) v += agg_affine[a].bias_f64;
                         break;
                     case OP_MIN:
-                        v = is_f64 ? ((const double*)(row + ly->off_min))[s]
-                                   : (double)((const int64_t*)(row + ly->off_min))[s];
+                        v = is_f64 ? ROW_F64(row, ly->off_min, s)
+                                   : (double)ROW_I64(row, ly->off_min, s);
                         break;
                     case OP_MAX:
-                        v = is_f64 ? ((const double*)(row + ly->off_max))[s]
-                                   : (double)((const int64_t*)(row + ly->off_max))[s];
+                        v = is_f64 ? ROW_F64(row, ly->off_max, s)
+                                   : (double)ROW_I64(row, ly->off_max, s);
                         break;
                     case OP_FIRST: case OP_LAST:
-                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s]
-                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        v = is_f64 ? ROW_F64(row, ly->off_sum, s)
+                                   : (double)ROW_I64(row, ly->off_sum, s);
                         break;
                     case OP_VAR: case OP_VAR_POP:
                     case OP_STDDEV: case OP_STDDEV_POP: {
-                        double sum_val = is_f64 ? ((const double*)(row + ly->off_sum))[s]
-                                                : (double)((const int64_t*)(row + ly->off_sum))[s];
-                        double sq_val = ly->off_sumsq ? ((const double*)(row + ly->off_sumsq))[s] : 0.0;
+                        double sum_val = is_f64 ? ROW_F64(row, ly->off_sum, s)
+                                                : (double)ROW_I64(row, ly->off_sum, s);
+                        double sq_val = ly->off_sumsq ? ROW_F64(row, ly->off_sumsq, s) : 0.0;
                         double mean = cnt > 0 ? sum_val / cnt : 0.0;
                         double var_pop = cnt > 0 ? sq_val / cnt - mean * mean : 0.0;
                         if (var_pop < 0) var_pop = 0;
@@ -5607,18 +5610,20 @@ sequential_fallback:;
                 int64_t v;
                 switch (agg_op) {
                     case OP_SUM:
-                        v = ((const int64_t*)(row + ly->off_sum))[s];
+                        v = ROW_I64(row, ly->off_sum, s);
                         if (agg_affine[a].enabled) v += agg_affine[a].bias_i64 * cnt;
                         break;
                     case OP_COUNT: v = cnt; break;
-                    case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
-                    case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
-                    case OP_FIRST: case OP_LAST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                    case OP_MIN:   v = ROW_I64(row, ly->off_min, s); break;
+                    case OP_MAX:   v = ROW_I64(row, ly->off_max, s); break;
+                    case OP_FIRST: case OP_LAST: v = ROW_I64(row, ly->off_sum, s); break;
                     default:       v = 0; break;
                 }
                 ((int64_t*)td_data(new_col))[gi] = v;
             }
         }
+        #undef ROW_F64
+        #undef ROW_I64
 
         /* Generate unique column name */
         td_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);

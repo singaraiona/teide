@@ -292,6 +292,8 @@ static MunitResult test_cancel(const void* params, void* data) {
     td_op_t* scan = td_scan(g, "val");
     td_op_t* sum_op = td_sum(g, scan);
     td_t* result = td_execute(g, sum_op);
+    /* td_execute() resets cancel flag at start — first query may succeed */
+    if (!TD_IS_ERR(result)) td_release(result);
 
     /* td_execute() resets the flag, so this tests that the next query works */
     td_graph_free(g);

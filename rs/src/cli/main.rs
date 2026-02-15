@@ -49,6 +49,9 @@ struct Args {
     /// Execute SQL init script before entering REPL
     #[arg(short, long)]
     init: Option<PathBuf>,
+    /// Show query execution time
+    #[arg(short, long)]
+    timer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -77,7 +80,7 @@ fn main() {
 
     // Non-interactive: execute SQL from file (with optional --init)
     if let Some(ref file) = args.file {
-        run_sql_file(file, args.init.as_deref());
+        run_sql_file(file, args.init.as_deref(), args.timer);
         return;
     }
 
@@ -130,7 +133,7 @@ fn run_session_query(session: &mut teide::sql::Session, sql: &str) {
     }
 }
 
-fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>) {
+fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>, timer: bool) {
     let mut session = make_session();
     if let Some(init_path) = init {
         if let Err(e) = session.execute_script_file(init_path) {
@@ -147,12 +150,21 @@ fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>) {
         if sql.is_empty() {
             continue;
         }
+        let start = std::time::Instant::now();
         match session.execute(sql) {
             Ok(teide::sql::ExecResult::Query(result)) => {
                 print_result(&result, &OutputFormat::Table);
+                if timer {
+                    let elapsed = start.elapsed();
+                    println!("{}Run Time: {elapsed:.3?}{}", theme::FOOTER, theme::R);
+                }
             }
             Ok(teide::sql::ExecResult::Ddl(msg)) => {
-                println!("{}{msg}{}", theme::SUCCESS, theme::R)
+                println!("{}{msg}{}", theme::SUCCESS, theme::R);
+                if timer {
+                    let elapsed = start.elapsed();
+                    println!("{}Run Time: {elapsed:.3?}{}", theme::FOOTER, theme::R);
+                }
             }
             Err(e) => eprintln!("{}Error: {e}{}", theme::ERROR, theme::R),
         }

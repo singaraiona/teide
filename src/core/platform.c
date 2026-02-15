@@ -81,6 +81,10 @@ void td_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
+void td_vm_advise_willneed(void* ptr, size_t size) {
+    if (ptr) madvise(ptr, size, MADV_WILLNEED);
+}
+
 void td_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
 #if defined(TD_OS_MACOS)

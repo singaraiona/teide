@@ -301,6 +301,9 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
             }
             td_retain(seg);
             segs[p] = seg;
+            /* Async readahead: pre-fault mmap pages in background */
+            td_vm_advise_willneed(td_data(seg),
+                                  (size_t)seg->len * td_elem_size(first_seg->type));
         }
 
         result = td_table_add_col(result, name_id, parted);

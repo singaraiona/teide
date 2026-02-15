@@ -171,6 +171,21 @@ int64_t td_table_col_name(td_t* tbl, int64_t idx) {
 }
 
 /* --------------------------------------------------------------------------
+ * td_table_set_col_name
+ * -------------------------------------------------------------------------- */
+
+void td_table_set_col_name(td_t* tbl, int64_t idx, int64_t name_id) {
+    if (!tbl || TD_IS_ERR(tbl)) return;
+    if (idx < 0 || idx >= tbl->len) return;
+
+    td_t* schema = *tbl_schema_slot(tbl);
+    if (!schema || TD_IS_ERR(schema)) return;
+
+    int64_t* ids = (int64_t*)td_data(schema);
+    ids[idx] = name_id;
+}
+
+/* --------------------------------------------------------------------------
  * td_table_ncols
  * -------------------------------------------------------------------------- */
 

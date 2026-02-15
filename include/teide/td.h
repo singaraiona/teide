@@ -458,6 +458,7 @@ void  td_vm_free(void* ptr, size_t size);
 void* td_vm_map_file(const char* path, size_t* out_size);
 void  td_vm_unmap_file(void* ptr, size_t size);
 void  td_vm_advise_seq(void* ptr, size_t size);
+void  td_vm_advise_willneed(void* ptr, size_t size);
 void  td_vm_release(void* ptr, size_t size);
 
 /* ===== Threading API ===== */
@@ -550,6 +551,7 @@ td_t*       td_table_add_col(td_t* tbl, int64_t name_id, td_t* col_vec);
 td_t*       td_table_get_col(td_t* tbl, int64_t name_id);
 td_t*       td_table_get_col_idx(td_t* tbl, int64_t idx);
 int64_t     td_table_col_name(td_t* tbl, int64_t idx);
+void        td_table_set_col_name(td_t* tbl, int64_t idx, int64_t name_id);
 int64_t     td_table_ncols(td_t* tbl);
 int64_t     td_table_nrows(td_t* tbl);
 int64_t     td_parted_nrows(td_t* parted_col);

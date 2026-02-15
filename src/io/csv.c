@@ -308,7 +308,7 @@ static csv_type_t detect_type(const char* f, size_t len) {
             if (len == 10) return CSV_TYPE_DATE;
             if (len >= 19 && (f[10] == 'T' || f[10] == ' ') &&
                 f[13] == ':' && f[16] == ':') {
-                int tp[] = {11,12,14,15,17,18};
+                const int tp[] = {11,12,14,15,17,18};
                 bool is_ts = true;
                 for (int i = 0; i < 6; i++) {
                     if ((unsigned)(f[tp[i]] - '0') > 9) { is_ts = false; break; }
@@ -320,7 +320,7 @@ static csv_type_t detect_type(const char* f, size_t len) {
 
     /* Time: HH:MM:SS[.ffffff] (at least 8 chars) */
     if (len >= 8 && f[2] == ':' && f[5] == ':') {
-        int tp[] = {0,1,3,4,6,7};
+        const int tp[] = {0,1,3,4,6,7};
         bool is_time = true;
         for (int i = 0; i < 6; i++) {
             if ((unsigned)(f[tp[i]] - '0') > 9) { is_time = false; break; }

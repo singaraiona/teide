@@ -219,7 +219,7 @@ static inline uint64_t td_hash_i64(int64_t val) {
  */
 static inline uint64_t td_hash_f64(double val) {
     uint64_t bits;
-    if (val == 0.0) val = 0.0;          /* normalize -0.0 → +0.0 */
+    if (val == 0.0) { uint64_t z = 0; memcpy(&val, &z, sizeof(val)); } /* normalize -0.0 → +0.0 */
     memcpy(&bits, &val, sizeof(bits));
     uint64_t A = bits ^ 0x2d358dccaa6c78a5ULL;
     uint64_t B = bits ^ 0x8bb84b93962eacc9ULL;

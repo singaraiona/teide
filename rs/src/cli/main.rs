@@ -850,6 +850,7 @@ fn handle_dot_command(
             println!("  {NORD7}Total{R}    {FOOTER}{:>10}{R}", fmt_bytes(total_cur));
         }
         ".help" => print_help(),
+        // process::exit skips destructors; acceptable since OS reclaims all resources.
         ".quit" => std::process::exit(0),
         _ => println!(
             "{ERROR}Unknown command: {}. Type .help for commands.{R}",

@@ -125,10 +125,12 @@ impl Session {
     /// Execute a multi-statement SQL script (statements separated by `;`).
     /// Returns the result of the last statement.
     ///
-    /// Note: Naive ';' split; does not respect string literals.
-    /// Use execute() for statements containing semicolons in string values.
+    /// Known limitation: naive semicolon split does not respect string
+    /// literals. Use execute() for single statements containing semicolons.
     pub fn execute_script(&mut self, sql: &str) -> Result<ExecResult, SqlError> {
         let mut last = None;
+        // Known limitation: naive semicolon split does not respect string
+        // literals. Use execute() for single statements containing semicolons.
         for stmt in sql.split(';') {
             let s = stmt.trim();
             if s.is_empty() {

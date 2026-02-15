@@ -197,6 +197,9 @@ static td_op_ext_t* ensure_ext_node(td_graph_t* g, uint32_t node_id) {
 
     ext = (td_op_ext_t*)td_sys_alloc(sizeof(td_op_ext_t));
     if (!ext) return NULL;
+    /* M1: Zero-init to prevent use of uninitialized fields (literal,
+       keys, agg_ins, etc.) before the caller populates them. */
+    memset(ext, 0, sizeof(*ext));
     ext->base.id = node_id;
     if (!track_ext_node(g, ext)) {
         td_sys_free(ext);
@@ -451,6 +454,51 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
             if (n->inputs[i] && sp < (int)nc)
                 stack[sp++] = n->inputs[i]->id;
         }
+        /* H1: Traverse ext-node children so constant folding reaches all
+           referenced nodes (GROUP keys/aggs, SORT/PROJECT/SELECT columns,
+           JOIN keys, WINDOW partition/order/func_inputs). */
+        td_op_ext_t* ext = find_ext(g, nid);
+        if (ext) {
+            switch (n->opcode) {
+                case OP_GROUP:
+                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                        if (ext->keys[k] && !visited[ext->keys[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->keys[k]->id;
+                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                        if (ext->agg_ins[a] && !visited[ext->agg_ins[a]->id] && sp < (int)nc)
+                            stack[sp++] = ext->agg_ins[a]->id;
+                    break;
+                case OP_SORT:
+                case OP_PROJECT:
+                case OP_SELECT:
+                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                        if (ext->sort.columns[k] && !visited[ext->sort.columns[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->sort.columns[k]->id;
+                    break;
+                case OP_JOIN:
+                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                        if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->join.left_keys[k]->id;
+                        if (ext->join.right_keys && ext->join.right_keys[k] &&
+                            !visited[ext->join.right_keys[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->join.right_keys[k]->id;
+                    }
+                    break;
+                case OP_WINDOW:
+                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                        if (ext->window.part_keys[k] && !visited[ext->window.part_keys[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->window.part_keys[k]->id;
+                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                        if (ext->window.order_keys[k] && !visited[ext->window.order_keys[k]->id] && sp < (int)nc)
+                            stack[sp++] = ext->window.order_keys[k]->id;
+                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                        if (ext->window.func_inputs[f] && !visited[ext->window.func_inputs[f]->id] && sp < (int)nc)
+                            stack[sp++] = ext->window.func_inputs[f]->id;
+                    break;
+                default:
+                    break;
+            }
+        }
     }
     /* Process in reverse order (children before parents) */
     for (int i = oc - 1; i >= 0; i--)
@@ -501,7 +549,9 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
            ext->sym holds the total arg count. */
         if (n->opcode == OP_CONCAT) {
             td_op_ext_t* ext = find_ext(g, nid);
-            if (ext) {
+            /* M4: Guard against ext->sym < 2 — trailing uint32_t values
+               only exist when there are more than 2 arguments. */
+            if (ext && ext->sym >= 2) {
                 int n_args = (int)ext->sym;
                 uint32_t* trail = (uint32_t*)((char*)(ext + 1));
                 for (int i = 2; i < n_args; i++) {

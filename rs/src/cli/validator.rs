@@ -32,18 +32,17 @@ impl Validator for SqlValidator {
             return ValidationResult::Complete;
         }
 
-        // Unbalanced parentheses → incomplete
+        // Unbalanced parentheses → incomplete (skip parens inside quotes)
         let mut depth: i32 = 0;
         let mut in_string = false;
+        let mut in_dquote = false;
         for ch in trimmed.chars() {
-            if ch == '\'' {
-                in_string = !in_string;
-            } else if !in_string {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
-                }
+            match ch {
+                '\'' if !in_dquote => in_string = !in_string,
+                '"' if !in_string => in_dquote = !in_dquote,
+                '(' if !in_string && !in_dquote => depth += 1,
+                ')' if !in_string && !in_dquote => depth -= 1,
+                _ => {}
             }
         }
         if depth > 0 {

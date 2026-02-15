@@ -152,17 +152,24 @@ static void local_sym_init(local_sym_t* ls) {
      * across threads (each allocation is an independent mmap). */
     ls->buckets = (uint64_t*)td_sys_alloc(ls->bucket_cap * sizeof(uint64_t));
     ls->buckets_hdr = NULL; /* unused with td_sys_alloc */
-    if (ls->buckets) memset(ls->buckets, 0, ls->bucket_cap * sizeof(uint64_t));
+    ls->offsets = NULL;
+    ls->offsets_hdr = NULL;
+    ls->lens = NULL;
+    ls->lens_hdr = NULL;
+    ls->arena = NULL;
+    ls->arena_hdr = NULL;
+    ls->count = 0;
+    ls->arena_used = 0;
+    if (!ls->buckets) { ls->buckets = NULL; return; }
+    memset(ls->buckets, 0, ls->bucket_cap * sizeof(uint64_t));
     ls->cap = LSYM_INIT_STRS;
     ls->offsets = (uint32_t*)td_sys_alloc(ls->cap * sizeof(uint32_t));
-    ls->offsets_hdr = NULL;
+    if (!ls->offsets) { td_sys_free(ls->buckets); ls->buckets = NULL; return; }
     ls->lens = (uint32_t*)td_sys_alloc(ls->cap * sizeof(uint32_t));
-    ls->lens_hdr = NULL;
-    ls->count = 0;
+    if (!ls->lens) { td_sys_free(ls->buckets); ls->buckets = NULL; td_sys_free(ls->offsets); ls->offsets = NULL; return; }
     ls->arena_cap = LSYM_INIT_ARENA;
     ls->arena = (char*)td_sys_alloc(ls->arena_cap);
-    ls->arena_hdr = NULL;
-    ls->arena_used = 0;
+    if (!ls->arena) { td_sys_free(ls->buckets); ls->buckets = NULL; td_sys_free(ls->offsets); ls->offsets = NULL; td_sys_free(ls->lens); ls->lens = NULL; return; }
 }
 
 static void local_sym_free(local_sym_t* ls) {
@@ -176,6 +183,7 @@ static void local_sym_free(local_sym_t* ls) {
 /* OOM during rehash degrades to O(n) lookup but doesn't crash.
  * Load factor 0.7 ensures probing terminates. */
 static void local_sym_rehash(local_sym_t* ls) {
+    if (ls->bucket_cap > UINT32_MAX / 2) return; /* overflow guard */
     uint32_t new_cap = ls->bucket_cap * 2;
     uint64_t* new_buckets = (uint64_t*)td_sys_alloc(new_cap * sizeof(uint64_t));
     if (!new_buckets) return;
@@ -682,7 +690,8 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
     bool has_quotes = (memchr(p, '"', remaining) != NULL);
 
     if (TD_LIKELY(!has_quotes)) {
-        /* Fast path: no quotes, use memchr for newlines */
+        /* Fast path: no quotes, use memchr for newlines.
+         * Only scans for \n; pure \r line endings (old Mac) treated as single row. */
         for (;;) {
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             if (!nl) break;
@@ -745,6 +754,7 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
 typedef struct {
     uint32_t*  data;
     int64_t**  mappings;
+    uint32_t*  mapping_counts; /* count per worker for bounds checking */
     uint32_t   n_workers;
 } sym_fixup_ctx_t;
 
@@ -753,15 +763,16 @@ static void sym_fixup_fn(void* arg, uint32_t worker_id, int64_t start, int64_t e
     sym_fixup_ctx_t* c = (sym_fixup_ctx_t*)arg;
     uint32_t* restrict data = c->data;
     int64_t** restrict mappings = c->mappings;
+    uint32_t* restrict mcounts = c->mapping_counts;
     for (int64_t r = start; r < end; r++) {
         uint32_t packed = data[r];
         uint32_t wid = UNPACK_WID(packed);
         if (wid >= c->n_workers) continue; /* corrupted packed value */
         uint32_t lid = UNPACK_LID(packed);
-        if (mappings[wid])
+        if (mappings[wid] && lid < mcounts[wid])
             data[r] = (uint32_t)mappings[wid][lid];
         else
-            data[r] = 0;
+            data[r] = 0; /* fallback for corrupt packed value */
     }
 }
 
@@ -775,9 +786,11 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
         /* Build per-worker mappings: local_id → global sym_id (VLA) */
         int64_t* mappings[n_workers];
         td_t* map_hdrs[n_workers];
+        uint32_t mapping_counts[n_workers]; /* count per worker for lid bounds checking */
         for (uint32_t w = 0; w < n_workers; w++) {
             mappings[w] = NULL;
             map_hdrs[w] = NULL;
+            mapping_counts[w] = 0;
         }
 
         for (uint32_t w = 0; w < n_workers; w++) {
@@ -787,6 +800,7 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
             mappings[w] = (int64_t*)scratch_alloc(&map_hdrs[w],
                                                     ls->count * sizeof(int64_t));
             if (!mappings[w]) continue;
+            mapping_counts[w] = ls->count;
             for (uint32_t i = 0; i < ls->count; i++) {
                 mappings[w][i] = td_sym_intern(
                     ls->arena + ls->offsets[i], ls->lens[i]);
@@ -799,17 +813,19 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
         uint32_t* data = (uint32_t*)col_data[c];
         if (pool && n_rows > 1024) {
             sym_fixup_ctx_t ctx = { .data = data, .mappings = mappings,
+                                    .mapping_counts = mapping_counts,
                                     .n_workers = n_workers };
             td_pool_dispatch(pool, sym_fixup_fn, &ctx, n_rows);
         } else {
             for (int64_t r = 0; r < n_rows; r++) {
                 uint32_t packed = data[r];
                 uint32_t wid = UNPACK_WID(packed);
+                if (wid >= n_workers) continue;
                 uint32_t lid = UNPACK_LID(packed);
-                if (mappings[wid])
+                if (mappings[wid] && lid < mapping_counts[wid])
                     data[r] = (uint32_t)mappings[wid][lid];
                 else
-                    data[r] = 0;
+                    data[r] = 0; /* fallback for corrupt packed value */
             }
         }
 
@@ -829,7 +845,7 @@ typedef struct {
     int               n_cols;
     char              delim;
     const csv_type_t* col_types;
-    void**            col_data;
+    void**            col_data;     /* non-const: workers write parsed values into columns */
     local_sym_t*      local_syms;   /* [n_workers * n_cols] */
     uint32_t          n_workers;
 } csv_par_ctx_t;

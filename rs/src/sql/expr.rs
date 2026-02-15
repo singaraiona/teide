@@ -132,6 +132,8 @@ pub fn plan_expr(
         }
 
         // IN list: x IN (a, b, c)  →  x = a OR x = b OR x = c
+        // Hoist the inner expression once and reuse for all comparisons to
+        // avoid creating redundant scan nodes in the graph.
         Expr::InList {
             expr: inner,
             list,
@@ -144,9 +146,8 @@ pub fn plan_expr(
             let first_val = plan_expr(g, &list[0], schema)?;
             let mut result = g.eq(x, first_val)?;
             for item in &list[1..] {
-                let x_again = plan_expr(g, inner, schema)?;
                 let val = plan_expr(g, item, schema)?;
-                let cmp = g.eq(x_again, val)?;
+                let cmp = g.eq(x, val)?;
                 result = g.or(result, cmp)?;
             }
             if *negated {

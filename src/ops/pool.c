@@ -91,6 +91,14 @@ td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
     /* conc-L7: memset zeroes all fields including the `cancelled` atomic,
      * which resets any cancellation state from a prior pool instance. */
     memset(pool, 0, sizeof(*pool));
+    /* H3: Re-initialize atomic fields after memset — memset produces a
+     * valid zero bit pattern on all supported platforms, but C11 requires
+     * atomic_init for well-defined atomic semantics. */
+    atomic_init(&pool->shutdown, 0);
+    atomic_init(&pool->task_tail, 0);
+    atomic_init(&pool->task_count, 0);
+    atomic_init(&pool->pending, 0);
+    atomic_init(&pool->cancelled, 0);
 
     if (n_workers == 0) {
         uint32_t ncpu = td_thread_count();
@@ -196,6 +204,9 @@ void td_pool_free(td_pool_t* pool) {
  * td_pool_dispatch
  * -------------------------------------------------------------------------- */
 
+/* M2: Caller (td_execute) must reset pool->cancelled before dispatching.
+ * The cancelled flag is per-query state; failing to clear it causes all
+ * subsequent dispatches to skip task execution. */
 void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
                       int64_t total_elems) {
     if (total_elems <= 0) return;
@@ -363,6 +374,9 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
  * Global pool singleton (lazy init)
  * -------------------------------------------------------------------------- */
 
+/* L4: Global singleton; not destroyed at program exit (OS reclaims resources).
+ * May cause ASan leak reports — suppress via LSAN_OPTIONS=detect_leaks=0 or
+ * an explicit td_pool_destroy() call before exit. */
 static td_pool_t  g_pool;
 static _Atomic(uint32_t) g_pool_init_state = 0;  /* 0=uninit, 1=initializing, 2=ready */
 

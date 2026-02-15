@@ -931,7 +931,10 @@ fn plan_query(
 
         // Fuse LIMIT into HEAD(SORT) so the engine only gathers N rows
         let total_limit = match (offset_val, limit_val) {
-            (Some(off), Some(lim)) => Some(off + lim),
+            (Some(off), Some(lim)) => Some(
+                off.checked_add(lim)
+                    .ok_or_else(|| SqlError::Plan("OFFSET + LIMIT overflow".into()))?,
+            ),
             (None, Some(lim)) => Some(lim),
             _ => None,
         };
@@ -1309,6 +1312,17 @@ fn plan_group_select(
     alias_exprs: &HashMap<String, Expr>,
     filter_mask: Option<*mut crate::td_t>,
 ) -> Result<(Table, Vec<String>), SqlError> {
+    // RAII guard: ensures the filter_mask is released on all exit paths
+    // (including early returns). set_filter_mask does its own retain, so the
+    // graph keeps the mask alive independently.
+    struct MaskGuard(*mut crate::td_t);
+    impl Drop for MaskGuard {
+        fn drop(&mut self) {
+            unsafe { crate::ffi_release(self.0); }
+        }
+    }
+    let _mask_guard = filter_mask.map(|m| MaskGuard(m));
+
     let has_group_by = !group_by_cols.is_empty();
 
     // Phase 1: Analyze SELECT items, collect all unique aggregates
@@ -1450,18 +1464,13 @@ fn plan_group_select(
     let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs)?;
 
     // Push filter mask into the graph so exec_group skips filtered rows.
-    // Ownership: execute_raw returns rc=1 mask, set_filter_mask retains (rc=2),
-    // we release our reference below (rc=1), Graph::drop releases the graph's
-    // reference (rc=0). The mask data is valid because working_table stays
-    // alive throughout.
+    // Ownership: set_filter_mask retains (rc=2). MaskGuard (created at the
+    // top of this function) releases our reference on any exit path (rc=1).
+    // Graph::drop releases the graph's reference (rc=0).
     if let Some(mask) = filter_mask {
         unsafe { g.set_filter_mask(mask); }
     }
     let group_result = g.execute(group_node)?;
-    // Release the mask reference (graph holds its own via set_filter_mask)
-    if let Some(mask) = filter_mask {
-        unsafe { crate::ffi_release(mask); }
-    }
 
     // Build result schema from NATIVE column names + our format_agg_name aliases.
     // The C engine names agg columns as "{col}_{suffix}" (e.g., "v1_sum").
@@ -2208,10 +2217,12 @@ fn concat_tables(ctx: &Context, left: &Table, right: &Table) -> Result<Table, Sq
 
 /// Execute a CROSS JOIN (Cartesian product) of two tables.
 ///
-/// NOTE: cross join memcpy does not preserve null bitmaps.
-/// Columns with nulls will have null information dropped.
-/// This is acceptable because cross join is used for small literal tables
-/// that never contain nulls in practice.
+/// **Known limitation**: cross join memcpy does not preserve null bitmaps.
+/// Columns with nulls will have null information silently dropped.
+/// This is acceptable because cross join is currently only used for small
+/// literal tables that never contain nulls in practice. If cross join is
+/// later exposed for general use, a null bitmap check should be added to
+/// return an error when input columns carry null bitmaps.
 fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
     let _ = ctx;
     let left = ensure_vector_columns(left, "CROSS JOIN")?;
@@ -2391,6 +2402,8 @@ fn exec_set_operation(
     result.finish()
 }
 
+/// Raw column data pointer -- valid only while the source Table is alive.
+/// Do not store beyond the scope of exec_set_operation.
 #[derive(Clone, Copy)]
 struct SetOpCol {
     col_type: i8,
@@ -2719,8 +2732,10 @@ fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr
             }
         }
         crate::types::I64 | crate::types::I32 => {
-            let v = table.get_i64(col, row).unwrap_or(0);
-            Ok(Expr::Value(Value::Number(format!("{v}"), false)))
+            match table.get_i64(col, row) {
+                Some(v) => Ok(Expr::Value(Value::Number(v.to_string(), false))),
+                None => Ok(Expr::Value(Value::Null)),
+            }
         }
         crate::types::SYM | crate::types::ENUM => {
             let v = table.get_str(col, row).unwrap_or_default();

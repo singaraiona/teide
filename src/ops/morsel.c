@@ -64,7 +64,10 @@ bool td_morsel_next(td_morsel_t* m) {
     m->morsel_len = remaining < TD_MORSEL_ELEMS ? remaining : TD_MORSEL_ELEMS;
     m->morsel_ptr = (uint8_t*)td_data(m->vec) + (size_t)m->offset * m->elem_size;
 
-    /* Null bitmap: only if HAS_NULLS */
+    /* Null bitmap: only if HAS_NULLS.
+     * M5: null_bits points to the byte containing bit (m->offset).
+     * Callers must account for (m->offset % 8) bit offset within the
+     * first byte of null_bits when testing individual null bits. */
     m->null_bits = NULL;
     if (m->vec->attrs & TD_ATTR_HAS_NULLS) {
         if (m->vec->attrs & TD_ATTR_NULLMAP_EXT) {

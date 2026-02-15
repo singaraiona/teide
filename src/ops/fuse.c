@@ -58,6 +58,9 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
     if (!root) return;
 
     uint32_t nc = g->node_count;
+    /* M3: Overflow guard — prevent stack_cap from wrapping around on
+       pathologically large graphs. */
+    if (nc > UINT32_MAX / 2) return;
     uint32_t stack_cap = nc * 2;
     uint32_t stack_local[256];
     uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)td_sys_alloc(stack_cap * sizeof(uint32_t));
@@ -88,7 +91,9 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
            ext->sym holds the total arg count. */
         if (n->opcode == OP_CONCAT) {
             td_op_ext_t* ext = find_ext(g, nid);
-            if (ext) {
+            /* M4: Guard against ext->sym < 2 — trailing uint32_t values
+               only exist when there are more than 2 arguments. */
+            if (ext && ext->sym >= 2) {
                 int n_args = (int)ext->sym;
                 uint32_t* trail = (uint32_t*)((char*)(ext + 1));
                 for (int i = 2; i < n_args; i++) {

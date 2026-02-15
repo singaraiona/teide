@@ -166,7 +166,8 @@ pub struct CompletionState {
 fn lock_completion_state(state: &Arc<Mutex<CompletionState>>) -> MutexGuard<'_, CompletionState> {
     match state.lock() {
         Ok(guard) => guard,
-        // If a panic poisoned the mutex, keep serving completions with last-known state.
+        // Intentionally recovers from poisoned mutex to keep completions working.
+        // The completion state is best-effort metadata; stale data is acceptable.
         Err(poisoned) => poisoned.into_inner(),
     }
 }

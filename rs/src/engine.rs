@@ -815,6 +815,10 @@ impl Drop for Table {
 /// A reference to an operation node in a `Graph`. Does not own memory --
 /// the `Graph` owns all nodes.
 ///
+/// Raw pointer to a graph operation node. **WARNING**: This is only valid
+/// while the parent `Graph` is alive. Do not store Columns beyond the
+/// Graph's lifetime.
+///
 /// SAFETY: Column holds a raw pointer into Graph's node array.
 /// It must not be used after the Graph is dropped or with a different Graph.
 /// The current API enforces this by requiring &self on Graph methods that

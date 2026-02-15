@@ -34,15 +34,30 @@
  * On-disk format IS the in-memory format (zero deserialization on load).
  * -------------------------------------------------------------------------- */
 
+/* Explicit allowlist of types that are safe to serialize as raw bytes.
+ * Only fixed-size scalar types -- pointer-bearing types (STR, LIST, TABLE)
+ * and non-scalar types are excluded. */
+static bool is_serializable_type(int8_t t) {
+    switch (t) {
+    case TD_BOOL: case TD_U8:   case TD_CHAR:  case TD_I16:
+    case TD_I32:  case TD_I64:  case TD_F64:   case TD_SYM:
+    case TD_DATE: case TD_TIME: case TD_TIMESTAMP: case TD_GUID:
+    case TD_ENUM:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* --------------------------------------------------------------------------
- * td_col_save — write a vector to a column file
+ * td_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
 td_err_t td_col_save(td_t* vec, const char* path) {
     if (!vec || TD_IS_ERR(vec)) return TD_ERR_TYPE;
     if (!path) return TD_ERR_IO;
-    /* Pointer-bearing types can't be serialized as raw bytes */
-    if (vec->type == TD_STR || vec->type == TD_LIST || vec->type == TD_TABLE)
+    /* Explicit allowlist of serializable types */
+    if (!is_serializable_type(vec->type))
         return TD_ERR_NYI;
 
     FILE* f = fopen(path, "wb");
@@ -67,6 +82,7 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     /* Write data */
     if (vec->len < 0) { fclose(f); return TD_ERR_CORRUPT; }
     uint8_t esz = td_elem_size(vec->type);
+    if (esz == 0 && vec->len > 0) { fclose(f); return TD_ERR_TYPE; }
     /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
     if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
         fclose(f);
@@ -76,7 +92,14 @@ td_err_t td_col_save(td_t* vec, const char* path) {
 
     void* data;
     if (vec->attrs & TD_ATTR_SLICE) {
-        data = (char*)td_data(vec->slice_parent) + vec->slice_offset * esz;
+        /* Validate slice bounds before computing data pointer */
+        td_t* parent = vec->slice_parent;
+        if (!parent || vec->slice_offset < 0 ||
+            vec->slice_offset + vec->len > parent->len) {
+            fclose(f);
+            return TD_ERR_IO;
+        }
+        data = (char*)td_data(parent) + vec->slice_offset * esz;
     } else {
         data = td_data(vec);
     }
@@ -92,7 +115,7 @@ td_err_t td_col_save(td_t* vec, const char* path) {
 }
 
 /* --------------------------------------------------------------------------
- * td_col_load — load a column file via mmap (zero deserialization)
+ * td_col_load -- load a column file via mmap (zero deserialization)
  * -------------------------------------------------------------------------- */
 
 td_t* td_col_load(const char* path) {
@@ -111,14 +134,10 @@ td_t* td_col_load(const char* path) {
 
     td_t* tmp = (td_t*)ptr;
 
-    /* Validate type from untrusted file data */
-    if (tmp->type == TD_STR || tmp->type == TD_LIST || tmp->type == TD_TABLE) {
+    /* Validate type from untrusted file data -- allowlist only */
+    if (!is_serializable_type(tmp->type)) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_NYI);
-    }
-    if (tmp->type <= 0 || tmp->type >= TD_TYPE_COUNT) {
-        td_vm_unmap_file(ptr, mapped_size);
-        return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
     if (tmp->len < 0) {
         td_vm_unmap_file(ptr, mapped_size);
@@ -126,6 +145,10 @@ td_t* td_col_load(const char* path) {
     }
 
     uint8_t esz = td_elem_size(tmp->type);
+    if (esz == 0 && tmp->len > 0) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_TYPE);
+    }
     if ((uint64_t)tmp->len * esz > SIZE_MAX - 32) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_IO);
@@ -155,10 +178,10 @@ td_t* td_col_load(const char* path) {
 }
 
 /* --------------------------------------------------------------------------
- * td_col_mmap — zero-copy column load via mmap (mmod=1)
+ * td_col_mmap -- zero-copy column load via mmap (mmod=1)
  *
  * Returns a td_t* backed directly by the file's mmap region.
- * MAP_PRIVATE gives COW semantics — only the header page gets a private
+ * MAP_PRIVATE gives COW semantics -- only the header page gets a private
  * copy when we write mmod/rc. All data pages stay shared with page cache.
  * td_release -> td_free -> munmap.
  * -------------------------------------------------------------------------- */
@@ -177,14 +200,10 @@ td_t* td_col_mmap(const char* path) {
 
     td_t* vec = (td_t*)ptr;
 
-    /* Validate type from untrusted file data */
-    if (vec->type == TD_STR || vec->type == TD_LIST || vec->type == TD_TABLE) {
+    /* Validate type from untrusted file data -- allowlist only */
+    if (!is_serializable_type(vec->type)) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_NYI);
-    }
-    if (vec->type <= 0 || vec->type >= TD_TYPE_COUNT) {
-        td_vm_unmap_file(ptr, mapped_size);
-        return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
     if (vec->len < 0) {
         td_vm_unmap_file(ptr, mapped_size);
@@ -214,7 +233,7 @@ td_t* td_col_mmap(const char* path) {
         return TD_ERR_PTR(TD_ERR_IO);
     }
 
-    /* Patch header — MAP_PRIVATE COW: only the header page gets copied */
+    /* Patch header -- MAP_PRIVATE COW: only the header page gets copied */
     vec->mmod = 1;
     vec->order = 0;
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);

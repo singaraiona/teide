@@ -100,6 +100,9 @@ static void graph_fixup_ptrs(td_graph_t* g, td_op_t* old_nodes) {
 static td_op_t* graph_alloc_node(td_graph_t* g) {
     if (g->node_count >= g->node_cap) {
         td_op_t* old_nodes = g->nodes;
+        /* H2: Overflow guard — if node_cap is already > UINT32_MAX/2,
+           doubling would wrap around to a smaller value. */
+        if (g->node_cap > UINT32_MAX / 2) return NULL;
         uint32_t new_cap = g->node_cap * 2;
         td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
                                                       new_cap * sizeof(td_op_t));

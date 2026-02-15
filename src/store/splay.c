@@ -90,6 +90,8 @@ td_err_t td_splay_save(td_t* tbl, const char* dir, const char* sym_path) {
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
 
         td_err_t err = td_col_save(col, path);
+        /* On partial failure, columns 0..c-1 remain on disk.
+         * Caller should clean up or use atomic rename for safe writes. */
         if (err != TD_OK) return err;
     }
 

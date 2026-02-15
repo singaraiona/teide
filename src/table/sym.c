@@ -64,8 +64,11 @@ static _Atomic(bool) g_sym_inited = false;
 /* Spinlock protecting g_sym mutations in td_sym_intern */
 static _Atomic(int) g_sym_lock = 0;
 static inline void sym_lock(void) {
-    while (atomic_exchange_explicit(&g_sym_lock, 1, memory_order_acquire))
-        ; /* spin */
+    while (atomic_exchange_explicit(&g_sym_lock, 1, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
 }
 static inline void sym_unlock(void) {
     atomic_store_explicit(&g_sym_lock, 0, memory_order_release);
@@ -176,7 +179,7 @@ int64_t td_sym_intern(const char* str, size_t len) {
     /* Probe for existing entry */
     for (;;) {
         uint64_t e = g_sym.buckets[slot];
-        if (e == 0) break;  /* empty — not found */
+        if (e == 0) break;  /* empty -- not found */
 
         uint32_t e_hash = (uint32_t)(e >> 32);
         if (e_hash == hash) {
@@ -197,7 +200,7 @@ int64_t td_sym_intern(const char* str, size_t len) {
         return -1;
     }
 
-    /* Not found — create new entry */
+    /* Not found -- create new entry */
     uint32_t new_id = g_sym.str_count;
 
     /* Grow strings array if needed */
@@ -240,7 +243,7 @@ int64_t td_sym_find(const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
 
     /* Lock required: concurrent td_sym_intern may trigger ht_grow which
-     * frees and replaces g_sym.buckets — reading without lock is UAF. */
+     * frees and replaces g_sym.buckets -- reading without lock is UAF. */
     sym_lock();
 
     uint32_t hash = fnv1a(str, len);
@@ -249,7 +252,7 @@ int64_t td_sym_find(const char* str, size_t len) {
 
     for (;;) {
         uint64_t e = g_sym.buckets[slot];
-        if (e == 0) { sym_unlock(); return -1; }  /* empty — not found */
+        if (e == 0) { sym_unlock(); return -1; }  /* empty -- not found */
 
         uint32_t e_hash = (uint32_t)(e >> 32);
         if (e_hash == hash) {
@@ -269,8 +272,10 @@ int64_t td_sym_find(const char* str, size_t len) {
  * td_sym_str
  * -------------------------------------------------------------------------- */
 
-/* Returns unretained internal pointer. Caller must not store across sym table
- * mutations (ht_grow). Safe during read-only access phase. */
+/* Returned pointer is valid only while no concurrent td_sym_intern occurs.
+ * Safe during read-only execution phase (after all interning is complete).
+ * Caller must not store the pointer across sym table mutations (ht_grow
+ * or strings realloc). */
 td_t* td_sym_str(int64_t id) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return NULL;
 
@@ -297,7 +302,7 @@ uint32_t td_sym_count(void) {
 }
 
 /* --------------------------------------------------------------------------
- * td_sym_save — serialize symbol table to a binary file
+ * td_sym_save -- serialize symbol table to a binary file
  *
  * Format:
  *   [4B magic "TSYM"][4B count]
@@ -310,11 +315,17 @@ td_err_t td_sym_save(const char* path) {
     if (!path) return TD_ERR_IO;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return TD_ERR_IO;
 
+    /* Snapshot str_count and strings pointer under lock to avoid reading
+     * stale values if a concurrent td_sym_intern triggers reallocation. */
+    sym_lock();
+    uint32_t count = g_sym.str_count;
+    td_t** strings = g_sym.strings;
+    sym_unlock();
+
     FILE* f = fopen(path, "wb");
     if (!f) return TD_ERR_IO;
 
     uint32_t magic = 0x4D595354;  /* "TSYM" little-endian */
-    uint32_t count = g_sym.str_count;
 
     if (fwrite(&magic, 4, 1, f) != 1 ||
         fwrite(&count, 4, 1, f) != 1) {
@@ -323,7 +334,7 @@ td_err_t td_sym_save(const char* path) {
     }
 
     for (uint32_t i = 0; i < count; i++) {
-        td_t* s = g_sym.strings[i];
+        td_t* s = strings[i];
         uint32_t len = (uint32_t)td_str_len(s);
         const char* data = td_str_ptr(s);
 
@@ -339,7 +350,7 @@ td_err_t td_sym_save(const char* path) {
 }
 
 /* --------------------------------------------------------------------------
- * td_sym_load — deserialize symbol table from a binary file
+ * td_sym_load -- deserialize symbol table from a binary file
  *
  * Interns all symbols from the file into the global symbol table.
  * Must be called after td_sym_init(). Existing symbols are preserved
@@ -371,7 +382,7 @@ td_err_t td_sym_load(const char* path) {
         return TD_ERR_CORRUPT;
     }
 
-    /* Read buffer — reuse for all strings */
+    /* Read buffer -- reuse for all strings */
     char buf[4096];
     char* heap_buf = NULL;
     size_t heap_cap = 0;

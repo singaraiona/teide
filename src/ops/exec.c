@@ -96,7 +96,8 @@ static inline bool pool_cancelled(td_pool_t* pool) {
     } while(0)
 
 /* --------------------------------------------------------------------------
- * Helper: find the extended node for a given base node ID
+ * Helper: find the extended node for a given base node ID.
+ * O(ext_count) linear scan; acceptable for typical graph sizes (<100 ext nodes).
  * -------------------------------------------------------------------------- */
 
 static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
@@ -200,7 +201,10 @@ static bool eval_const_numeric_expr(td_graph_t* g, td_op_t* op,
             return true;
         }
         int64_t v = ai;
-        int64_t r = (op->opcode == OP_NEG) ? -v : (v < 0 ? -v : v);
+        /* Unsigned negation avoids UB on INT64_MIN */
+        int64_t r = (op->opcode == OP_NEG)
+                  ? (int64_t)(-(uint64_t)v)
+                  : (v < 0 ? (int64_t)(-(uint64_t)v) : v);
         *out_i = r;
         *out_f = (double)r;
         *out_is_f64 = false;
@@ -238,9 +242,10 @@ static bool eval_const_numeric_expr(td_graph_t* g, td_op_t* op,
 
     int64_t r = 0;
     switch (op->opcode) {
-        case OP_ADD: r = li + ri; break;
-        case OP_SUB: r = li - ri; break;
-        case OP_MUL: r = li * ri; break;
+        /* Use uint64_t casts to get defined wrapping on overflow */
+        case OP_ADD: r = (int64_t)((uint64_t)li + (uint64_t)ri); break;
+        case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
+        case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
         case OP_DIV: r = ri != 0 ? li / ri : 0; break;
         case OP_MOD: r = ri != 0 ? li % ri : 0; break;
         case OP_MIN2: r = li < ri ? li : ri; break;
@@ -760,9 +765,10 @@ static void expr_exec_binary(uint8_t opcode, int8_t dt, void* dp,
         const int64_t* a = (const int64_t*)ap;
         const int64_t* b = (const int64_t*)bp;
         switch (opcode) {
-            case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = a[j] + b[j]; break;
-            case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = a[j] - b[j]; break;
-            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = a[j] * b[j]; break;
+            /* Use uint64_t casts to get defined wrapping on overflow */
+            case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] + (uint64_t)b[j]); break;
+            case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
+            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] / b[j] : 0; break;
             case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] % b[j] : 0; break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
@@ -833,13 +839,17 @@ static void expr_exec_unary(uint8_t opcode, int8_t dt, void* dp,
         if (t1 == TD_I64) {
             const int64_t* a = (const int64_t*)ap;
             switch (opcode) {
-                case OP_NEG: for (int64_t j = 0; j < n; j++) d[j] = -a[j]; break;
-                case OP_ABS: for (int64_t j = 0; j < n; j++) d[j] = a[j] < 0 ? -a[j] : a[j]; break;
+                /* Unsigned negation avoids UB on INT64_MIN */
+                case OP_NEG: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)(-(uint64_t)a[j]); break;
+                case OP_ABS: for (int64_t j = 0; j < n; j++) d[j] = a[j] < 0 ? (int64_t)(-(uint64_t)a[j]) : a[j]; break;
                 default: break;
             }
-        } else { /* CAST f64→i64 */
+        } else { /* CAST f64→i64 — clamp to avoid out-of-range UB */
             const double* a = (const double*)ap;
-            for (int64_t j = 0; j < n; j++) d[j] = (int64_t)a[j];
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (a[j] >= (double)INT64_MAX) ? INT64_MAX
+                     : (a[j] <= (double)INT64_MIN) ? INT64_MIN
+                     : (int64_t)a[j];
         }
     } else if (dt == TD_BOOL) {
         uint8_t* d = (uint8_t*)dp;
@@ -1009,8 +1019,9 @@ static td_t* exec_elementwise_unary(td_graph_t* g, td_op_t* op, td_t* input) {
                     if (out_type == TD_I64) {
                         int64_t r;
                         switch (op->opcode) {
-                            case OP_NEG: r = -v; break;
-                            case OP_ABS: r = v < 0 ? -v : v; break;
+                            /* Unsigned negation avoids UB on INT64_MIN */
+                            case OP_NEG: r = (int64_t)(-(uint64_t)v); break;
+                            case OP_ABS: r = v < 0 ? (int64_t)(-(uint64_t)v) : v; break;
                             default:     r = v; break;
                         }
                         ((int64_t*)dst)[i] = r;
@@ -1116,9 +1127,10 @@ static void binary_range(td_op_t* op, int8_t out_type,
             int64_t li = (int64_t)lv, ri = (int64_t)rv;
             int64_t r;
             switch (op->opcode) {
-                case OP_ADD: r = li + ri; break;
-                case OP_SUB: r = li - ri; break;
-                case OP_MUL: r = li * ri; break;
+                /* Use uint64_t casts to get defined wrapping on overflow */
+                case OP_ADD: r = (int64_t)((uint64_t)li + (uint64_t)ri); break;
+                case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
+                case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
                 case OP_DIV: r = ri != 0 ? li / ri : 0; break;
                 case OP_MOD: r = ri != 0 ? li % ri : 0; break;
                 case OP_MIN2: r = li < ri ? li : ri; break;
@@ -1363,9 +1375,9 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
         if (src->max_i > dst->max_i) dst->max_i = src->max_i;
     }
     dst->cnt += src->cnt;
-    /* first/last: keep lowest-index first and highest-index last
+    /* reduce_merge does not merge first/last; caller handles these separately.
      * Since workers process sequential ranges, worker 0's first is the global first,
-     * and the last worker's last is the global last. We handle this after merge. */
+     * and the last worker's last is the global last. */
 }
 
 static td_t* exec_reduction(td_graph_t* g, td_op_t* op, td_t* input) {
@@ -1652,7 +1664,9 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     if (pass_count <= TD_PARALLEL_THRESHOLD || ncols <= 0)
         return exec_filter_seq(input, pred, ncols, pass_count);
 
-    if (ncols > 4096) return TD_ERR_PTR(TD_ERR_NYI); /* stack safety */
+    /* VLA guard: cap at 256 columns for stack safety (256*16 = 4KB).
+     * Wider tables fall back to sequential filter. */
+    if (ncols > 256) return exec_filter_seq(input, pred, ncols, pass_count);
 
     /* Build match_idx: match_idx[j] = row of j-th matching element */
     td_t* idx_hdr = NULL;
@@ -2550,7 +2564,8 @@ static void topn_scan_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
 
 static int64_t topn_merge_fused(fused_topn_ctx_t* ctx, uint32_t n_workers,
                                  int64_t* out, int64_t limit) {
-    /* VLA bounded by TOPN_MAX (1024) — max 16KB on stack. */
+    /* Clamp to TOPN_MAX (1024) for VLA stack safety — max 16KB. */
+    if (limit > 1024) limit = 1024;
     topn_entry_t merge[limit];
     int64_t cnt = 0;
     for (uint32_t w = 0; w < n_workers; w++) {
@@ -2585,7 +2600,8 @@ static int64_t topn_merge_fused(fused_topn_ctx_t* ctx, uint32_t n_workers,
 /* Merge per-worker heaps → sorted indices in out[0..return_val-1]. */
 static int64_t topn_merge(topn_ctx_t* ctx, uint32_t n_workers,
                            int64_t* out, int64_t limit) {
-    /* Scratch merge heap (on stack — limit is bounded by TOPN_MAX) */
+    /* Clamp to TOPN_MAX (1024) for VLA stack safety. */
+    if (limit > 1024) limit = 1024;
     topn_entry_t merge[limit];
     int64_t cnt = 0;
 
@@ -4306,7 +4322,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 uint16_t op = c->agg_ops[a];
                 if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                     acc->f64[idx] += fv;
-                    acc->i64[idx] += iv;
+                    acc->i64[idx] = (int64_t)((uint64_t)acc->i64[idx] + (uint64_t)iv);
                     if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
                 } else if (op == OP_FIRST) {
                     if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
@@ -4338,7 +4354,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             uint16_t op = c->agg_ops[a];
             if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
                 acc->f64[idx] += fv;
-                acc->i64[idx] += iv;
+                acc->i64[idx] = (int64_t)((uint64_t)acc->i64[idx] + (uint64_t)iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
             } else if (op == OP_FIRST) {
                 if (acc->count[gid] == 1) { acc->f64[idx] = fv; acc->i64[idx] = iv; }
@@ -6048,6 +6064,7 @@ static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
  * Technically UB per C11 (requires _Atomic), but universally supported by
  * GCC/Clang and generates correct code.  Changing to _Atomic(int64_t) could
  * affect scratch_alloc alignment requirements, so we keep plain type. */
+_Static_assert(_Alignof(int64_t) >= 8, "int64_t must be 8-byte aligned for atomic ops");
 typedef struct {
     int64_t* ht_heads;     /* shared, protected by atomic CAS */
     int64_t* ht_next;      /* per-row, no contention */
@@ -6157,6 +6174,8 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
                 ri[off] = r;
                 off++;
                 matched = true;
+                /* Monotonic 0→1 store from multiple workers; benign race on
+                 * non-_Atomic uint8_t (same UB caveat as join_build_fn atomics). */
                 if (c->matched_right) __atomic_store_n(&c->matched_right[r], 1, __ATOMIC_RELAXED);
             }
         }

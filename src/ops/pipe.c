@@ -37,6 +37,9 @@
 td_pipe_t* td_pipe_new(void) {
     td_pipe_t* p = (td_pipe_t*)td_sys_alloc(sizeof(td_pipe_t));
     if (!p) return NULL;
+    /* L3: Zero-init the entire struct before setting individual fields,
+       ensuring no uninitialized pointers or state. */
+    memset(p, 0, sizeof(*p));
     p->spill_fd = -1;
 
     return p;

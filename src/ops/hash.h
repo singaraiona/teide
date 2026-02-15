@@ -151,6 +151,9 @@ static const uint64_t td__wyp[4] = {
  * modern x86-64. Seed is fixed at 0 for deterministic, repeatable hashing
  * within a single process lifetime.
  */
+/* L2: Fixed seed=0 is acceptable for in-process dataframe operations;
+ * use a random seed if processing adversarial input (e.g., untrusted
+ * CSV with crafted hash collisions). */
 static inline uint64_t td_hash_bytes(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint64_t seed = 0;

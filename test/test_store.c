@@ -232,7 +232,7 @@ static MunitResult test_splay_open_roundtrip(const void* params, void* fixture) 
     (void)params; (void)fixture;
 
     /* Clean up any leftover splay dir */
-    system("rm -rf " TMP_SPLAY_DIR);
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
 
     /* Build a 3-column table: I64, F64, I32 */
     td_t* tbl = td_table_new(4);
@@ -304,7 +304,7 @@ static MunitResult test_splay_open_roundtrip(const void* params, void* fixture) 
     td_release(tbl);
 
     /* Cleanup */
-    system("rm -rf " TMP_SPLAY_DIR);
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
     return MUNIT_OK;
 }
 

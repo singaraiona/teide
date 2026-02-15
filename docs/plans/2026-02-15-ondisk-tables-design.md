@@ -31,18 +31,19 @@ This is already implemented in `src/store/col.c`. The change: instead of `td_col
 td_t* td_col_mmap(const char* path);
 ```
 
-Returns a `td_t*` with `mmod=2` (direct-mmap). The OS manages which pages are resident. Unused pages get evicted under memory pressure. No buddy allocator involvement for the data — just the 32-byte header interpretation.
+Returns a `td_t*` with `mmod=1` (file-mmap). The OS manages which pages are resident. Unused pages get evicted under memory pressure. No buddy allocator involvement for the data — just the 32-byte header interpretation. Uses `MAP_PRIVATE` (COW): only the header page gets a private copy when we write mmod/rc; all data pages stay shared with the page cache.
 
 **mmod values**:
 - `0` — buddy-allocated (current behavior)
-- `1` — file-mmap managed by storage layer (legacy, used by col_load internally)
-- `2` — direct-mmap, zero-copy (new)
+- `1` — file-mmap, zero-copy (td_col_mmap)
+- `2` — direct-mmap for large buddy allocations (>1GiB, tracked via td_tl_direct_blocks)
 
-**COW guard**: any mutation attempt on an mmod=2 vector triggers a buddy copy — allocate, memcpy the touched region, then write. Read-only analytics never hits this path.
+**COW guard**: any mutation attempt on an mmod=1 vector triggers a buddy copy via `td_cow()` — allocate, memcpy, then write. Read-only analytics never hits this path.
 
-**Release dispatch**: `td_release` checks mmod:
+**Release dispatch**: `td_release` → `td_free` checks mmod:
 - `mmod=0` → buddy free (existing)
-- `mmod=2` → `munmap` the backing region
+- `mmod=1` → compute mapped_size from header, `munmap`
+- `mmod=2` → direct-mmap free (existing)
 
 ## 3. Symfile Management & Splayed Table Intersection
 

@@ -71,21 +71,25 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
     /* Iterative post-order: collect nodes into an order array, then
        process in reverse (children before parents). */
     uint32_t nc = g->node_count;
-    uint32_t stack[256];
-    uint32_t order[256];
+    uint32_t stack_local[256], order_local[256];
     bool visited_stack[256];
+    uint32_t *stack = nc <= 256 ? stack_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
     bool* visited;
     if (nc <= 256) {
         visited = visited_stack;
     } else {
         visited = (bool*)td_sys_alloc(nc * sizeof(bool));
-        if (!visited) return;
+    }
+    if (!stack || !order || !visited) {
+        if (nc > 256) { td_sys_free(stack); td_sys_free(order); td_sys_free(visited); }
+        return;
     }
     memset(visited, 0, nc * sizeof(bool));
 
     int sp = 0, oc = 0;
     stack[sp++] = root->id;
-    while (sp > 0 && oc < 256) {
+    while (sp > 0 && oc < (int)nc) {
         uint32_t nid = stack[--sp];
         td_op_t* n = &g->nodes[nid];
         if (!n || n->flags & OP_FLAG_DEAD) continue;
@@ -93,7 +97,7 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
         visited[nid] = true;
         order[oc++] = nid;
         for (int i = 0; i < 2 && i < n->arity; i++) {
-            if (n->inputs[i] && sp < 256)
+            if (n->inputs[i] && sp < (int)nc)
                 stack[sp++] = n->inputs[i]->id;
         }
     }
@@ -101,7 +105,7 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
     for (int i = oc - 1; i >= 0; i--)
         infer_type_for_node(&g->nodes[order[i]]);
 
-    if (nc > 256) td_sys_free(visited);
+    if (nc > 256) { td_sys_free(stack); td_sys_free(order); td_sys_free(visited); }
 }
 
 /* --------------------------------------------------------------------------
@@ -356,21 +360,25 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
     /* Iterative post-order: collect nodes, then process in reverse
        (children before parents). */
     uint32_t nc = g->node_count;
-    uint32_t stack[256];
-    uint32_t order[256];
+    uint32_t stack_local[256], order_local[256];
     bool visited_stack[256];
+    uint32_t *stack = nc <= 256 ? stack_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+    uint32_t *order = nc <= 256 ? order_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
     bool* visited;
     if (nc <= 256) {
         visited = visited_stack;
     } else {
         visited = (bool*)td_sys_alloc(nc * sizeof(bool));
-        if (!visited) return;
+    }
+    if (!stack || !order || !visited) {
+        if (nc > 256) { td_sys_free(stack); td_sys_free(order); td_sys_free(visited); }
+        return;
     }
     memset(visited, 0, nc * sizeof(bool));
 
     int sp = 0, oc = 0;
     stack[sp++] = root->id;
-    while (sp > 0 && oc < 256) {
+    while (sp > 0 && oc < (int)nc) {
         uint32_t nid = stack[--sp];
         td_op_t* n = &g->nodes[nid];
         if (!n || n->flags & OP_FLAG_DEAD) continue;
@@ -378,7 +386,7 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
         visited[nid] = true;
         order[oc++] = nid;
         for (int i = 0; i < 2 && i < n->arity; i++) {
-            if (n->inputs[i] && sp < 256)
+            if (n->inputs[i] && sp < (int)nc)
                 stack[sp++] = n->inputs[i]->id;
         }
     }
@@ -386,7 +394,7 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
     for (int i = oc - 1; i >= 0; i--)
         fold_node(g, &g->nodes[order[i]]);
 
-    if (nc > 256) td_sys_free(visited);
+    if (nc > 256) { td_sys_free(stack); td_sys_free(order); td_sys_free(visited); }
 }
 
 /* --------------------------------------------------------------------------
@@ -398,7 +406,10 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
 static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
     if (!root) return;
 
-    uint32_t stack[256];
+    uint32_t nc = g->node_count;
+    uint32_t stack_local[256];
+    uint32_t *stack = nc <= 256 ? stack_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+    if (!stack) return;
     int sp = 0;
     stack[sp++] = root->id;
     while (sp > 0) {
@@ -407,10 +418,11 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
         live[nid] = true;
         td_op_t* n = &g->nodes[nid];
         for (int i = 0; i < 2; i++) {
-            if (n->inputs[i] && sp < 256)
+            if (n->inputs[i] && sp < (int)nc)
                 stack[sp++] = n->inputs[i]->id;
         }
     }
+    if (nc > 256) td_sys_free(stack);
 }
 
 static void pass_dce(td_graph_t* g, td_op_t* root) {

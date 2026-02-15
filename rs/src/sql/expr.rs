@@ -51,19 +51,19 @@ pub fn plan_expr(
         Expr::Value(val) => match val {
             Value::Number(n, _) => {
                 if let Ok(i) = n.parse::<i64>() {
-                    Ok(g.const_i64(i))
+                    Ok(g.const_i64(i)?)
                 } else {
                     let f = n
                         .parse::<f64>()
                         .map_err(|_| SqlError::Plan(format!("Invalid number literal: {n}")))?;
-                    Ok(g.const_f64(f))
+                    Ok(g.const_f64(f)?)
                 }
             }
             Value::SingleQuotedString(s) => Ok(g.const_str(s)?),
-            Value::Boolean(b) => Ok(g.const_bool(*b)),
+            Value::Boolean(b) => Ok(g.const_bool(*b)?),
             Value::Null => {
                 // NULL represented as f64 NaN constant — C engine uses NaN-as-null
-                Ok(g.const_f64(f64::NAN))
+                Ok(g.const_f64(f64::NAN)?)
             }
             _ => Err(SqlError::Plan(format!("Unsupported value: {val}"))),
         },
@@ -72,20 +72,20 @@ pub fn plan_expr(
             let l = plan_expr(g, left, schema)?;
             let r = plan_expr(g, right, schema)?;
             match op {
-                BinaryOperator::Plus => Ok(g.add(l, r)),
-                BinaryOperator::Minus => Ok(g.sub(l, r)),
-                BinaryOperator::Multiply => Ok(g.mul(l, r)),
-                BinaryOperator::Divide => Ok(g.div(l, r)),
-                BinaryOperator::Modulo => Ok(g.modulo(l, r)),
-                BinaryOperator::Eq => Ok(g.eq(l, r)),
-                BinaryOperator::NotEq => Ok(g.ne(l, r)),
-                BinaryOperator::Lt => Ok(g.lt(l, r)),
-                BinaryOperator::LtEq => Ok(g.le(l, r)),
-                BinaryOperator::Gt => Ok(g.gt(l, r)),
-                BinaryOperator::GtEq => Ok(g.ge(l, r)),
-                BinaryOperator::And => Ok(g.and(l, r)),
-                BinaryOperator::Or => Ok(g.or(l, r)),
-                BinaryOperator::StringConcat => Ok(g.concat(&[l, r])),
+                BinaryOperator::Plus => Ok(g.add(l, r)?),
+                BinaryOperator::Minus => Ok(g.sub(l, r)?),
+                BinaryOperator::Multiply => Ok(g.mul(l, r)?),
+                BinaryOperator::Divide => Ok(g.div(l, r)?),
+                BinaryOperator::Modulo => Ok(g.modulo(l, r)?),
+                BinaryOperator::Eq => Ok(g.eq(l, r)?),
+                BinaryOperator::NotEq => Ok(g.ne(l, r)?),
+                BinaryOperator::Lt => Ok(g.lt(l, r)?),
+                BinaryOperator::LtEq => Ok(g.le(l, r)?),
+                BinaryOperator::Gt => Ok(g.gt(l, r)?),
+                BinaryOperator::GtEq => Ok(g.ge(l, r)?),
+                BinaryOperator::And => Ok(g.and(l, r)?),
+                BinaryOperator::Or => Ok(g.or(l, r)?),
+                BinaryOperator::StringConcat => Ok(g.concat(&[l, r])?),
                 _ => Err(SqlError::Plan(format!("Unsupported operator: {op}"))),
             }
         }
@@ -93,8 +93,8 @@ pub fn plan_expr(
         Expr::UnaryOp { op, expr: inner } => {
             let e = plan_expr(g, inner, schema)?;
             match op {
-                UnaryOperator::Not => Ok(g.not(e)),
-                UnaryOperator::Minus => Ok(g.neg(e)),
+                UnaryOperator::Not => Ok(g.not(e)?),
+                UnaryOperator::Minus => Ok(g.neg(e)?),
                 _ => Err(SqlError::Plan(format!("Unsupported unary operator: {op}"))),
             }
         }
@@ -104,11 +104,11 @@ pub fn plan_expr(
         // IS NULL / IS NOT NULL
         Expr::IsNull(inner) => {
             let e = plan_expr(g, inner, schema)?;
-            Ok(g.isnull(e))
+            Ok(g.isnull(e)?)
         }
         Expr::IsNotNull(inner) => {
             let e = plan_expr(g, inner, schema)?;
-            Ok(g.not(g.isnull(e)))
+            Ok(g.not(g.isnull(e)?)?)
         }
 
         // BETWEEN: x BETWEEN a AND b  →  x >= a AND x <= b
@@ -121,11 +121,11 @@ pub fn plan_expr(
             let x = plan_expr(g, inner, schema)?;
             let lo = plan_expr(g, low, schema)?;
             let hi = plan_expr(g, high, schema)?;
-            let ge = g.ge(x, lo);
-            let le = g.le(x, hi);
-            let result = g.and(ge, le);
+            let ge = g.ge(x, lo)?;
+            let le = g.le(x, hi)?;
+            let result = g.and(ge, le)?;
             if *negated {
-                Ok(g.not(result))
+                Ok(g.not(result)?)
             } else {
                 Ok(result)
             }
@@ -138,19 +138,19 @@ pub fn plan_expr(
             negated,
         } => {
             if list.is_empty() {
-                return Ok(g.const_bool(*negated));
+                return Ok(g.const_bool(*negated)?);
             }
             let x = plan_expr(g, inner, schema)?;
             let first_val = plan_expr(g, &list[0], schema)?;
-            let mut result = g.eq(x, first_val);
+            let mut result = g.eq(x, first_val)?;
             for item in &list[1..] {
                 let x_again = plan_expr(g, inner, schema)?;
                 let val = plan_expr(g, item, schema)?;
-                let cmp = g.eq(x_again, val);
-                result = g.or(result, cmp);
+                let cmp = g.eq(x_again, val)?;
+                result = g.or(result, cmp)?;
             }
             if *negated {
-                Ok(g.not(result))
+                Ok(g.not(result)?)
             } else {
                 Ok(result)
             }
@@ -168,7 +168,7 @@ pub fn plan_expr(
             }
             let e = plan_expr(g, inner, schema)?;
             let target = map_sql_type(data_type)?;
-            Ok(g.cast(e, target))
+            Ok(g.cast(e, target)?)
         }
 
         // CASE WHEN → nested IF
@@ -180,7 +180,7 @@ pub fn plan_expr(
         } => {
             let else_val = match else_result {
                 Some(e) => plan_expr(g, e, schema)?,
-                None => g.const_f64(f64::NAN), // NULL default
+                None => g.const_f64(f64::NAN)?, // NULL default
             };
             let mut result = else_val;
 
@@ -189,16 +189,16 @@ pub fn plan_expr(
                 for (cond_val, then_val) in conditions.iter().zip(results.iter()).rev() {
                     let x = plan_expr(g, op, schema)?;
                     let v = plan_expr(g, cond_val, schema)?;
-                    let c = g.eq(x, v);
+                    let c = g.eq(x, v)?;
                     let t = plan_expr(g, then_val, schema)?;
-                    result = g.if_then_else(c, t, result);
+                    result = g.if_then_else(c, t, result)?;
                 }
             } else {
                 // Searched CASE: CASE WHEN c1 THEN r1 ...
                 for (cond_expr, then_val) in conditions.iter().zip(results.iter()).rev() {
                     let c = plan_expr(g, cond_expr, schema)?;
                     let t = plan_expr(g, then_val, schema)?;
-                    result = g.if_then_else(c, t, result);
+                    result = g.if_then_else(c, t, result)?;
                 }
             }
             Ok(result)
@@ -213,9 +213,9 @@ pub fn plan_expr(
         } => {
             let input = plan_expr(g, inner, schema)?;
             let pat = plan_expr(g, pattern, schema)?;
-            let result = g.like(input, pat);
+            let result = g.like(input, pat)?;
             if *negated {
-                Ok(g.not(result))
+                Ok(g.not(result)?)
             } else {
                 Ok(result)
             }
@@ -229,19 +229,19 @@ pub fn plan_expr(
             ..
         } => {
             let input = plan_expr(g, inner, schema)?;
-            let input_ci = g.lower(input);
+            let input_ci = g.lower(input)?;
             let pat_ci = match pattern.as_ref() {
                 Expr::Value(Value::SingleQuotedString(s)) => {
                     g.const_str(&s.to_lowercase())?
                 }
                 _ => {
                     let pat = plan_expr(g, pattern, schema)?;
-                    g.lower(pat)
+                    g.lower(pat)?
                 }
             };
-            let result = g.like(input_ci, pat_ci);
+            let result = g.like(input_ci, pat_ci)?;
             if *negated {
-                Ok(g.not(result))
+                Ok(g.not(result)?)
             } else {
                 Ok(result)
             }
@@ -296,7 +296,7 @@ pub fn plan_expr(
 
         Expr::Trim { expr, .. } => {
             let a = plan_expr(g, expr, schema)?;
-            Ok(g.trim(a))
+            Ok(g.trim(a)?)
         }
 
         Expr::Substring {
@@ -309,30 +309,30 @@ pub fn plan_expr(
             let start = if let Some(from) = substring_from {
                 plan_expr(g, from, schema)?
             } else {
-                g.const_i64(1)
+                g.const_i64(1)?
             };
             let len = if let Some(for_expr) = substring_for {
                 plan_expr(g, for_expr, schema)?
             } else {
-                g.const_i64(i64::MAX)
+                g.const_i64(i64::MAX)?
             };
-            Ok(g.substr(s, start, len))
+            Ok(g.substr(s, start, len)?)
         }
 
         Expr::Extract { field, expr: inner, .. } => {
             let col = plan_expr(g, inner, schema)?;
             let field_id = map_datetime_field(field)?;
-            Ok(g.extract(col, field_id))
+            Ok(g.extract(col, field_id)?)
         }
 
         // sqlparser v0.53+ parses CEIL/FLOOR as dedicated Expr variants
         Expr::Ceil { expr, .. } => {
             let a = plan_expr(g, expr, schema)?;
-            Ok(g.ceil(a))
+            Ok(g.ceil(a)?)
         }
         Expr::Floor { expr, .. } => {
             let a = plan_expr(g, expr, schema)?;
-            Ok(g.floor(a))
+            Ok(g.floor(a)?)
         }
 
         _ => Err(SqlError::Plan(format!("Unsupported expression: {expr}"))),
@@ -374,32 +374,32 @@ fn plan_scalar_function(
         "abs" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.abs(a))
+            Ok(g.abs(a)?)
         }
         "ceil" | "ceiling" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.ceil(a))
+            Ok(g.ceil(a)?)
         }
         "floor" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.floor(a))
+            Ok(g.floor(a)?)
         }
         "sqrt" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.sqrt(a))
+            Ok(g.sqrt(a)?)
         }
         "ln" | "log" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.log(a))
+            Ok(g.log(a)?)
         }
         "exp" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.exp(a))
+            Ok(g.exp(a)?)
         }
 
         // 2-arg functions
@@ -410,16 +410,16 @@ fn plan_scalar_function(
             let a = plan_expr(g, &args[0], schema)?;
             // Helper: round_val = IF(val >= 0, FLOOR(val + 0.5), CEIL(val - 0.5))
             // This handles negative numbers correctly (banker's-style half-away-from-zero)
-            let build_round = |g: &mut crate::Graph, val: crate::Column| {
-                let zero = g.const_f64(0.0);
-                let half = g.const_f64(0.5);
-                let cond = g.ge(val, zero);
-                let pos = g.floor(g.add(val, half));
-                let neg = g.ceil(g.sub(val, half));
-                g.if_then_else(cond, pos, neg)
+            let build_round = |g: &mut crate::Graph, val: crate::Column| -> Result<crate::Column, SqlError> {
+                let zero = g.const_f64(0.0)?;
+                let half = g.const_f64(0.5)?;
+                let cond = g.ge(val, zero)?;
+                let pos = g.floor(g.add(val, half)?)?;
+                let neg = g.ceil(g.sub(val, half)?)?;
+                Ok(g.if_then_else(cond, pos, neg)?)
             };
             if args.len() == 1 {
-                Ok(build_round(g, a))
+                build_round(g, a)
             } else {
                 // ROUND(x, n): extract n as integer constant
                 let n = match &args[1] {
@@ -447,11 +447,11 @@ fn plan_scalar_function(
                 };
                 // ROUND(x, n) → round(x * scale) / scale
                 let scale = 10.0_f64.powi(n);
-                let scale_node = g.const_f64(scale);
-                let scaled = g.mul(a, scale_node);
-                let rounded = build_round(g, scaled);
-                let inv_scale = g.const_f64(1.0 / scale);
-                Ok(g.mul(rounded, inv_scale))
+                let scale_node = g.const_f64(scale)?;
+                let scaled = g.mul(a, scale_node)?;
+                let rounded = build_round(g, scaled)?;
+                let inv_scale = g.const_f64(1.0 / scale)?;
+                Ok(g.mul(rounded, inv_scale)?)
             }
         }
 
@@ -462,7 +462,7 @@ fn plan_scalar_function(
             let mut result = plan_expr(g, &args[0], schema)?;
             for arg in &args[1..] {
                 let b = plan_expr(g, arg, schema)?;
-                result = g.min2(result, b);
+                result = g.min2(result, b)?;
             }
             Ok(result)
         }
@@ -475,7 +475,7 @@ fn plan_scalar_function(
             let mut result = plan_expr(g, &args[0], schema)?;
             for arg in &args[1..] {
                 let b = plan_expr(g, arg, schema)?;
-                result = g.max2(result, b);
+                result = g.max2(result, b)?;
             }
             Ok(result)
         }
@@ -493,9 +493,9 @@ fn plan_scalar_function(
             let mut result = plan_expr(g, fallback, schema)?;
             for arg in args[..args.len() - 1].iter().rev() {
                 let val = plan_expr(g, arg, schema)?;
-                let is_null = g.isnull(val);
-                let not_null = g.not(is_null);
-                result = g.if_then_else(not_null, val, result);
+                let is_null = g.isnull(val)?;
+                let not_null = g.not(is_null)?;
+                result = g.if_then_else(not_null, val, result)?;
             }
             Ok(result)
         }
@@ -505,31 +505,31 @@ fn plan_scalar_function(
             check_arg_count(name, &args, 2)?;
             let a = plan_expr(g, &args[0], schema)?;
             let b = plan_expr(g, &args[1], schema)?;
-            let eq = g.eq(a, b);
-            let null_val = g.const_f64(f64::NAN);
-            Ok(g.if_then_else(eq, null_val, a))
+            let eq = g.eq(a, b)?;
+            let null_val = g.const_f64(f64::NAN)?;
+            Ok(g.if_then_else(eq, null_val, a)?)
         }
 
         // String functions
         "upper" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.upper(a))
+            Ok(g.upper(a)?)
         }
         "lower" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.lower(a))
+            Ok(g.lower(a)?)
         }
         "length" | "len" | "char_length" | "character_length" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.strlen(a))
+            Ok(g.strlen(a)?)
         }
         "trim" | "btrim" => {
             check_arg_count(name, &args, 1)?;
             let a = plan_expr(g, &args[0], schema)?;
-            Ok(g.trim(a))
+            Ok(g.trim(a)?)
         }
         "substr" | "substring" => {
             if args.len() < 2 || args.len() > 3 {
@@ -543,16 +543,16 @@ fn plan_scalar_function(
             let len = if args.len() == 3 {
                 plan_expr(g, &args[2], schema)?
             } else {
-                g.const_i64(i64::MAX) // take remainder
+                g.const_i64(i64::MAX)? // take remainder
             };
-            Ok(g.substr(s, start, len))
+            Ok(g.substr(s, start, len)?)
         }
         "replace" => {
             check_arg_count(name, &args, 3)?;
             let s = plan_expr(g, &args[0], schema)?;
             let from = plan_expr(g, &args[1], schema)?;
             let to = plan_expr(g, &args[2], schema)?;
-            Ok(g.replace(s, from, to))
+            Ok(g.replace(s, from, to)?)
         }
         "concat" => {
             if args.len() < 2 {
@@ -562,7 +562,7 @@ fn plan_scalar_function(
                 .iter()
                 .map(|a| plan_expr(g, a, schema))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(g.concat(&cols))
+            Ok(g.concat(&cols)?)
         }
 
         // Date/time functions
@@ -576,7 +576,7 @@ fn plan_scalar_function(
             let teide_secs = now - 946684800;
             // Truncate to start of day, convert to microseconds
             let day_us = (teide_secs / 86400) * 86400 * 1_000_000;
-            Ok(g.const_i64(day_us))
+            Ok(g.const_i64(day_us)?)
         }
         "current_timestamp" | "now" => {
             let now = std::time::SystemTime::now()
@@ -585,7 +585,7 @@ fn plan_scalar_function(
             let unix_us = now.as_micros() as i64;
             // Convert to Teide epoch (2000-01-01 = Unix 946684800 seconds)
             let teide_us = unix_us - 946_684_800_000_000i64;
-            Ok(g.const_i64(teide_us))
+            Ok(g.const_i64(teide_us)?)
         }
         "extract" => {
             // EXTRACT can also be called as a function: extract('year', col)
@@ -595,7 +595,7 @@ fn plan_scalar_function(
             let field_name = parse_field_arg(&args[0])?;
             let col = plan_expr(g, &args[1], schema)?;
             let field_id = resolve_field_name(&field_name)?;
-            Ok(g.extract(col, field_id))
+            Ok(g.extract(col, field_id)?)
         }
         "date_trunc" => {
             // DATE_TRUNC('unit', timestamp)
@@ -605,7 +605,7 @@ fn plan_scalar_function(
             let field_name = parse_field_arg(&args[0])?;
             let col = plan_expr(g, &args[1], schema)?;
             let field_id = resolve_field_name(&field_name)?;
-            Ok(g.date_trunc(col, field_id))
+            Ok(g.date_trunc(col, field_id)?)
         }
         "date_diff" | "datediff" => {
             // DATE_DIFF('unit', start, end) → integer count of units between timestamps
@@ -618,45 +618,45 @@ fn plan_scalar_function(
 
             match field_name.as_str() {
                 "second" => {
-                    let diff = g.sub(end, start);
-                    let divisor = g.const_i64(1_000_000);
-                    let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), crate::types::I64))
+                    let diff = g.sub(end, start)?;
+                    let divisor = g.const_i64(1_000_000)?;
+                    let fv = g.div(diff, divisor)?;
+                    Ok(g.cast(g.floor(fv)?, crate::types::I64)?)
                 }
                 "minute" => {
-                    let diff = g.sub(end, start);
-                    let divisor = g.const_i64(60_000_000);
-                    let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), crate::types::I64))
+                    let diff = g.sub(end, start)?;
+                    let divisor = g.const_i64(60_000_000)?;
+                    let fv = g.div(diff, divisor)?;
+                    Ok(g.cast(g.floor(fv)?, crate::types::I64)?)
                 }
                 "hour" => {
-                    let diff = g.sub(end, start);
-                    let divisor = g.const_i64(3_600_000_000);
-                    let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), crate::types::I64))
+                    let diff = g.sub(end, start)?;
+                    let divisor = g.const_i64(3_600_000_000)?;
+                    let fv = g.div(diff, divisor)?;
+                    Ok(g.cast(g.floor(fv)?, crate::types::I64)?)
                 }
                 "day" => {
-                    let diff = g.sub(end, start);
-                    let divisor = g.const_i64(86_400_000_000);
-                    let fv = g.div(diff, divisor);
-                    Ok(g.cast(g.floor(fv), crate::types::I64))
+                    let diff = g.sub(end, start)?;
+                    let divisor = g.const_i64(86_400_000_000)?;
+                    let fv = g.div(diff, divisor)?;
+                    Ok(g.cast(g.floor(fv)?, crate::types::I64)?)
                 }
                 "month" => {
                     // (year2*12+month2) - (year1*12+month1)
-                    let y1 = g.extract(start, crate::extract_field::YEAR);
-                    let m1 = g.extract(start, crate::extract_field::MONTH);
-                    let y2 = g.extract(end, crate::extract_field::YEAR);
-                    let m2 = g.extract(end, crate::extract_field::MONTH);
-                    let twelve = g.const_i64(12);
-                    let twelve2 = g.const_i64(12);
-                    let ym1 = g.add(g.mul(y1, twelve), m1);
-                    let ym2 = g.add(g.mul(y2, twelve2), m2);
-                    Ok(g.sub(ym2, ym1))
+                    let y1 = g.extract(start, crate::extract_field::YEAR)?;
+                    let m1 = g.extract(start, crate::extract_field::MONTH)?;
+                    let y2 = g.extract(end, crate::extract_field::YEAR)?;
+                    let m2 = g.extract(end, crate::extract_field::MONTH)?;
+                    let twelve = g.const_i64(12)?;
+                    let twelve2 = g.const_i64(12)?;
+                    let ym1 = g.add(g.mul(y1, twelve)?, m1)?;
+                    let ym2 = g.add(g.mul(y2, twelve2)?, m2)?;
+                    Ok(g.sub(ym2, ym1)?)
                 }
                 "year" => {
-                    let y1 = g.extract(start, crate::extract_field::YEAR);
-                    let y2 = g.extract(end, crate::extract_field::YEAR);
-                    Ok(g.sub(y2, y1))
+                    let y1 = g.extract(start, crate::extract_field::YEAR)?;
+                    let y2 = g.extract(end, crate::extract_field::YEAR)?;
+                    Ok(g.sub(y2, y1)?)
                 }
                 _ => Err(SqlError::Plan(format!(
                     "Unsupported DATE_DIFF unit: {field_name}"
@@ -921,27 +921,27 @@ pub fn plan_post_agg_expr(
             let l = plan_post_agg_expr(g, left, alias_to_native)?;
             let r = plan_post_agg_expr(g, right, alias_to_native)?;
             match op {
-                BinaryOperator::Plus => Ok(g.add(l, r)),
-                BinaryOperator::Minus => Ok(g.sub(l, r)),
-                BinaryOperator::Multiply => Ok(g.mul(l, r)),
-                BinaryOperator::Divide => Ok(g.div(l, r)),
-                BinaryOperator::Modulo => Ok(g.modulo(l, r)),
-                BinaryOperator::Eq => Ok(g.eq(l, r)),
-                BinaryOperator::NotEq => Ok(g.ne(l, r)),
-                BinaryOperator::Lt => Ok(g.lt(l, r)),
-                BinaryOperator::LtEq => Ok(g.le(l, r)),
-                BinaryOperator::Gt => Ok(g.gt(l, r)),
-                BinaryOperator::GtEq => Ok(g.ge(l, r)),
-                BinaryOperator::And => Ok(g.and(l, r)),
-                BinaryOperator::Or => Ok(g.or(l, r)),
+                BinaryOperator::Plus => Ok(g.add(l, r)?),
+                BinaryOperator::Minus => Ok(g.sub(l, r)?),
+                BinaryOperator::Multiply => Ok(g.mul(l, r)?),
+                BinaryOperator::Divide => Ok(g.div(l, r)?),
+                BinaryOperator::Modulo => Ok(g.modulo(l, r)?),
+                BinaryOperator::Eq => Ok(g.eq(l, r)?),
+                BinaryOperator::NotEq => Ok(g.ne(l, r)?),
+                BinaryOperator::Lt => Ok(g.lt(l, r)?),
+                BinaryOperator::LtEq => Ok(g.le(l, r)?),
+                BinaryOperator::Gt => Ok(g.gt(l, r)?),
+                BinaryOperator::GtEq => Ok(g.ge(l, r)?),
+                BinaryOperator::And => Ok(g.and(l, r)?),
+                BinaryOperator::Or => Ok(g.or(l, r)?),
                 _ => Err(SqlError::Plan(format!("Unsupported operator: {op}"))),
             }
         }
         Expr::UnaryOp { op, expr: inner } => {
             let e = plan_post_agg_expr(g, inner, alias_to_native)?;
             match op {
-                UnaryOperator::Not => Ok(g.not(e)),
-                UnaryOperator::Minus => Ok(g.neg(e)),
+                UnaryOperator::Not => Ok(g.not(e)?),
+                UnaryOperator::Minus => Ok(g.neg(e)?),
                 _ => Err(SqlError::Plan(format!("Unsupported unary operator: {op}"))),
             }
         }
@@ -953,22 +953,22 @@ pub fn plan_post_agg_expr(
         } => {
             let e = plan_post_agg_expr(g, inner, alias_to_native)?;
             let target = map_sql_type(data_type)?;
-            Ok(g.cast(e, target))
+            Ok(g.cast(e, target)?)
         }
         Expr::Value(val) => match val {
             Value::Number(n, _) => {
                 if let Ok(i) = n.parse::<i64>() {
-                    Ok(g.const_i64(i))
+                    Ok(g.const_i64(i)?)
                 } else {
                     let f = n
                         .parse::<f64>()
                         .map_err(|_| SqlError::Plan(format!("Invalid number literal: {n}")))?;
-                    Ok(g.const_f64(f))
+                    Ok(g.const_f64(f)?)
                 }
             }
             Value::SingleQuotedString(s) => Ok(g.const_str(s)?),
-            Value::Boolean(b) => Ok(g.const_bool(*b)),
-            Value::Null => Ok(g.const_f64(f64::NAN)),
+            Value::Boolean(b) => Ok(g.const_bool(*b)?),
+            Value::Null => Ok(g.const_f64(f64::NAN)?),
             _ => Err(SqlError::Plan(format!("Unsupported value: {val}"))),
         },
         Expr::Identifier(ident) => {
@@ -1023,27 +1023,27 @@ pub fn plan_having_expr(
             let l = plan_having_expr(g, left, result_schema, original_schema, native_names)?;
             let r = plan_having_expr(g, right, result_schema, original_schema, native_names)?;
             match op {
-                BinaryOperator::Plus => Ok(g.add(l, r)),
-                BinaryOperator::Minus => Ok(g.sub(l, r)),
-                BinaryOperator::Multiply => Ok(g.mul(l, r)),
-                BinaryOperator::Divide => Ok(g.div(l, r)),
-                BinaryOperator::Modulo => Ok(g.modulo(l, r)),
-                BinaryOperator::Eq => Ok(g.eq(l, r)),
-                BinaryOperator::NotEq => Ok(g.ne(l, r)),
-                BinaryOperator::Lt => Ok(g.lt(l, r)),
-                BinaryOperator::LtEq => Ok(g.le(l, r)),
-                BinaryOperator::Gt => Ok(g.gt(l, r)),
-                BinaryOperator::GtEq => Ok(g.ge(l, r)),
-                BinaryOperator::And => Ok(g.and(l, r)),
-                BinaryOperator::Or => Ok(g.or(l, r)),
+                BinaryOperator::Plus => Ok(g.add(l, r)?),
+                BinaryOperator::Minus => Ok(g.sub(l, r)?),
+                BinaryOperator::Multiply => Ok(g.mul(l, r)?),
+                BinaryOperator::Divide => Ok(g.div(l, r)?),
+                BinaryOperator::Modulo => Ok(g.modulo(l, r)?),
+                BinaryOperator::Eq => Ok(g.eq(l, r)?),
+                BinaryOperator::NotEq => Ok(g.ne(l, r)?),
+                BinaryOperator::Lt => Ok(g.lt(l, r)?),
+                BinaryOperator::LtEq => Ok(g.le(l, r)?),
+                BinaryOperator::Gt => Ok(g.gt(l, r)?),
+                BinaryOperator::GtEq => Ok(g.ge(l, r)?),
+                BinaryOperator::And => Ok(g.and(l, r)?),
+                BinaryOperator::Or => Ok(g.or(l, r)?),
                 _ => Err(SqlError::Plan(format!("Unsupported operator: {op}"))),
             }
         }
         Expr::UnaryOp { op, expr: inner } => {
             let e = plan_having_expr(g, inner, result_schema, original_schema, native_names)?;
             match op {
-                UnaryOperator::Not => Ok(g.not(e)),
-                UnaryOperator::Minus => Ok(g.neg(e)),
+                UnaryOperator::Not => Ok(g.not(e)?),
+                UnaryOperator::Minus => Ok(g.neg(e)?),
                 _ => Err(SqlError::Plan(format!("Unsupported unary operator: {op}"))),
             }
         }
@@ -1187,21 +1187,21 @@ pub fn plan_agg_input(
         match op {
             AggOp::Count => {
                 // COUNT FILTER → SUM of indicator: IF(cond, 1.0, 0.0)
-                let one = g.const_f64(1.0);
-                let zero = g.const_f64(0.0);
-                Ok((AggOp::Sum, g.if_then_else(pred, one, zero)))
+                let one = g.const_f64(1.0)?;
+                let zero = g.const_f64(0.0)?;
+                Ok((AggOp::Sum, g.if_then_else(pred, one, zero)?))
             }
             AggOp::Sum => {
                 // Zero-fill filtered rows (0 is neutral for addition)
-                let input_f64 = g.cast(input, crate::types::F64);
-                let zero = g.const_f64(0.0);
-                Ok((op, g.if_then_else(pred, input_f64, zero)))
+                let input_f64 = g.cast(input, crate::types::F64)?;
+                let zero = g.const_f64(0.0)?;
+                Ok((op, g.if_then_else(pred, input_f64, zero)?))
             }
             AggOp::Min | AggOp::Max => {
                 // NaN-fill filtered rows (NaN loses all < and > comparisons)
-                let input_f64 = g.cast(input, crate::types::F64);
-                let nan = g.const_f64(f64::NAN);
-                Ok((op, g.if_then_else(pred, input_f64, nan)))
+                let input_f64 = g.cast(input, crate::types::F64)?;
+                let nan = g.const_f64(f64::NAN)?;
+                Ok((op, g.if_then_else(pred, input_f64, nan)?))
             }
             AggOp::Avg => unreachable!(), // handled above
             _ => {

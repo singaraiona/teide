@@ -515,18 +515,18 @@ impl Table {
         unsafe { ffi::td_table_col_name(self.raw, idx) }
     }
 
-    /// Resolve the column name at `idx` to a `&str`.
-    pub fn col_name_str(&self, idx: usize) -> &str {
+    /// Resolve the column name at `idx` to an owned `String`.
+    pub fn col_name_str(&self, idx: usize) -> String {
         let sym_id = self.col_name(idx as i64);
         let atom = unsafe { ffi::td_sym_str(sym_id) };
         if atom.is_null() {
-            return "";
+            return String::new();
         }
         unsafe {
             let ptr = ffi::td_str_ptr(atom);
             let len = ffi::td_str_len(atom);
             let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-            std::str::from_utf8(slice).unwrap_or("")
+            std::str::from_utf8(slice).unwrap_or("").to_owned()
         }
     }
 
@@ -698,7 +698,7 @@ impl Table {
     }
 
     /// Read a string value from a SYM or ENUM column at `col`, `row`.
-    pub fn get_str(&self, col: usize, row: usize) -> Option<&str> {
+    pub fn get_str(&self, col: usize, row: usize) -> Option<String> {
         let vec = self.get_col_idx(col as i64)?;
         let t = unsafe { ffi::td_type(vec) };
 
@@ -717,7 +717,7 @@ impl Table {
     }
 
     /// Read a string from a flat (non-parted) SYM or ENUM vector.
-    unsafe fn read_str_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<&'static str> {
+    unsafe fn read_str_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<String> {
         let sym_id = match t {
             ffi::TD_SYM => {
                 let data = unsafe { ffi::td_data(vec) as *const i64 };
@@ -737,7 +737,7 @@ impl Table {
             let ptr = ffi::td_str_ptr(atom);
             let slen = ffi::td_str_len(atom);
             let slice = std::slice::from_raw_parts(ptr as *const u8, slen);
-            std::str::from_utf8(slice).ok()
+            std::str::from_utf8(slice).ok().map(|s| s.to_owned())
         }
     }
 }
@@ -792,6 +792,15 @@ impl Graph<'_> {
         self.raw
     }
 
+    // ---- Helper: check an op pointer for null ------------------------------
+
+    fn check_op(raw: *mut ffi::td_op_t) -> Result<Column> {
+        if raw.is_null() {
+            return Err(Error::Oom);
+        }
+        Ok(Column { raw })
+    }
+
     // ---- Source ops -------------------------------------------------------
 
     /// Scan a column by name from the bound table.
@@ -799,277 +808,217 @@ impl Graph<'_> {
     pub fn scan(&self, col_name: &str) -> Result<Column> {
         let c_name = CString::new(col_name).map_err(|_| Error::InvalidInput)?;
         let raw = unsafe { ffi::td_scan(self.raw, c_name.as_ptr()) };
-        Ok(Column { raw })
+        Self::check_op(raw)
     }
 
     /// Create a constant f64 node.
-    pub fn const_f64(&self, val: f64) -> Column {
-        Column {
-            raw: unsafe { ffi::td_const_f64(self.raw, val) },
-        }
+    pub fn const_f64(&self, val: f64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_const_f64(self.raw, val) })
     }
 
     /// Create a constant i64 node.
-    pub fn const_i64(&self, val: i64) -> Column {
-        Column {
-            raw: unsafe { ffi::td_const_i64(self.raw, val) },
-        }
+    pub fn const_i64(&self, val: i64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_const_i64(self.raw, val) })
     }
 
     /// Create a constant bool node.
-    pub fn const_bool(&self, val: bool) -> Column {
-        Column {
-            raw: unsafe { ffi::td_const_bool(self.raw, val) },
-        }
+    pub fn const_bool(&self, val: bool) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_const_bool(self.raw, val) })
     }
 
     /// Create a constant string node.
     /// Returns `Error::InvalidInput` when `val` contains interior NUL bytes.
     pub fn const_str(&self, val: &str) -> Result<Column> {
         let c_val = CString::new(val).map_err(|_| Error::InvalidInput)?;
-        Ok(Column {
-            raw: unsafe { ffi::td_const_str(self.raw, c_val.as_ptr()) },
-        })
+        Self::check_op(unsafe { ffi::td_const_str(self.raw, c_val.as_ptr()) })
     }
 
     /// Create a constant table node referencing a table.
-    pub fn const_table(&self, table: &Table) -> Column {
-        Column {
-            raw: unsafe { ffi::td_const_table(self.raw, table.raw) },
-        }
+    pub fn const_table(&self, table: &Table) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_const_table(self.raw, table.raw) })
     }
 
     // ---- Binary element-wise ops ------------------------------------------
 
-    pub fn add(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_add(self.raw, a.raw, b.raw) },
-        }
+    pub fn add(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_add(self.raw, a.raw, b.raw) })
     }
 
-    pub fn sub(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_sub(self.raw, a.raw, b.raw) },
-        }
+    pub fn sub(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_sub(self.raw, a.raw, b.raw) })
     }
 
-    pub fn mul(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_mul(self.raw, a.raw, b.raw) },
-        }
+    pub fn mul(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_mul(self.raw, a.raw, b.raw) })
     }
 
-    pub fn div(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_div(self.raw, a.raw, b.raw) },
-        }
+    pub fn div(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_div(self.raw, a.raw, b.raw) })
     }
 
-    pub fn modulo(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_mod(self.raw, a.raw, b.raw) },
-        }
+    pub fn modulo(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_mod(self.raw, a.raw, b.raw) })
     }
 
-    pub fn eq(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_eq(self.raw, a.raw, b.raw) },
-        }
+    pub fn eq(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_eq(self.raw, a.raw, b.raw) })
     }
 
-    pub fn ne(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_ne(self.raw, a.raw, b.raw) },
-        }
+    pub fn ne(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_ne(self.raw, a.raw, b.raw) })
     }
 
-    pub fn lt(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_lt(self.raw, a.raw, b.raw) },
-        }
+    pub fn lt(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_lt(self.raw, a.raw, b.raw) })
     }
 
-    pub fn le(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_le(self.raw, a.raw, b.raw) },
-        }
+    pub fn le(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_le(self.raw, a.raw, b.raw) })
     }
 
-    pub fn gt(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_gt(self.raw, a.raw, b.raw) },
-        }
+    pub fn gt(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_gt(self.raw, a.raw, b.raw) })
     }
 
-    pub fn ge(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_ge(self.raw, a.raw, b.raw) },
-        }
+    pub fn ge(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_ge(self.raw, a.raw, b.raw) })
     }
 
-    pub fn and(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_and(self.raw, a.raw, b.raw) },
-        }
+    pub fn and(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_and(self.raw, a.raw, b.raw) })
     }
 
-    pub fn or(&self, a: Column, b: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_or(self.raw, a.raw, b.raw) },
-        }
+    pub fn or(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_or(self.raw, a.raw, b.raw) })
     }
 
-    pub fn min2(&self, a: Column, b: Column) -> Column {
-        Column { raw: unsafe { ffi::td_min2(self.raw, a.raw, b.raw) } }
+    pub fn min2(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_min2(self.raw, a.raw, b.raw) })
     }
 
-    pub fn max2(&self, a: Column, b: Column) -> Column {
-        Column { raw: unsafe { ffi::td_max2(self.raw, a.raw, b.raw) } }
+    pub fn max2(&self, a: Column, b: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_max2(self.raw, a.raw, b.raw) })
     }
 
-    pub fn if_then_else(&self, cond: Column, then_val: Column, else_val: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_if(self.raw, cond.raw, then_val.raw, else_val.raw) },
-        }
+    pub fn if_then_else(&self, cond: Column, then_val: Column, else_val: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_if(self.raw, cond.raw, then_val.raw, else_val.raw) })
     }
 
-    pub fn like(&self, input: Column, pattern: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_like(self.raw, input.raw, pattern.raw) },
-        }
+    pub fn like(&self, input: Column, pattern: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_like(self.raw, input.raw, pattern.raw) })
     }
 
     // ---- String ops -------------------------------------------------------
 
-    pub fn upper(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_upper(self.raw, a.raw) } }
+    pub fn upper(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_upper(self.raw, a.raw) })
     }
 
-    pub fn lower(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_lower(self.raw, a.raw) } }
+    pub fn lower(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_lower(self.raw, a.raw) })
     }
 
-    pub fn strlen(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_strlen(self.raw, a.raw) } }
+    pub fn strlen(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_strlen(self.raw, a.raw) })
     }
 
-    pub fn trim(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_trim_op(self.raw, a.raw) } }
+    pub fn trim(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_trim_op(self.raw, a.raw) })
     }
 
-    pub fn substr(&self, s: Column, start: Column, len: Column) -> Column {
-        Column { raw: unsafe { ffi::td_substr(self.raw, s.raw, start.raw, len.raw) } }
+    pub fn substr(&self, s: Column, start: Column, len: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_substr(self.raw, s.raw, start.raw, len.raw) })
     }
 
-    pub fn replace(&self, s: Column, from: Column, to: Column) -> Column {
-        Column { raw: unsafe { ffi::td_replace(self.raw, s.raw, from.raw, to.raw) } }
+    pub fn replace(&self, s: Column, from: Column, to: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_replace(self.raw, s.raw, from.raw, to.raw) })
     }
 
-    pub fn concat(&self, args: &[Column]) -> Column {
+    pub fn concat(&self, args: &[Column]) -> Result<Column> {
         let mut ptrs: Vec<*mut ffi::td_op_t> = args.iter().map(|c| c.raw).collect();
-        Column {
-            raw: unsafe { ffi::td_concat(self.raw, ptrs.as_mut_ptr(), args.len() as std::ffi::c_int) },
-        }
+        Self::check_op(unsafe { ffi::td_concat(self.raw, ptrs.as_mut_ptr(), args.len() as std::ffi::c_int) })
     }
 
     // ---- Unary ops --------------------------------------------------------
 
-    pub fn not(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_not(self.raw, a.raw) },
-        }
+    pub fn not(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_not(self.raw, a.raw) })
     }
 
-    pub fn neg(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_neg(self.raw, a.raw) },
-        }
+    pub fn neg(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_neg(self.raw, a.raw) })
     }
 
-    pub fn abs(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_abs(self.raw, a.raw) } }
+    pub fn abs(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_abs(self.raw, a.raw) })
     }
 
-    pub fn sqrt(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_sqrt_op(self.raw, a.raw) } }
+    pub fn sqrt(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_sqrt_op(self.raw, a.raw) })
     }
 
-    pub fn log(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_log_op(self.raw, a.raw) } }
+    pub fn log(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_log_op(self.raw, a.raw) })
     }
 
-    pub fn exp(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_exp_op(self.raw, a.raw) } }
+    pub fn exp(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_exp_op(self.raw, a.raw) })
     }
 
-    pub fn ceil(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_ceil_op(self.raw, a.raw) } }
+    pub fn ceil(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_ceil_op(self.raw, a.raw) })
     }
 
-    pub fn floor(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_floor_op(self.raw, a.raw) } }
+    pub fn floor(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_floor_op(self.raw, a.raw) })
     }
 
-    pub fn isnull(&self, a: Column) -> Column {
-        Column { raw: unsafe { ffi::td_isnull(self.raw, a.raw) } }
+    pub fn isnull(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_isnull(self.raw, a.raw) })
     }
 
-    pub fn cast(&self, a: Column, target_type: i8) -> Column {
-        Column { raw: unsafe { ffi::td_cast(self.raw, a.raw, target_type) } }
+    pub fn cast(&self, a: Column, target_type: i8) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_cast(self.raw, a.raw, target_type) })
     }
 
     // ---- Date/time extraction ---------------------------------------------
 
-    pub fn extract(&self, col: Column, field: i64) -> Column {
-        Column { raw: unsafe { ffi::td_extract(self.raw, col.raw, field) } }
+    pub fn extract(&self, col: Column, field: i64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_extract(self.raw, col.raw, field) })
     }
 
-    pub fn date_trunc(&self, col: Column, field: i64) -> Column {
-        Column { raw: unsafe { ffi::td_date_trunc(self.raw, col.raw, field) } }
+    pub fn date_trunc(&self, col: Column, field: i64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_date_trunc(self.raw, col.raw, field) })
     }
 
     // ---- Reduction ops ----------------------------------------------------
 
-    pub fn sum(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_sum(self.raw, a.raw) },
-        }
+    pub fn sum(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_sum(self.raw, a.raw) })
     }
 
-    pub fn avg(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_avg(self.raw, a.raw) },
-        }
+    pub fn avg(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_avg(self.raw, a.raw) })
     }
 
-    pub fn min_op(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_min_op(self.raw, a.raw) },
-        }
+    pub fn min_op(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_min_op(self.raw, a.raw) })
     }
 
-    pub fn max_op(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_max_op(self.raw, a.raw) },
-        }
+    pub fn max_op(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_max_op(self.raw, a.raw) })
     }
 
-    pub fn count(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_count(self.raw, a.raw) },
-        }
+    pub fn count(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_count(self.raw, a.raw) })
     }
 
-    pub fn first(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_first(self.raw, a.raw) },
-        }
+    pub fn first(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_first(self.raw, a.raw) })
     }
 
-    pub fn last(&self, a: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_last(self.raw, a.raw) },
-        }
+    pub fn last(&self, a: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_last(self.raw, a.raw) })
     }
 
     // ---- Structural ops ---------------------------------------------------
@@ -1103,7 +1052,7 @@ impl Graph<'_> {
         self._pinned.push(Box::new(key_ptrs));
         self._pinned.push(Box::new(ops));
         self._pinned.push(Box::new(input_ptrs));
-        Ok(Column { raw })
+        Self::check_op(raw)
     }
 
     /// Hash join.
@@ -1133,7 +1082,7 @@ impl Graph<'_> {
         };
         self._pinned.push(Box::new(lk));
         self._pinned.push(Box::new(rk));
-        Ok(Column { raw })
+        Self::check_op(raw)
     }
 
     /// Multi-column sort.
@@ -1176,7 +1125,7 @@ impl Graph<'_> {
         // Pin arrays — td_sort_op stores pointers to them
         self._pinned.push(Box::new(key_ptrs));
         self._pinned.push(Box::new(desc_u8));
-        Ok(Column { raw })
+        Self::check_op(raw)
     }
 
     /// Window function computation.
@@ -1239,57 +1188,45 @@ impl Graph<'_> {
         self._pinned.push(Box::new(kinds));
         self._pinned.push(Box::new(fi_ptrs));
         self._pinned.push(Box::new(params));
-        Ok(Column { raw })
+        Self::check_op(raw)
     }
 
     /// Project (select) specific columns from a table node.
     pub fn project(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
-        Ok(Column {
-            raw: unsafe {
-                ffi::td_project(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
-            },
+        Self::check_op(unsafe {
+            ffi::td_project(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
         })
     }
 
     /// Select specific columns from a table node (alias for project).
     pub fn select(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
-        Ok(Column {
-            raw: unsafe {
-                ffi::td_select(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
-            },
+        Self::check_op(unsafe {
+            ffi::td_select(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
         })
     }
 
     /// Filter rows by a boolean predicate column.
-    pub fn filter(&self, input: Column, predicate: Column) -> Column {
-        Column {
-            raw: unsafe { ffi::td_filter(self.raw, input.raw, predicate.raw) },
-        }
+    pub fn filter(&self, input: Column, predicate: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_filter(self.raw, input.raw, predicate.raw) })
     }
 
     /// Take the first `n` rows.
-    pub fn head(&self, input: Column, n: i64) -> Column {
-        Column {
-            raw: unsafe { ffi::td_head(self.raw, input.raw, n) },
-        }
+    pub fn head(&self, input: Column, n: i64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_head(self.raw, input.raw, n) })
     }
 
     /// Take the last `n` rows.
-    pub fn tail(&self, input: Column, n: i64) -> Column {
-        Column {
-            raw: unsafe { ffi::td_tail(self.raw, input.raw, n) },
-        }
+    pub fn tail(&self, input: Column, n: i64) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_tail(self.raw, input.raw, n) })
     }
 
     /// Rename/alias a column.
     /// Returns `Error::InvalidInput` when `name` contains interior NUL bytes.
     pub fn alias(&self, input: Column, name: &str) -> Result<Column> {
         let c_name = CString::new(name).map_err(|_| Error::InvalidInput)?;
-        Ok(Column {
-            raw: unsafe { ffi::td_alias(self.raw, input.raw, c_name.as_ptr()) },
-        })
+        Self::check_op(unsafe { ffi::td_alias(self.raw, input.raw, c_name.as_ptr()) })
     }
 
     // ---- Execute ----------------------------------------------------------
@@ -1320,10 +1257,8 @@ impl Graph<'_> {
 
     /// Inject a pre-computed vector as a constant node in the graph.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn const_vec(&self, vec: *mut ffi::td_t) -> Column {
-        Column {
-            raw: unsafe { ffi::td_const_vec(self.raw, vec) },
-        }
+    pub fn const_vec(&self, vec: *mut ffi::td_t) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_const_vec(self.raw, vec) })
     }
 
     /// Set a boolean filter mask for group-by pushdown.

@@ -3132,6 +3132,8 @@ typedef struct {
     uint8_t  n_agg_vals;      /* non-NULL agg columns (excludes COUNT) */
     uint8_t  need_flags;
     uint8_t  agg_is_f64;      /* bitmask: bit a set => agg[a] source is f64 */
+    uint8_t  agg_is_first;   /* bitmask: bit a set => agg[a] is OP_FIRST */
+    uint8_t  agg_is_last;    /* bitmask: bit a set => agg[a] is OP_LAST  */
     int8_t   agg_val_slot[8]; /* agg_idx -> entry/accum slot (-1 = no value) */
     /* Unified accumulator offsets: each block is n_agg_vals * 8 bytes.
      * Each 8B slot is double or int64_t based on agg_is_f64 bitmask. */
@@ -3142,7 +3144,8 @@ typedef struct {
 } ght_layout_t;
 
 static ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
-                                        td_t** agg_vecs, uint8_t need_flags) {
+                                        td_t** agg_vecs, uint8_t need_flags,
+                                        const uint16_t* agg_ops) {
     ght_layout_t ly;
     memset(&ly, 0, sizeof(ly));
     ly.n_keys = n_keys;
@@ -3158,6 +3161,10 @@ static ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
             nv++;
         } else {
             ly.agg_val_slot[a] = -1;
+        }
+        if (agg_ops) {
+            if (agg_ops[a] == OP_FIRST) ly.agg_is_first |= (1u << a);
+            if (agg_ops[a] == OP_LAST)  ly.agg_is_last  |= (1u << a);
         }
     }
     ly.n_agg_vals = nv;
@@ -3316,17 +3323,26 @@ static inline void accum_from_entry(char* row, const char* entry,
         char* base = row;
         const char* val = agg_data + s * 8;
 
-        if (ly->agg_is_f64 & (1u << a)) {
+        uint8_t amask = (1u << a);
+        if (ly->agg_is_f64 & amask) {
             double v;
             memcpy(&v, val, 8);
-            if (nf & GHT_NEED_SUM) { double* p = (double*)(base + ly->off_sum) + s; *p += v; }
+            if (nf & GHT_NEED_SUM) {
+                if (ly->agg_is_first & amask) { /* keep init value */ }
+                else if (ly->agg_is_last & amask) { memcpy(base + ly->off_sum + s * 8, val, 8); }
+                else { double* p = (double*)(base + ly->off_sum) + s; *p += v; }
+            }
             if (nf & GHT_NEED_MIN) { double* p = (double*)(base + ly->off_min) + s; if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { double* p = (double*)(base + ly->off_max) + s; if (v > *p) *p = v; }
             if (nf & GHT_NEED_SUMSQ) { double* p = (double*)(base + ly->off_sumsq) + s; *p += v * v; }
         } else {
             int64_t v;
             memcpy(&v, val, 8);
-            if (nf & GHT_NEED_SUM) { int64_t* p = (int64_t*)(base + ly->off_sum) + s; *p += v; }
+            if (nf & GHT_NEED_SUM) {
+                if (ly->agg_is_first & amask) { /* keep init value */ }
+                else if (ly->agg_is_last & amask) { memcpy(base + ly->off_sum + s * 8, val, 8); }
+                else { int64_t* p = (int64_t*)(base + ly->off_sum) + s; *p += v; }
+            }
             if (nf & GHT_NEED_MIN) { int64_t* p = (int64_t*)(base + ly->off_min) + s; if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { int64_t* p = (int64_t*)(base + ly->off_max) + s; if (v > *p) *p = v; }
             if (nf & GHT_NEED_SUMSQ) { double* p = (double*)(base + ly->off_sumsq) + s; *p += (double)v * (double)v; }
@@ -3678,6 +3694,10 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             v = sf ? ((const double*)(row + ly->off_max))[s]
                                    : (double)((const int64_t*)(row + ly->off_max))[s];
                             break;
+                        case OP_FIRST: case OP_LAST:
+                            v = sf ? ((const double*)(row + ly->off_sum))[s]
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                            break;
                         case OP_VAR: case OP_VAR_POP:
                         case OP_STDDEV: case OP_STDDEV_POP: {
                             double sum_val = sf ? ((const double*)(row + ly->off_sum))[s]
@@ -3705,7 +3725,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                         case OP_COUNT: v = cnt; break;
                         case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
                         case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
-                        case OP_FIRST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                        case OP_FIRST: case OP_LAST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
                         default:       v = 0; break;
                     }
                     ((int64_t*)ao->dst)[di] = v;
@@ -5214,7 +5234,7 @@ ht_path:;
     }
 
     /* Compute row-layout: keys + agg values inline */
-    ght_layout_t ght_layout = ght_compute_layout(n_keys, n_aggs, agg_vecs, ght_need);
+    ght_layout_t ght_layout = ght_compute_layout(n_keys, n_aggs, agg_vecs, ght_need, ext->agg_ops);
 
     /* Right-sized hash table: start small, rehash on load > 0.5 */
     uint32_t ht_cap = 256;
@@ -5520,6 +5540,10 @@ sequential_fallback:;
                         v = is_f64 ? ((const double*)(row + ly->off_max))[s]
                                    : (double)((const int64_t*)(row + ly->off_max))[s];
                         break;
+                    case OP_FIRST: case OP_LAST:
+                        v = is_f64 ? ((const double*)(row + ly->off_sum))[s]
+                                   : (double)((const int64_t*)(row + ly->off_sum))[s];
+                        break;
                     case OP_VAR: case OP_VAR_POP:
                     case OP_STDDEV: case OP_STDDEV_POP: {
                         double sum_val = is_f64 ? ((const double*)(row + ly->off_sum))[s]
@@ -5547,7 +5571,7 @@ sequential_fallback:;
                     case OP_COUNT: v = cnt; break;
                     case OP_MIN:   v = ((const int64_t*)(row + ly->off_min))[s]; break;
                     case OP_MAX:   v = ((const int64_t*)(row + ly->off_max))[s]; break;
-                    case OP_FIRST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
+                    case OP_FIRST: case OP_LAST: v = ((const int64_t*)(row + ly->off_sum))[s]; break;
                     default:       v = 0; break;
                 }
                 ((int64_t*)td_data(new_col))[gi] = v;
@@ -6647,11 +6671,21 @@ static td_t* exec_substr(td_graph_t* g, td_op_t* op) {
     const int64_t* l_data = NULL;
     if (start_v->type == TD_ATOM_I64) s_scalar = start_v->i64;
     else if (start_v->type == TD_ATOM_F64) s_scalar = (int64_t)start_v->f64;
-    else if (start_v->len == 1) s_scalar = ((int64_t*)td_data(start_v))[0];
+    else if (start_v->len == 1) {
+        if (start_v->type == TD_F64)
+            s_scalar = (int64_t)((double*)td_data(start_v))[0];
+        else
+            s_scalar = ((int64_t*)td_data(start_v))[0];
+    }
     else s_data = (const int64_t*)td_data(start_v);
     if (len_v->type == TD_ATOM_I64) l_scalar = len_v->i64;
     else if (len_v->type == TD_ATOM_F64) l_scalar = (int64_t)len_v->f64;
-    else if (len_v->len == 1) l_scalar = ((int64_t*)td_data(len_v))[0];
+    else if (len_v->len == 1) {
+        if (len_v->type == TD_F64)
+            l_scalar = (int64_t)((double*)td_data(len_v))[0];
+        else
+            l_scalar = ((int64_t*)td_data(len_v))[0];
+    }
     else l_data = (const int64_t*)td_data(len_v);
 
     for (int64_t i = 0; i < nrows; i++) {

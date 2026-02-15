@@ -190,7 +190,7 @@ static void local_sym_rehash(local_sym_t* ls) {
 
 static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
     if (TD_UNLIKELY(!ls->buckets || !ls->offsets || !ls->lens || !ls->arena))
-        return 0;
+        return UINT32_MAX;
     uint32_t hash = (uint32_t)td_hash_bytes(str, len);
     uint32_t mask = ls->bucket_cap - 1;
     uint32_t slot = hash & mask;
@@ -216,7 +216,7 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
             ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
         ls->lens = (uint32_t*)scratch_realloc(&ls->lens_hdr,
             ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
-        if (TD_UNLIKELY(!ls->offsets || !ls->lens)) return 0;
+        if (TD_UNLIKELY(!ls->offsets || !ls->lens)) return UINT32_MAX;
         ls->cap = new_cap;
     }
 
@@ -225,7 +225,7 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
         while (new_acap < ls->arena_used + len) new_acap *= 2;
         ls->arena = (char*)scratch_realloc(&ls->arena_hdr,
             ls->arena_cap, new_acap);
-        if (TD_UNLIKELY(!ls->arena)) return 0;
+        if (TD_UNLIKELY(!ls->arena)) return UINT32_MAX;
         ls->arena_cap = new_acap;
     }
     memcpy(ls->arena + ls->arena_used, str, len);
@@ -820,6 +820,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     break;
                 case CSV_TYPE_STR: {
                     uint32_t lid = local_sym_intern(&my_syms[c], fld, flen);
+                    if (TD_UNLIKELY(lid == UINT32_MAX)) continue; /* skip row on OOM */
                     ((uint32_t*)ctx->col_data[c])[row] = PACK_SYM(worker_id, lid);
                     break;
                 }

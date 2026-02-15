@@ -66,18 +66,28 @@ static _Atomic(bool) g_sym_inited = false;
  * -------------------------------------------------------------------------- */
 
 void td_sym_init(void) {
-    if (atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&g_sym_inited, &expected, true,
+            memory_order_acq_rel, memory_order_acquire))
+        return; /* already initialized by another thread */
 
     g_sym.bucket_cap = SYM_INIT_CAP;
     g_sym.buckets = (uint64_t*)td_sys_alloc(g_sym.bucket_cap * sizeof(uint64_t));
-    if (!g_sym.buckets) return;
+    if (!g_sym.buckets) {
+        atomic_store_explicit(&g_sym_inited, false, memory_order_release);
+        return;
+    }
 
     g_sym.str_cap = SYM_INIT_CAP;
     g_sym.str_count = 0;
     g_sym.strings = (td_t**)td_sys_alloc(g_sym.str_cap * sizeof(td_t*));
-    if (!g_sym.strings) { td_sys_free(g_sym.buckets); g_sym.buckets = NULL; return; }
-
-    atomic_store_explicit(&g_sym_inited, true, memory_order_release);
+    if (!g_sym.strings) {
+        td_sys_free(g_sym.buckets);
+        g_sym.buckets = NULL;
+        atomic_store_explicit(&g_sym_inited, false, memory_order_release);
+        return;
+    }
+    /* g_sym_inited already set to true by CAS above */
 }
 
 /* --------------------------------------------------------------------------
@@ -316,6 +326,12 @@ td_err_t td_sym_load(const char* path) {
         return TD_ERR_CORRUPT;
     }
 
+    /* Reject unreasonable count to prevent DoS from crafted files */
+    if (count > 100000000u) { /* 100M max symbols */
+        fclose(f);
+        return TD_ERR_CORRUPT;
+    }
+
     /* Read buffer — reuse for all strings */
     char buf[4096];
     char* heap_buf = NULL;
@@ -324,6 +340,12 @@ td_err_t td_sym_load(const char* path) {
     for (uint32_t i = 0; i < count; i++) {
         uint32_t len;
         if (fread(&len, 4, 1, f) != 1) {
+            if (heap_buf) td_sys_free(heap_buf);
+            fclose(f);
+            return TD_ERR_CORRUPT;
+        }
+
+        if (len > 16 * 1024 * 1024) { /* 16MB max per symbol */
             if (heap_buf) td_sys_free(heap_buf);
             fclose(f);
             return TD_ERR_CORRUPT;

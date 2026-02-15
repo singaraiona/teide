@@ -847,9 +847,9 @@ fn plan_query(
             } else {
                 // Non-GROUP BY: materialize as before
                 let mut g = ctx.graph(&table)?;
-                let table_node = g.const_table(&table);
+                let table_node = g.const_table(&table)?;
                 let pred = plan_expr(&mut g, &resolved, &schema)?;
-                let filtered = g.filter(table_node, pred);
+                let filtered = g.filter(table_node, pred)?;
                 (g.execute(filtered)?, None)
             }
         } else {
@@ -910,11 +910,11 @@ fn plan_query(
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table)?;
-        let table_node = g.const_table(&result_table);
+        let table_node = g.const_table(&result_table)?;
         let pred = plan_having_expr(
             &mut g, having_expr, &having_schema, &schema, &native_names,
         )?;
-        let filtered = g.filter(table_node, pred);
+        let filtered = g.filter(table_node, pred)?;
         g.execute(filtered)?
     } else {
         result_table
@@ -925,7 +925,7 @@ fn plan_query(
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table)?;
-        let table_node = g.const_table(&result_table);
+        let table_node = g.const_table(&result_table)?;
         let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
         // Fuse LIMIT into HEAD(SORT) so the engine only gathers N rows
@@ -935,7 +935,7 @@ fn plan_query(
             _ => None,
         };
         let root = match total_limit {
-            Some(n) => g.head(sort_node, n),
+            Some(n) => g.head(sort_node, n)?,
             None => sort_node,
         };
         (g.execute(root)?, total_limit.is_some())
@@ -954,16 +954,16 @@ fn plan_query(
             (Some(off), Some(lim)) => {
                 let total = off + lim;
                 let g = ctx.graph(&result_table)?;
-                let table_node = g.const_table(&result_table);
-                let head_node = g.head(table_node, total);
+                let table_node = g.const_table(&result_table)?;
+                let head_node = g.head(table_node, total)?;
                 let trimmed = g.execute(head_node)?;
                 skip_rows(ctx, &trimmed, off)?
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
                 let g = ctx.graph(&result_table)?;
-                let table_node = g.const_table(&result_table);
-                let root = g.head(table_node, lim);
+                let table_node = g.const_table(&result_table)?;
+                let root = g.head(table_node, lim)?;
                 g.execute(root)?
             }
             (None, None) => result_table,
@@ -1197,8 +1197,8 @@ fn resolve_from(
         // Build join graph (scoped to avoid borrow conflict)
         let result = {
             let mut g = ctx.graph(&al_table)?;
-            let left_table_node = g.const_table(&al_table);
-            let right_table_node = g.const_table(&ar_table);
+            let left_table_node = g.const_table(&al_table)?;
+            let right_table_node = g.const_table(&ar_table)?;
 
             let left_key_nodes: Vec<crate::Column> = join_keys
                 .iter()
@@ -1217,7 +1217,7 @@ fn resolve_from(
                         rk
                     )));
                 }
-                right_key_nodes.push(g.const_vec(right_col_ptr));
+                right_key_nodes.push(g.const_vec(right_col_ptr)?);
             }
 
             let joined = g.join(
@@ -1489,7 +1489,7 @@ fn plan_group_select(
     }
 
     let mut pg = ctx.graph(&group_result)?;
-    let table_node = pg.const_table(&group_result);
+    let table_node = pg.const_table(&group_result)?;
 
     let mut proj_cols = Vec::new();
     let mut proj_aliases = Vec::new();
@@ -1504,7 +1504,7 @@ fn plan_group_select(
                 // Always scan by native C engine name
                 let col_idx = key_names.len() + *idx;
                 let native = group_result.col_name_str(col_idx);
-                proj_cols.push(pg.scan(native)?);
+                proj_cols.push(pg.scan(&native)?);
                 proj_aliases.push(alias.clone());
             }
             SelectPlan::PostAggExpr(expr, alias) => {
@@ -1769,7 +1769,7 @@ fn plan_distinct(
     // The result has keys + 1 COUNT column. We only want the keys.
     // Build a SELECT projection to drop the count column.
     let pg = ctx.graph(&group_result)?;
-    let table_node = pg.const_table(&group_result);
+    let table_node = pg.const_table(&group_result)?;
     let proj_cols: Vec<Column> = col_names
         .iter()
         .map(|k| pg.scan(k))
@@ -1792,7 +1792,7 @@ fn plan_expr_select(
     hidden_order_cols: &[String],
 ) -> Result<(Table, Vec<String>), SqlError> {
     let mut g = ctx.graph(working_table)?;
-    let table_node = g.const_table(working_table);
+    let table_node = g.const_table(working_table)?;
 
     let mut proj_cols = Vec::new();
     let mut aliases = Vec::new();
@@ -1884,7 +1884,7 @@ fn plan_window_stage(
     for (spec, func_indices) in spec_groups {
         let stage_result = {
             let mut g = ctx.graph(&current_table)?;
-            let table_node = g.const_table(&current_table);
+            let table_node = g.const_table(&current_table)?;
             let (frame_type, frame_start, frame_end) = parse_window_frame(&spec)?;
 
             let mut part_key_cols: Vec<Column> = Vec::new();
@@ -2052,15 +2052,15 @@ fn skip_rows(ctx: &Context, table: &Table, offset: i64) -> Result<Table, SqlErro
     let nrows = table.nrows();
     if offset >= nrows {
         let g = ctx.graph(table)?;
-        let table_node = g.const_table(table);
-        let root = g.head(table_node, 0);
+        let table_node = g.const_table(table)?;
+        let root = g.head(table_node, 0)?;
         return Ok(g.execute(root)?);
     }
     // td_tail takes the last N rows — exactly what we need after skipping offset
     let keep = nrows - offset;
     let g = ctx.graph(table)?;
-    let table_node = g.const_table(table);
-    let root = g.tail(table_node, keep);
+    let table_node = g.const_table(table)?;
+    let root = g.tail(table_node, keep)?;
     Ok(g.execute(root)?)
 }
 
@@ -2444,7 +2444,7 @@ fn apply_post_processing(
             .map(|i| result_table.col_name_str(i).to_string())
             .collect();
         let mut g = ctx.graph(&result_table)?;
-        let table_node = g.const_table(&result_table);
+        let table_node = g.const_table(&result_table)?;
         let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
         let total_limit = match (offset_val, limit_val) {
@@ -2453,7 +2453,7 @@ fn apply_post_processing(
             _ => None,
         };
         let root = match total_limit {
-            Some(n) => g.head(sort_node, n),
+            Some(n) => g.head(sort_node, n)?,
             None => sort_node,
         };
         (g.execute(root)?, total_limit.is_some())
@@ -2472,16 +2472,16 @@ fn apply_post_processing(
             (Some(off), Some(lim)) => {
                 let total = off + lim;
                 let g = ctx.graph(&result_table)?;
-                let table_node = g.const_table(&result_table);
-                let head_node = g.head(table_node, total);
+                let table_node = g.const_table(&result_table)?;
+                let head_node = g.head(table_node, total)?;
                 let trimmed = g.execute(head_node)?;
                 skip_rows(ctx, &trimmed, off)?
             }
             (Some(off), None) => skip_rows(ctx, &result_table, off)?,
             (None, Some(lim)) => {
                 let g = ctx.graph(&result_table)?;
-                let table_node = g.const_table(&result_table);
-                let root = g.head(table_node, lim);
+                let table_node = g.const_table(&result_table)?;
+                let root = g.head(table_node, lim)?;
                 g.execute(root)?
             }
             (None, None) => result_table,
@@ -2680,8 +2680,8 @@ fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr
             Ok(Expr::Value(Value::Number(format!("{v}"), false)))
         }
         crate::types::SYM | crate::types::ENUM => {
-            let v = table.get_str(col, row).unwrap_or("");
-            Ok(Expr::Value(Value::SingleQuotedString(v.to_string())))
+            let v = table.get_str(col, row).unwrap_or_default();
+            Ok(Expr::Value(Value::SingleQuotedString(v)))
         }
         crate::types::BOOL => {
             let v = table.get_i64(col, row).unwrap_or(0);
@@ -2998,7 +2998,7 @@ fn trim_to_visible_columns(
     }
 
     let g = ctx.graph(&table)?;
-    let table_node = g.const_table(&table);
+    let table_node = g.const_table(&table)?;
     let proj_cols: Vec<Column> = visible_aliases
         .iter()
         .map(|name| g.scan(name))

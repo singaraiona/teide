@@ -63,6 +63,12 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
         return NULL;
     }
 
+    if (st.st_size <= 0) {
+        close(fd);
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+
     size_t len = (size_t)st.st_size;
     void* p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     close(fd);

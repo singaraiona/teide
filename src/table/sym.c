@@ -61,6 +61,16 @@ typedef struct {
 static sym_table_t g_sym;
 static _Atomic(bool) g_sym_inited = false;
 
+/* Spinlock protecting g_sym mutations in td_sym_intern */
+static _Atomic(int) g_sym_lock = 0;
+static inline void sym_lock(void) {
+    while (atomic_exchange_explicit(&g_sym_lock, 1, memory_order_acquire))
+        ; /* spin */
+}
+static inline void sym_unlock(void) {
+    atomic_store_explicit(&g_sym_lock, 0, memory_order_release);
+}
+
 /* --------------------------------------------------------------------------
  * td_sym_init
  * -------------------------------------------------------------------------- */
@@ -155,6 +165,9 @@ static bool ht_grow(void) {
 
 int64_t td_sym_intern(const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+
+    sym_lock();
+
     uint32_t hash = fnv1a(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
     uint32_t slot = hash & mask;
@@ -170,6 +183,7 @@ int64_t td_sym_intern(const char* str, size_t len) {
             td_t* existing = g_sym.strings[e_id];
             if (td_str_len(existing) == len &&
                 memcmp(td_str_ptr(existing), str, len) == 0) {
+                sym_unlock();
                 return (int64_t)e_id;
             }
         }
@@ -177,8 +191,10 @@ int64_t td_sym_intern(const char* str, size_t len) {
     }
 
     /* Refuse insert if table is critically full (ht_grow may have failed) */
-    if (g_sym.str_count >= (uint32_t)(g_sym.bucket_cap * 0.95))
+    if (g_sym.str_count >= (uint32_t)(g_sym.bucket_cap * 0.95)) {
+        sym_unlock();
         return -1;
+    }
 
     /* Not found — create new entry */
     uint32_t new_id = g_sym.str_count;
@@ -188,14 +204,14 @@ int64_t td_sym_intern(const char* str, size_t len) {
         uint32_t new_str_cap = g_sym.str_cap * 2;
         td_t** new_strings = (td_t**)td_sys_realloc(g_sym.strings,
                                                     new_str_cap * sizeof(td_t*));
-        if (!new_strings) return -1;
+        if (!new_strings) { sym_unlock(); return -1; }
         g_sym.strings = new_strings;
         g_sym.str_cap = new_str_cap;
     }
 
     /* Create string atom and retain it */
     td_t* s = td_str(str, len);
-    if (!s || TD_IS_ERR(s)) return -1;
+    if (!s || TD_IS_ERR(s)) { sym_unlock(); return -1; }
     td_retain(s);  /* sym table owns a ref */
     g_sym.strings[new_id] = s;
     g_sym.str_count++;
@@ -206,12 +222,12 @@ int64_t td_sym_intern(const char* str, size_t len) {
     /* Check load factor and grow if needed */
     if ((double)g_sym.str_count / (double)g_sym.bucket_cap > SYM_LOAD_FACTOR) {
         if (!ht_grow()) {
-            /* Growth failed — undo the insert to keep table consistent.
-             * The entry is still in the hash table but we'll reject future
-             * inserts if the table becomes critically full (checked above). */
+            /* OOM: continue with old table. Linear probing degrades but
+             * 0.95 load factor guard prevents infinite loops. */
         }
     }
 
+    sym_unlock();
     return (int64_t)new_id;
 }
 

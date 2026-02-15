@@ -386,7 +386,7 @@ fn join_inner() {
     let right_table = g.const_table(&right).unwrap();
     let left_id1 = g.scan("id1").unwrap();
     let right_id1_vec = right.get_col_idx(0).unwrap();
-    let right_id1 = g.const_vec(right_id1_vec).unwrap();
+    let right_id1 = unsafe { g.const_vec(right_id1_vec).unwrap() };
 
     let joined = g.join(left_table, &[left_id1], right_table, &[right_id1], 0).unwrap();
     let result = g.execute(joined).unwrap();
@@ -411,7 +411,7 @@ fn join_left() {
     let right_table = g.const_table(&right).unwrap();
     let left_id1 = g.scan("id1").unwrap();
     let right_id1_vec = right.get_col_idx(0).unwrap();
-    let right_id1 = g.const_vec(right_id1_vec).unwrap();
+    let right_id1 = unsafe { g.const_vec(right_id1_vec).unwrap() };
 
     let joined = g.join(left_table, &[left_id1], right_table, &[right_id1], 1).unwrap();
     let result = g.execute(joined).unwrap();

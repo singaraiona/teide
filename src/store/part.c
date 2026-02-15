@@ -66,7 +66,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         /* Skip . and .. and non-directories */
         if (ent->d_name[0] == '.') continue;
 
-        /* Validate partition dir: digits and dots only (YYYY.MM.DD format) */
+        /* Partition directory names validated as digit+dot sequences.
+         * Non-conforming entries are harmless — they fail on splay load if invalid. */
         bool valid = false;
         for (const char* c = ent->d_name; *c; c++) {
             if (*c == '.') { valid = true; continue; }

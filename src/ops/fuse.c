@@ -42,11 +42,24 @@ static bool is_elementwise(uint16_t opcode) {
            (opcode >= OP_ADD && opcode <= OP_MAX2);
 }
 
+/* O(n) scan — acceptable for typical graph sizes (tens to hundreds of nodes). */
+static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
+            return g->ext_nodes[i];
+    }
+    return NULL;
+}
+
 /* Count references to each node (iterative) */
 static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
     if (!root) return;
 
-    uint32_t stack[256];
+    uint32_t nc = g->node_count;
+    uint32_t stack_cap = nc * 2;
+    uint32_t stack_local[256];
+    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)td_sys_alloc(stack_cap * sizeof(uint32_t));
+    if (!stack) return;
     int sp = 0;
     stack[sp++] = root->id;
     while (sp > 0) {
@@ -55,10 +68,36 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
         ref_counts[nid]++;
         if (ref_counts[nid] > 1) continue;  /* already counted children */
         for (int i = 0; i < n->arity && i < 2; i++) {
-            if (n->inputs[i] && sp < 256)
+            if (n->inputs[i] && sp < (int)stack_cap)
                 stack[sp++] = n->inputs[i]->id;
         }
+        /* M11: 3-input ops (OP_IF, OP_SUBSTR, OP_REPLACE) store the third
+           operand node ID as (uintptr_t)ext->literal. */
+        if (n->opcode == OP_IF || n->opcode == OP_SUBSTR || n->opcode == OP_REPLACE) {
+            td_op_ext_t* ext = find_ext(g, nid);
+            if (ext) {
+                uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                if (third_id < nc && sp < (int)stack_cap)
+                    stack[sp++] = third_id;
+            }
+        }
+        /* M11: OP_CONCAT stores extra arg IDs (beyond inputs[0..1]) as
+           uint32_t values in trailing bytes after the ext node.
+           ext->sym holds the total arg count. */
+        if (n->opcode == OP_CONCAT) {
+            td_op_ext_t* ext = find_ext(g, nid);
+            if (ext) {
+                int n_args = (int)ext->sym;
+                uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                for (int i = 2; i < n_args; i++) {
+                    uint32_t arg_id = trail[i - 2];
+                    if (arg_id < nc && sp < (int)stack_cap)
+                        stack[sp++] = arg_id;
+                }
+            }
+        }
     }
+    if (stack_cap > 256) td_sys_free(stack);
 }
 
 void td_fuse_pass(td_graph_t* g, td_op_t* root) {

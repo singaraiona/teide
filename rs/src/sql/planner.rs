@@ -186,7 +186,7 @@ fn create_empty_table(columns: &[ColumnDef]) -> Result<(Table, Vec<String>), Sql
             return Err(engine_err_from_raw(vec));
         }
 
-        let name_id = crate::sym_intern(&name);
+        let name_id = crate::sym_intern(&name)?;
         let res = builder.add_col(name_id, vec);
         unsafe { crate::ffi_release(vec) };
         res?;
@@ -315,21 +315,22 @@ fn build_table_from_values(
         for (c, expr) in row.iter().enumerate() {
             let typ = target_types[c];
             let vec = col_vecs[c];
-            let result = append_value_to_vec(vec, typ, expr, c, target_cols);
-            if let Err(e) = result {
-                for v in &col_vecs {
-                    unsafe { crate::ffi_release(*v) };
+            match append_value_to_vec(vec, typ, expr, c, target_cols) {
+                Ok(next) => col_vecs[c] = next,
+                Err(e) => {
+                    for v in &col_vecs {
+                        unsafe { crate::ffi_release(*v) };
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
-            col_vecs[c] = result.unwrap();
         }
     }
 
     // Build table
     let mut builder = RawTableBuilder::new(ncols as i64)?;
     for (c, vec) in col_vecs.iter().enumerate() {
-        let name_id = crate::sym_intern(&target_cols[c]);
+        let name_id = crate::sym_intern(&target_cols[c])?;
         let res = builder.add_col(name_id, *vec);
         unsafe { crate::ffi_release(*vec) };
         res?;
@@ -385,7 +386,7 @@ fn append_value_to_vec(
             let s = eval_str_literal(expr).map_err(|e| {
                 SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
             })?;
-            let sym_id = crate::sym_intern(&s);
+            let sym_id = crate::sym_intern(&s)?;
             if typ == ffi::TD_SYM {
                 let next = unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
                 check_vec_append(next)
@@ -495,7 +496,7 @@ fn reorder_insert_columns(
     // Build new table: for each target column, either copy from source or fill with defaults
     let mut builder = RawTableBuilder::new(ncols as i64)?;
     for tgt_idx in 0..ncols {
-        let name_id = crate::sym_intern(&target_cols[tgt_idx]);
+        let name_id = crate::sym_intern(&target_cols[tgt_idx])?;
         let typ = target_types[tgt_idx];
 
         let col = if let Some(src_idx) = col_map[tgt_idx] {
@@ -1208,16 +1209,18 @@ fn resolve_from(
             // Right keys: use const_vec to avoid cross-graph references
             let mut right_key_nodes: Vec<crate::Column> = Vec::new();
             for (_, rk) in &join_keys {
-                let right_sym = crate::sym_intern(rk);
+                let right_sym = crate::sym_intern(rk)?;
                 let right_col_ptr =
                     unsafe { crate::ffi_table_get_col(ar_table.as_raw(), right_sym) };
-                if right_col_ptr.is_null() {
+                if right_col_ptr.is_null() || crate::ffi_is_err(right_col_ptr) {
                     return Err(SqlError::Plan(format!(
                         "Right key column '{}' not found",
                         rk
                     )));
                 }
-                right_key_nodes.push(g.const_vec(right_col_ptr)?);
+                // SAFETY: right_col_ptr is a valid column vector obtained from
+                // ffi_table_get_col and checked for null/error above.
+                right_key_nodes.push(unsafe { g.const_vec(right_col_ptr)? });
             }
 
             let joined = g.join(

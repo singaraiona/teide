@@ -67,6 +67,8 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     /* Write data */
     if (vec->len < 0) { fclose(f); return TD_ERR_CORRUPT; }
     uint8_t esz = td_elem_size(vec->type);
+    /* data_size computation assumes 64-bit size_t. On 32-bit platforms,
+     * vectors >512M elements with 8-byte types would overflow. */
     size_t data_size = (size_t)vec->len * esz;
 
     void* data;
@@ -120,6 +122,10 @@ td_t* td_col_load(const char* path) {
     }
 
     uint8_t esz = td_elem_size(tmp->type);
+    if ((uint64_t)tmp->len * esz > SIZE_MAX - 32) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_IO);
+    }
     size_t data_size = (size_t)tmp->len * esz;
     if (32 + data_size > mapped_size) {
         td_vm_unmap_file(ptr, mapped_size);
@@ -186,6 +192,17 @@ td_t* td_col_mmap(const char* path) {
     if (32 + data_size > mapped_size) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    /* Validate that 32 + len*esz matches the file size.
+     * td_free() reconstructs the munmap size as:
+     *   (32 + len*esz + 4095) & ~4095  (page-rounded)
+     * This must match the kernel's page-rounded mmap size (derived from
+     * file_size). If the file has trailing garbage, the formula diverges. */
+    size_t expected = 32 + (size_t)vec->len * esz;
+    if (expected != mapped_size) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_IO);
     }
 
     /* Patch header — MAP_PRIVATE COW: only the header page gets copied */

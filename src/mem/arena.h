@@ -37,14 +37,6 @@
 #include <stdatomic.h>
 
 /* --------------------------------------------------------------------------
- * Slab cache: LIFO stack of free blocks per small order (5-9)
- * -------------------------------------------------------------------------- */
-typedef struct {
-    int64_t count;
-    td_t*   stack[TD_SLAB_CACHE_SIZE];
-} td_slab_cache_t;
-
-/* --------------------------------------------------------------------------
  * Direct mmap tracker (blocks > 1 GiB, bypassing buddy)
  * -------------------------------------------------------------------------- */
 typedef struct td_direct_block {
@@ -58,7 +50,6 @@ typedef struct td_direct_block {
  * -------------------------------------------------------------------------- */
 struct td_arena {
     td_buddy_t          buddy;
-    td_slab_cache_t     slabs[TD_SLAB_ORDERS]; /* orders 5..9 */
     _Atomic(td_t*)      return_queue;           /* MPSC lock-free stack head */
     size_t              region_size;
     struct td_arena*    next;                   /* linked list of arenas per thread */

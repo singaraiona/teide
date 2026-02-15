@@ -556,6 +556,7 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
     memset(node_reg, 0xFF, nc * sizeof(uint8_t));
 
     /* Post-order DFS with explicit stack */
+    /* Depth limit 64 — expressions deeper than 64 levels fall back to non-fused path. */
     typedef struct { td_op_t* node; uint8_t phase; } dfs_t;
     dfs_t dfs[64];
     int sp = 0;
@@ -925,11 +926,14 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     const td_expr_t* expr = c->expr;
     uint8_t esz = td_elem_size(c->out_type);
 
-    /* Per-worker scratch buffers (stack-allocated, morsel-sized) */
-    char scratch_mem[EXPR_MAX_REGS][EXPR_MORSEL * 8];
+    /* Per-worker scratch buffers (heap-allocated via arena, morsel-sized) */
+    td_t* scratch_hdr = NULL;
+    char* scratch_mem = (char*)scratch_alloc(&scratch_hdr,
+                            (size_t)EXPR_MAX_REGS * EXPR_MORSEL * 8);
+    if (!scratch_mem) return;
     void* scratch[EXPR_MAX_REGS];
     for (uint8_t r = 0; r < expr->n_regs; r++)
-        scratch[r] = scratch_mem[r];
+        scratch[r] = scratch_mem + (size_t)r * EXPR_MORSEL * 8;
 
     for (int64_t ms = start; ms < end; ms += EXPR_MORSEL) {
         int64_t me = (ms + EXPR_MORSEL < end) ? ms + EXPR_MORSEL : end;
@@ -937,6 +941,7 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
         if (result)
             memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
     }
+    scratch_free(scratch_hdr);
 }
 
 /* Evaluate compiled expression into a full-length output vector.
@@ -1647,6 +1652,8 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     if (pass_count <= TD_PARALLEL_THRESHOLD || ncols <= 0)
         return exec_filter_seq(input, pred, ncols, pass_count);
 
+    if (ncols > 4096) return TD_ERR_PTR(TD_ERR_NYI); /* stack safety */
+
     /* Build match_idx: match_idx[j] = row of j-th matching element */
     td_t* idx_hdr = NULL;
     int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
@@ -2137,6 +2144,7 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
             if (data[i] > max_id) max_id = data[i];
     }
 
+    if (max_id >= UINT32_MAX - 1) { *hdr_out = NULL; return NULL; }
     uint32_t n_ids = max_id + 1;
 
     /* Allocate array of intern IDs to sort */
@@ -2537,6 +2545,7 @@ static void topn_scan_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
 
 static int64_t topn_merge_fused(fused_topn_ctx_t* ctx, uint32_t n_workers,
                                  int64_t* out, int64_t limit) {
+    /* VLA bounded by TOPN_MAX (1024) — max 16KB on stack. */
     topn_entry_t merge[limit];
     int64_t cnt = 0;
     for (uint32_t w = 0; w < n_workers; w++) {
@@ -2617,6 +2626,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
 
     int64_t nrows = td_table_nrows(tbl);
     int64_t ncols = td_table_ncols(tbl);
+    if (ncols > 4096) return TD_ERR_PTR(TD_ERR_NYI); /* stack safety */
     uint8_t n_sort = ext->sort.n_cols;
 
     /* Allocate index array */
@@ -3478,6 +3488,7 @@ typedef struct {
     char*    data;           /* flat buffer: data[i * entry_stride] */
     uint32_t count;
     uint32_t cap;
+    bool     oom;            /* set on realloc failure */
     td_t*    _hdr;
 } radix_buf_t;
 
@@ -3490,7 +3501,7 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
         char* new_data = (char*)scratch_realloc(
             &buf->_hdr, (size_t)old_cap * entry_stride,
             (size_t)new_cap * entry_stride);
-        if (!new_data) return;
+        if (!new_data) { buf->oom = true; return; }
         buf->data = new_data;
         buf->cap = new_cap;
     }
@@ -4807,8 +4818,24 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
             da_accum_t* wa = &sc_acc[w];
             if (need_flags & DA_NEED_SUM) {
                 for (uint8_t a = 0; a < n_aggs; a++) {
-                    m->f64[a] += wa->f64[a];
-                    m->i64[a] += wa->i64[a];
+                    uint16_t op = ext->agg_ops[a];
+                    if (op == OP_FIRST) {
+                        /* Keep value from lowest worker_id that has count > 0 */
+                        if (m->count[0] == 0 && wa->count[0] > 0) {
+                            m->f64[a] = wa->f64[a];
+                            m->i64[a] = wa->i64[a];
+                        }
+                    } else if (op == OP_LAST) {
+                        /* Take value from highest worker_id that saw rows */
+                        if (wa->count[0] > 0) {
+                            m->f64[a] = wa->f64[a];
+                            m->i64[a] = wa->i64[a];
+                        }
+                    } else {
+                        /* SUM, AVG, COUNT, STDDEV, VAR — accumulate */
+                        m->f64[a] += wa->f64[a];
+                        m->i64[a] += wa->i64[a];
+                    }
                 }
             }
             if (need_flags & DA_NEED_SUMSQ) {
@@ -4876,6 +4903,7 @@ da_path:;
             td_pool_t* mm_pool = td_pool_get();
             uint32_t mm_n = (mm_pool && nrows >= TD_PARALLEL_THRESHOLD)
                             ? td_pool_total_workers(mm_pool) : 1;
+            /* VLA bounded by worker count — max ~2KB per key even on 256-core systems. */
             int64_t mm_mins[mm_n], mm_maxs[mm_n];
             for (uint8_t k = 0; k < n_keys && da_fits; k++) {
                 int64_t kmin, kmax;
@@ -5287,6 +5315,20 @@ ht_path:;
         };
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
         CHECK_CANCEL_GOTO(pool, cleanup);
+
+        /* Check for OOM during phase 1 radix buffer growth */
+        {
+            bool phase1_oom = false;
+            for (size_t i = 0; i < n_bufs; i++) {
+                if (radix_bufs[i].oom) { phase1_oom = true; break; }
+            }
+            if (phase1_oom) {
+                for (size_t i = 0; i < n_bufs; i++) scratch_free(radix_bufs[i]._hdr);
+                scratch_free(radix_bufs_hdr);
+                radix_bufs = NULL;
+                goto sequential_fallback;
+            }
+        }
 
         /* Phase 2: parallel per-partition aggregation (no column access) */
         part_hts = (group_ht_t*)scratch_calloc(&part_hts_hdr,

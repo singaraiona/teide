@@ -96,6 +96,9 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
         if (visited[nid]) continue;
         visited[nid] = true;
         order[oc++] = nid;
+        /* NOTE: ext node children (GROUP/SORT/JOIN/WINDOW keys, aggs) have types
+           set during graph construction — no inference traversal needed beyond
+           inputs[0..1]. */
         for (int i = 0; i < 2 && i < n->arity; i++) {
             if (n->inputs[i] && sp < (int)nc)
                 stack[sp++] = n->inputs[i]->id;
@@ -119,6 +122,7 @@ static bool is_const(td_op_t* n) {
     return n && n->opcode == OP_CONST;
 }
 
+/* O(n) scan — acceptable for typical graph sizes (tens to hundreds of nodes). */
 static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
     for (uint32_t i = 0; i < g->ext_count; i++) {
         if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
@@ -258,8 +262,16 @@ static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
                 case OP_ADD: r = (int64_t)((uint64_t)lv + (uint64_t)rv); break;
                 case OP_SUB: r = (int64_t)((uint64_t)lv - (uint64_t)rv); break;
                 case OP_MUL: r = (int64_t)((uint64_t)lv * (uint64_t)rv); break;
-                case OP_DIV: r = rv != 0 ? lv / rv : 0; break;
-                case OP_MOD: r = rv != 0 ? lv % rv : 0; break;
+                case OP_DIV:
+                    if (rv == 0) r = 0;
+                    else if (lv == INT64_MIN && rv == -1) r = INT64_MIN;
+                    else r = lv / rv;
+                    break;
+                case OP_MOD:
+                    if (rv == 0) r = 0;
+                    else if (lv == INT64_MIN && rv == -1) r = 0;
+                    else r = lv % rv;
+                    break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
                 default: return false;
@@ -278,8 +290,8 @@ static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
                 case OP_LE:  r = lv <= rv; break;
                 case OP_GT:  r = lv > rv; break;
                 case OP_GE:  r = lv >= rv; break;
-                case OP_AND: r = (uint8_t)lv && (uint8_t)rv; break;
-                case OP_OR:  r = (uint8_t)lv || (uint8_t)rv; break;
+                case OP_AND: r = (lv != 0.0) && (rv != 0.0); break;
+                case OP_OR:  r = (lv != 0.0) || (rv != 0.0); break;
                 default: return false;
             }
             folded = td_bool(r);
@@ -407,8 +419,11 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
     if (!root) return;
 
     uint32_t nc = g->node_count;
+    /* Worst case: each node can contribute up to ~N children (CONCAT trailing),
+       but nc*2 is a safe upper bound for the stack. */
+    uint32_t stack_cap = nc * 2;
     uint32_t stack_local[256];
-    uint32_t *stack = nc <= 256 ? stack_local : (uint32_t*)td_sys_alloc(nc * sizeof(uint32_t));
+    uint32_t *stack = stack_cap <= 256 ? stack_local : (uint32_t*)td_sys_alloc(stack_cap * sizeof(uint32_t));
     if (!stack) return;
     int sp = 0;
     stack[sp++] = root->id;
@@ -418,11 +433,36 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
         live[nid] = true;
         td_op_t* n = &g->nodes[nid];
         for (int i = 0; i < 2; i++) {
-            if (n->inputs[i] && sp < (int)nc)
+            if (n->inputs[i] && sp < (int)stack_cap)
                 stack[sp++] = n->inputs[i]->id;
         }
+        /* H4: 3-input ops (OP_IF, OP_SUBSTR, OP_REPLACE) store the third
+           operand node ID as (uintptr_t)ext->literal. */
+        if (n->opcode == OP_IF || n->opcode == OP_SUBSTR || n->opcode == OP_REPLACE) {
+            td_op_ext_t* ext = find_ext(g, nid);
+            if (ext) {
+                uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                if (third_id < nc && sp < (int)stack_cap)
+                    stack[sp++] = third_id;
+            }
+        }
+        /* H5: OP_CONCAT stores extra arg IDs (beyond inputs[0..1]) as
+           uint32_t values in trailing bytes after the ext node.
+           ext->sym holds the total arg count. */
+        if (n->opcode == OP_CONCAT) {
+            td_op_ext_t* ext = find_ext(g, nid);
+            if (ext) {
+                int n_args = (int)ext->sym;
+                uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                for (int i = 2; i < n_args; i++) {
+                    uint32_t arg_id = trail[i - 2];
+                    if (arg_id < nc && sp < (int)stack_cap)
+                        stack[sp++] = arg_id;
+                }
+            }
+        }
     }
-    if (nc > 256) td_sys_free(stack);
+    if (stack_cap > 256) td_sys_free(stack);
 }
 
 static void pass_dce(td_graph_t* g, td_op_t* root) {

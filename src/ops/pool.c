@@ -24,6 +24,7 @@
 #include "pool.h"
 #include "mem/sys.h"
 #include <string.h>
+#include <sched.h>
 
 /* Task granularity: TD_DISPATCH_MORSELS * TD_MORSEL_ELEMS elements per task */
 #define TASK_GRAIN  ((int64_t)TD_DISPATCH_MORSELS * TD_MORSEL_ELEMS)
@@ -264,12 +265,16 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
 
     /* Spin-wait for workers to finish remaining tasks.
      * No semaphore — avoids surplus-signal bug between consecutive dispatches. */
-    while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
+    {
+        unsigned spin_count = 0;
+        while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
 #if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
+            __builtin_ia32_pause();
 #elif defined(__aarch64__)
-        __asm__ volatile("yield" ::: "memory");
+            __asm__ volatile("yield" ::: "memory");
 #endif
+            if (++spin_count % 1024 == 0) sched_yield();
+        }
     }
 }
 
@@ -336,12 +341,16 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
     }
 
     /* Spin-wait for workers to finish remaining tasks */
-    while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
+    {
+        unsigned spin_count = 0;
+        while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
 #if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
+            __builtin_ia32_pause();
 #elif defined(__aarch64__)
-        __asm__ volatile("yield" ::: "memory");
+            __asm__ volatile("yield" ::: "memory");
 #endif
+            if (++spin_count % 1024 == 0) sched_yield();
+        }
     }
 }
 
@@ -393,7 +402,17 @@ td_err_t td_pool_init(uint32_t n_workers) {
     if (!atomic_compare_exchange_strong_explicit(&g_pool_init_state, &expected, 1,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
-        return TD_OK;  /* already initialized or in progress */
+        /* Another thread is currently initializing (state==1); spin until ready */
+        if (expected == 1) {
+            while (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 1) {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                __asm__ volatile("yield" ::: "memory");
+#endif
+            }
+        }
+        return TD_OK;  /* already initialized or completed during our spin */
     }
     td_err_t err = td_pool_create(&g_pool, n_workers);
     if (err == TD_OK) {
@@ -405,8 +424,11 @@ td_err_t td_pool_init(uint32_t n_workers) {
 }
 
 void td_pool_destroy(void) {
-    uint32_t state = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
-    if (state != 2) return;
+    uint32_t expected = 2;
+    if (!atomic_compare_exchange_strong_explicit(&g_pool_init_state, &expected, 3,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire))
+        return;  /* not ready, or another thread is already destroying */
     td_pool_free(&g_pool);
     atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);
 }

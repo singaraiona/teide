@@ -52,6 +52,8 @@ pub enum Error {
     Corrupt,
     Cancel,
     InvalidInput,
+    NullPointer,
+    EngineNotInitialized,
     RuntimeUnavailable,
 }
 
@@ -89,6 +91,8 @@ impl std::fmt::Display for Error {
             Error::Corrupt => "corrupt data",
             Error::Cancel => "query cancelled",
             Error::InvalidInput => "invalid input",
+            Error::NullPointer => "null pointer",
+            Error::EngineNotInitialized => "engine not initialized",
             Error::RuntimeUnavailable => "engine runtime is not available",
         };
         f.write_str(s)
@@ -246,7 +250,11 @@ fn check_ptr(ptr: *mut ffi::td_t) -> Result<*mut ffi::td_t> {
     }
 }
 
-struct EngineGuard;
+struct EngineGuard {
+    pool_inited: bool,
+    sym_inited: bool,
+    arena_inited: bool,
+}
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
@@ -260,9 +268,15 @@ impl Drop for EngineGuard {
         // 3. td_arena_destroy_all() — tears down the main thread's arena.
         //    Must come last because sym_destroy may reference arena memory.
         unsafe {
-            ffi::td_pool_destroy();
-            ffi::td_sym_destroy();
-            ffi::td_arena_destroy_all();
+            if self.pool_inited {
+                ffi::td_pool_destroy();
+            }
+            if self.sym_inited {
+                ffi::td_sym_destroy();
+            }
+            if self.arena_inited {
+                ffi::td_arena_destroy_all();
+            }
         }
     }
 }
@@ -281,14 +295,25 @@ fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
     // Hold the lock across init to prevent double-initialization race
     unsafe {
         ffi::td_arena_init();
-        ffi::td_sym_init();
-        let err = ffi::td_pool_init(0);
-        if err != ffi::td_err_t::TD_OK {
-            return Err(Error::from_code(err));
-        }
     }
+    let mut guard = EngineGuard {
+        pool_inited: false,
+        sym_inited: false,
+        arena_inited: true,
+    };
+    unsafe {
+        ffi::td_sym_init();
+    }
+    guard.sym_inited = true;
+    let err = unsafe { ffi::td_pool_init(0) };
+    if err != ffi::td_err_t::TD_OK {
+        // guard will drop, cleaning up arena + sym that were already initialized
+        drop(guard);
+        return Err(Error::from_code(err));
+    }
+    guard.pool_inited = true;
 
-    let guard = Arc::new(EngineGuard);
+    let guard = Arc::new(guard);
     *lock = Arc::downgrade(&guard);
     Ok(guard)
 }
@@ -304,6 +329,9 @@ fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
 /// cancellation thread). The next morsel boundary in the executor will
 /// observe the flag and return `Error::Cancel`.
 pub fn cancel() {
+    if acquire_existing_engine_guard().is_err() {
+        return; // Engine not initialized, nothing to cancel
+    }
     unsafe { ffi::td_cancel(); }
 }
 
@@ -313,12 +341,11 @@ pub fn cancel() {
 
 /// Intern a string into the global symbol table. Returns a stable i64 ID.
 ///
-/// # Panics
-/// Panics if the engine runtime has not been initialized (no `Context` exists).
-pub fn sym_intern(s: &str) -> i64 {
-    acquire_existing_engine_guard()
-        .expect("sym_intern called before engine initialization (no Context exists)");
-    unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) }
+/// Returns `Error::EngineNotInitialized` if no `Context` exists.
+pub fn sym_intern(s: &str) -> Result<i64> {
+    let _guard = acquire_existing_engine_guard()
+        .map_err(|_| Error::EngineNotInitialized)?;
+    Ok(unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) })
 }
 
 /// Engine context. Initializes the arena allocator, symbol table, and thread
@@ -414,7 +441,7 @@ impl Context {
     /// Create a new operation graph bound to a table.
     pub fn graph<'a>(&self, table: &'a Table) -> Result<Graph<'a>> {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
-        if raw.is_null() {
+        if raw.is_null() || ffi::td_is_err(raw as *const ffi::td_t) {
             return Err(Error::Oom);
         }
         Ok(Graph {
@@ -541,13 +568,26 @@ impl Table {
 
     /// Add a column to this table. The table pointer may change (COW semantics).
     /// `name` is a pre-interned symbol ID.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn add_column_raw(&mut self, name_id: i64, col: *mut ffi::td_t) {
+    ///
+    /// # Safety
+    /// `col` must be a valid, non-null Teide vector pointer from the current
+    /// engine runtime. The caller retains ownership; this function does NOT
+    /// release `col`.
+    pub unsafe fn add_column_raw(&mut self, name_id: i64, col: *mut ffi::td_t) -> Result<()> {
+        if col.is_null() {
+            return Err(Error::NullPointer);
+        }
         self.raw = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
+        Ok(())
     }
 
     /// Create a new table with the same column data but renamed columns.
     /// `names` must have exactly `ncols()` entries.
+    ///
+    /// # Ownership
+    /// `td_table_add_col` retains each column vector internally. If an error
+    /// occurs mid-construction, releasing `new_raw` cascades to all columns
+    /// already added, so no manual per-column release is needed on the error path.
     pub fn with_column_names(&self, names: &[String]) -> Result<Self> {
         let nc = self.ncols() as usize;
         if names.len() != nc {
@@ -572,7 +612,7 @@ impl Table {
                     ffi::td_release(new_raw);
                     return Err(err);
                 }
-                let name_id = sym_intern(name);
+                let name_id = sym_intern(name)?;
                 ffi::td_retain(col);
                 let next_raw = ffi::td_table_add_col(new_raw, name_id, col);
                 if next_raw.is_null() {
@@ -790,8 +830,17 @@ pub struct Graph<'a> {
     engine: Arc<EngineGuard>,
     // Ties lifetime to the Table AND makes Graph !Send + !Sync via *mut ()
     _table: PhantomData<(&'a Table, *mut ())>,
-    // Pin arrays passed to C functions that store pointers (td_group, td_sort_op).
-    // These must live until the graph is dropped/executed.
+    // Pin arrays passed to C functions that store pointers (td_group, td_sort_op,
+    // td_window_op, td_join). These must live until the graph is dropped/executed.
+    //
+    // SAFETY: Vec::as_mut_ptr() returns a stable pointer to the Vec's heap buffer.
+    // Wrapping each Vec in a Box<dyn Any> and pushing to _pinned does NOT
+    // invalidate the pointer because: (a) Box::new moves the Vec *value* (three
+    // words: ptr/len/cap) to the heap, but the data buffer the Vec points to is
+    // already on the heap and does not move; (b) pushing Box<dyn Any> into
+    // _pinned may reallocate the outer Vec<Box<...>>, but that only moves the
+    // Box pointers, not the inner data buffers. Therefore the raw pointers
+    // stored by C remain valid for the lifetime of the Graph.
     _pinned: Vec<Box<dyn std::any::Any>>,
 }
 
@@ -815,6 +864,8 @@ impl Graph<'_> {
     /// Scan a column by name from the bound table.
     /// Returns `Error::InvalidInput` when `col_name` contains interior NUL bytes.
     pub fn scan(&self, col_name: &str) -> Result<Column> {
+        // SAFETY: C function copies/interns the string immediately. CString is
+        // valid for the duration of the FFI call.
         let c_name = CString::new(col_name).map_err(|_| Error::InvalidInput)?;
         let raw = unsafe { ffi::td_scan(self.raw, c_name.as_ptr()) };
         Self::check_op(raw)
@@ -838,6 +889,8 @@ impl Graph<'_> {
     /// Create a constant string node.
     /// Returns `Error::InvalidInput` when `val` contains interior NUL bytes.
     pub fn const_str(&self, val: &str) -> Result<Column> {
+        // SAFETY: C function copies/interns the string immediately. CString is
+        // valid for the duration of the FFI call.
         let c_val = CString::new(val).map_err(|_| Error::InvalidInput)?;
         Self::check_op(unsafe { ffi::td_const_str(self.raw, c_val.as_ptr()) })
     }
@@ -1234,6 +1287,8 @@ impl Graph<'_> {
     /// Rename/alias a column.
     /// Returns `Error::InvalidInput` when `name` contains interior NUL bytes.
     pub fn alias(&self, input: Column, name: &str) -> Result<Column> {
+        // SAFETY: C function copies/interns the string immediately. CString is
+        // valid for the duration of the FFI call.
         let c_name = CString::new(name).map_err(|_| Error::InvalidInput)?;
         Self::check_op(unsafe { ffi::td_alias(self.raw, input.raw, c_name.as_ptr()) })
     }
@@ -1243,6 +1298,9 @@ impl Graph<'_> {
     /// Optimize the DAG and execute it, returning a result `Table`.
     pub fn execute(&self, root: Column) -> Result<Table> {
         let optimized = unsafe { ffi::td_optimize(self.raw, root.raw) };
+        if optimized.is_null() {
+            return Err(Error::Oom);
+        }
         let result = unsafe { ffi::td_execute(self.raw, optimized) };
         let result = check_ptr(result)?;
         // td_execute returns a freshly allocated td_t* with rc=1 (caller owns it).
@@ -1261,14 +1319,23 @@ impl Graph<'_> {
     /// is needed. The caller must call `td_release` exactly once when done.
     pub fn execute_raw(&self, root: Column) -> Result<*mut ffi::td_t> {
         let optimized = unsafe { ffi::td_optimize(self.raw, root.raw) };
+        if optimized.is_null() {
+            return Err(Error::Oom);
+        }
         let result = unsafe { ffi::td_execute(self.raw, optimized) };
         let result = check_ptr(result)?;
         Ok(result)
     }
 
     /// Inject a pre-computed vector as a constant node in the graph.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn const_vec(&self, vec: *mut ffi::td_t) -> Result<Column> {
+    ///
+    /// # Safety
+    /// `vec` must be a valid, non-null Teide vector pointer from the current
+    /// engine runtime.
+    pub unsafe fn const_vec(&self, vec: *mut ffi::td_t) -> Result<Column> {
+        if vec.is_null() {
+            return Err(Error::NullPointer);
+        }
         Self::check_op(unsafe { ffi::td_const_vec(self.raw, vec) })
     }
 
@@ -1277,6 +1344,14 @@ impl Graph<'_> {
     ///
     /// # Safety
     /// `mask` must be a valid boolean vector allocated by the same engine runtime.
+    ///
+    /// # Ownership
+    /// The mask is retained here via `td_retain`. When the graph is freed by
+    /// `td_graph_free`, the C engine releases the filter_mask pointer. The
+    /// retain/release sequence is therefore: caller creates mask (rc=1) ->
+    /// set_filter_mask retains (rc=2) -> caller may release their ref (rc=1)
+    /// -> graph free releases (rc=0, freed). If an error occurs before graph
+    /// execution, td_graph_free still handles the release.
     pub unsafe fn set_filter_mask(&mut self, mask: *mut ffi::td_t) {
         unsafe {
             ffi::td_retain(mask);

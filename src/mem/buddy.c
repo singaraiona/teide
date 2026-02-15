@@ -37,6 +37,7 @@ static uint8_t ceil_log2(size_t n) {
 }
 
 uint8_t td_order_for_size(size_t data_size) {
+    if (data_size > SIZE_MAX - 32) return TD_ORDER_MAX + 1;
     size_t total = data_size + 32;  /* header is 32 bytes */
     uint8_t k = ceil_log2(total);
     if (k < TD_ORDER_MIN) k = TD_ORDER_MIN;

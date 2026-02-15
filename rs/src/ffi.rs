@@ -345,8 +345,8 @@ pub struct td_t {
     pub attrs: u8,
     /// Bytes 20-23: reference count.
     /// In C this is `_Atomic(uint32_t)`. We use `AtomicU32` to match the C
-    /// type exactly. `AtomicU32` is guaranteed to have the same size and
-    /// alignment as `u32` on all targets, so the struct layout is unchanged.
+    /// type exactly. AtomicU32 has same size/alignment as u32 on all practical
+    /// targets. Validated by the size assertion at the bottom of this file.
     /// All atomic operations on `rc` go through the C FFI (`td_retain`,
     /// `td_release`); Rust never manipulates this field directly.
     pub rc: AtomicU32,
@@ -425,7 +425,8 @@ pub struct td_op_t {
     pub inputs: [*mut td_op_t; 2],
 }
 
-// Extended op node — opaque (104 bytes, complex unions)
+// Extended op node — opaque (104 bytes, complex unions).
+// Size validated by compile-time assertion at bottom of ffi.rs (line ~840).
 #[repr(C)]
 pub struct td_op_ext_t {
     _opaque: [u8; 104],

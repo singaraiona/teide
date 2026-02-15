@@ -145,33 +145,37 @@ typedef struct {
 
 static void local_sym_init(local_sym_t* ls) {
     ls->bucket_cap = LSYM_INIT_BUCKETS;
-    ls->buckets = (uint64_t*)scratch_alloc(&ls->buckets_hdr,
-                                            ls->bucket_cap * sizeof(uint64_t));
+    /* Use td_sys_alloc (mmap-backed) instead of scratch_alloc (buddy) because
+     * workers allocate these buffers but the main thread frees them after merge.
+     * Buddy allocator td_free() only works on the allocating thread's arena —
+     * cross-thread free silently leaks.  td_sys_alloc/td_sys_free are safe
+     * across threads (each allocation is an independent mmap). */
+    ls->buckets = (uint64_t*)td_sys_alloc(ls->bucket_cap * sizeof(uint64_t));
+    ls->buckets_hdr = NULL; /* unused with td_sys_alloc */
     if (ls->buckets) memset(ls->buckets, 0, ls->bucket_cap * sizeof(uint64_t));
     ls->cap = LSYM_INIT_STRS;
-    ls->offsets = (uint32_t*)scratch_alloc(&ls->offsets_hdr,
-                                            ls->cap * sizeof(uint32_t));
-    ls->lens = (uint32_t*)scratch_alloc(&ls->lens_hdr,
-                                         ls->cap * sizeof(uint32_t));
+    ls->offsets = (uint32_t*)td_sys_alloc(ls->cap * sizeof(uint32_t));
+    ls->offsets_hdr = NULL;
+    ls->lens = (uint32_t*)td_sys_alloc(ls->cap * sizeof(uint32_t));
+    ls->lens_hdr = NULL;
     ls->count = 0;
     ls->arena_cap = LSYM_INIT_ARENA;
-    ls->arena = (char*)scratch_alloc(&ls->arena_hdr, ls->arena_cap);
+    ls->arena = (char*)td_sys_alloc(ls->arena_cap);
+    ls->arena_hdr = NULL;
     ls->arena_used = 0;
 }
 
 static void local_sym_free(local_sym_t* ls) {
-    scratch_free(ls->buckets_hdr);
-    scratch_free(ls->offsets_hdr);
-    scratch_free(ls->lens_hdr);
-    scratch_free(ls->arena_hdr);
+    if (ls->buckets) td_sys_free(ls->buckets);
+    if (ls->offsets) td_sys_free(ls->offsets);
+    if (ls->lens)    td_sys_free(ls->lens);
+    if (ls->arena)   td_sys_free(ls->arena);
     memset(ls, 0, sizeof(*ls));
 }
 
 static void local_sym_rehash(local_sym_t* ls) {
     uint32_t new_cap = ls->bucket_cap * 2;
-    td_t* new_hdr = NULL;
-    uint64_t* new_buckets = (uint64_t*)scratch_alloc(&new_hdr,
-                                                      new_cap * sizeof(uint64_t));
+    uint64_t* new_buckets = (uint64_t*)td_sys_alloc(new_cap * sizeof(uint64_t));
     if (!new_buckets) return;
     memset(new_buckets, 0, new_cap * sizeof(uint64_t));
 
@@ -184,8 +188,7 @@ static void local_sym_rehash(local_sym_t* ls) {
         while (new_buckets[slot] != 0) slot = (slot + 1) & new_mask;
         new_buckets[slot] = e;
     }
-    scratch_free(ls->buckets_hdr);
-    ls->buckets_hdr = new_hdr;
+    td_sys_free(ls->buckets);
     ls->buckets = new_buckets;
     ls->bucket_cap = new_cap;
 }
@@ -214,20 +217,22 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
 
     if (new_id >= ls->cap) {
         uint32_t new_cap = ls->cap * 2;
-        ls->offsets = (uint32_t*)scratch_realloc(&ls->offsets_hdr,
-            ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
-        ls->lens = (uint32_t*)scratch_realloc(&ls->lens_hdr,
-            ls->cap * sizeof(uint32_t), new_cap * sizeof(uint32_t));
-        if (TD_UNLIKELY(!ls->offsets || !ls->lens)) return UINT32_MAX;
+        uint32_t* new_offsets = (uint32_t*)td_sys_realloc(ls->offsets,
+            new_cap * sizeof(uint32_t));
+        uint32_t* new_lens = (uint32_t*)td_sys_realloc(ls->lens,
+            new_cap * sizeof(uint32_t));
+        if (TD_UNLIKELY(!new_offsets || !new_lens)) return UINT32_MAX;
+        ls->offsets = new_offsets;
+        ls->lens = new_lens;
         ls->cap = new_cap;
     }
 
     if (ls->arena_used + len > ls->arena_cap) {
         size_t new_acap = ls->arena_cap * 2;
         while (new_acap < ls->arena_used + len) new_acap *= 2;
-        ls->arena = (char*)scratch_realloc(&ls->arena_hdr,
-            ls->arena_cap, new_acap);
-        if (TD_UNLIKELY(!ls->arena)) return UINT32_MAX;
+        char* new_arena = (char*)td_sys_realloc(ls->arena, new_acap);
+        if (TD_UNLIKELY(!new_arena)) return UINT32_MAX;
+        ls->arena = new_arena;
         ls->arena_cap = new_acap;
     }
     memcpy(ls->arena + ls->arena_used, str, len);
@@ -489,6 +494,7 @@ static const double g_pow10[] = {
 TD_INLINE double fast_f64(const char* p, size_t len) {
     if (TD_UNLIKELY(len == 0)) return 0.0;
 
+    const char* start = p;
     const char* end = p + len;
     int negative = 0;
     if (*p == '-') { negative = 1; p++; }
@@ -496,9 +502,12 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
 
     /* Integer part */
     uint64_t int_part = 0;
+    int idigits = 0;
     while (p < end && (unsigned)(*p - '0') < 10) {
         int_part = int_part * 10 + (uint64_t)(*p - '0');
+        idigits++;
         p++;
+        if (idigits > 18) goto strtod_fallback;
     }
     double val = (double)int_part;
 
@@ -511,6 +520,11 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
             frac = frac * 10 + (uint64_t)(*p - '0');
             frac_digits++;
             p++;
+            if (frac_digits > 18) {
+                /* Cap fractional accumulation — skip remaining fractional digits */
+                while (p < end && (unsigned)(*p - '0') < 10) p++;
+                break;
+            }
         }
         if (frac_digits > 0 && frac_digits <= 22) {
             val += (double)frac / g_pow10[frac_digits];
@@ -552,6 +566,16 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
     }
 
     return negative ? -val : val;
+
+strtod_fallback:
+    {
+        char tmp[64];
+        size_t slen = (size_t)(end - start);
+        if (slen > sizeof(tmp) - 1) slen = sizeof(tmp) - 1;
+        memcpy(tmp, start, slen);
+        tmp[slen] = '\0';
+        return strtod(tmp, NULL);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -719,6 +743,7 @@ static void sym_fixup_fn(void* arg, uint32_t worker_id, int64_t start, int64_t e
     for (int64_t r = start; r < end; r++) {
         uint32_t packed = data[r];
         uint32_t wid = UNPACK_WID(packed);
+        if (wid >= c->n_workers) continue; /* corrupted packed value */
         uint32_t lid = UNPACK_LID(packed);
         if (mappings[wid])
             data[r] = (uint32_t)mappings[wid][lid];
@@ -787,6 +812,7 @@ typedef struct {
     const char*       buf;
     size_t            buf_size;
     const int64_t*    row_offsets;
+    int64_t           n_rows;
     int               n_cols;
     char              delim;
     const csv_type_t* col_types;
@@ -814,12 +840,36 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
 
     for (int64_t row = start; row < end_row; row++) {
         const char* p = ctx->buf + ctx->row_offsets[row];
+        const char* row_end = (row + 1 < ctx->n_rows)
+            ? ctx->buf + ctx->row_offsets[row + 1]
+            : buf_end;
 
         for (int c = 0; c < ctx->n_cols; c++) {
+            /* Guard: if past row boundary, fill remaining columns with defaults */
+            if (p >= row_end) {
+                for (; c < ctx->n_cols; c++) {
+                    switch (ctx->col_types[c]) {
+                        case CSV_TYPE_BOOL: ((uint8_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I64:  ((int64_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = 0.0; break;
+                        case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_TIME: case CSV_TYPE_TIMESTAMP:
+                            ((int64_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_STR:  ((uint32_t*)ctx->col_data[c])[row] = 0; break;
+                        default: break;
+                    }
+                }
+                break;
+            }
+
             const char* fld;
             size_t flen;
             char* dyn_esc = NULL;
             p = scan_field(p, buf_end, ctx->delim, &fld, &flen, esc_buf, &dyn_esc);
+
+            /* Strip trailing \r from last field of row */
+            if (c == ctx->n_cols - 1 && flen > 0 && fld[flen - 1] == '\r')
+                flen--;
 
             switch (ctx->col_types[c]) {
                 case CSV_TYPE_BOOL: {
@@ -869,12 +919,36 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
 
     for (int64_t row = 0; row < n_rows; row++) {
         const char* p = buf + row_offsets[row];
+        const char* row_end = (row + 1 < n_rows)
+            ? buf + row_offsets[row + 1]
+            : buf_end;
 
         for (int c = 0; c < n_cols; c++) {
+            /* Guard: if past row boundary, fill remaining columns with defaults */
+            if (p >= row_end) {
+                for (; c < n_cols; c++) {
+                    switch (col_types[c]) {
+                        case CSV_TYPE_BOOL: ((uint8_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I64:  ((int64_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_F64:  ((double*)col_data[c])[row] = 0.0; break;
+                        case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_TIME: case CSV_TYPE_TIMESTAMP:
+                            ((int64_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_STR:  ((uint32_t*)col_data[c])[row] = 0; break;
+                        default: break;
+                    }
+                }
+                break;
+            }
+
             const char* fld;
             size_t flen;
             char* dyn_esc = NULL;
             p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn_esc);
+
+            /* Strip trailing \r from last field of row */
+            if (c == n_cols - 1 && flen > 0 && fld[flen - 1] == '\r')
+                flen--;
 
             switch (col_types[c]) {
                 case CSV_TYPE_BOOL: {
@@ -941,6 +1015,8 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
     td_t* result = NULL;
 
     /* ---- 3. Detect delimiter ---- */
+    /* Delimiter auto-detected from header row only. Explicit delimiter
+     * recommended when header differs from data. */
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
         for (const char* p = buf; p < buf_end && *p != '\n'; p++) {
@@ -1019,6 +1095,8 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
         /* Auto-infer from sample rows */
         csv_type_t col_types[CSV_MAX_COLS];
         memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
+        /* Type inference uses first CSV_SAMPLE_ROWS rows. Files where early rows
+         * don't represent the full type range may be mistyped. */
         int64_t sample_n = (n_rows < CSV_SAMPLE_ROWS) ? n_rows : CSV_SAMPLE_ROWS;
         for (int64_t r = 0; r < sample_n; r++) {
             const char* rp = buf + row_offsets[r];
@@ -1112,6 +1190,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
                     .buf         = buf,
                     .buf_size    = file_size,
                     .row_offsets = row_offsets,
+                    .n_rows      = n_rows,
                     .n_cols      = ncols,
                     .delim       = delimiter,
                     .col_types   = parse_types,

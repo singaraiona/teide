@@ -26,6 +26,11 @@
 #include "core/platform.h"
 #include <string.h>
 
+/* Ensure the return queue next-pointer overlay (bytes 0-7) does not clobber
+   the order field used by td_arena_drain_return_queue(). */
+_Static_assert(offsetof(td_t, order) >= 8,
+               "order must not overlap return queue next ptr");
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */
@@ -54,8 +59,13 @@ static _Atomic(uint32_t) g_arena_registry_lock = 0;
 
 static void arena_registry_lock(void) {
     while (atomic_exchange_explicit(&g_arena_registry_lock, 1,
-                                    memory_order_acquire) != 0)
-        ; /* spin */
+                                    memory_order_acquire) != 0) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
 }
 
 static void arena_registry_unlock(void) {
@@ -173,22 +183,36 @@ void td_arena_destroy_all(void) {
     }
     td_tl_direct_blocks = NULL;
 
-    /* Drain return queues before destroying (reclaim cross-thread frees) */
-    for (td_arena_t* a = td_tl_arena; a; a = a->next)
-        td_arena_drain_return_queue(a);
-
-    /* Unregister from global array so no new cross-thread frees target us */
+    /* Unregister from global array FIRST so no new cross-thread frees
+       target these arenas after this point. (H1/M7: fixes TOCTOU race
+       where another thread could push to a return queue between drain
+       and munmap.) */
     arena_registry_lock();
     for (td_arena_t* a = td_tl_arena; a; a = a->next) {
         uint32_t len = atomic_load_explicit(&g_arena_registry_len, memory_order_relaxed);
         for (uint32_t i = 0; i < len; i++) {
             if (g_arena_registry[i] == a) {
-                g_arena_registry[i] = NULL;
+                /* L1: compact registry — swap last entry into hole */
+                if (i < len - 1) {
+                    g_arena_registry[i] = g_arena_registry[len - 1];
+                    g_arena_registry[len - 1] = NULL;
+                } else {
+                    g_arena_registry[i] = NULL;
+                }
+                atomic_store_explicit(&g_arena_registry_len, len - 1,
+                                      memory_order_relaxed);
                 break;
             }
         }
     }
     arena_registry_unlock();
+
+    /* Ensure all pending cross-thread pushes have completed before draining */
+    atomic_thread_fence(memory_order_seq_cst);
+
+    /* Drain return queues (reclaim cross-thread frees that arrived before unregister) */
+    for (td_arena_t* a = td_tl_arena; a; a = a->next)
+        td_arena_drain_return_queue(a);
 
     td_arena_t* a = td_tl_arena;
     while (a) {
@@ -213,7 +237,9 @@ td_t* td_alloc(size_t data_size) {
         if (!td_tl_arena) return NULL;
     }
 
-    /* Lazy drain: reclaim blocks returned by other threads */
+    /* Only drain first arena's return queue on allocation hot path.
+       Secondary arenas are drained during td_parallel_end() or
+       td_arena_destroy_all(). */
     if (atomic_load_explicit(&td_tl_arena->return_queue,
                              memory_order_relaxed) != NULL)
         td_arena_drain_return_queue(td_tl_arena);
@@ -309,6 +335,8 @@ static bool td_atom_owns_obj(const td_t* v) {
     return false;
 }
 
+/* NOTE: recursive — depth bounded by data structure nesting. Dataframe
+   workloads don't create deeply nested structures. */
 static void td_release_owned_refs(td_t* v) {
     if (!v || TD_IS_ERR(v)) return;
 
@@ -450,6 +478,22 @@ static void td_detach_owned_refs(td_t* v) {
         v->attrs &= (uint8_t)~TD_ATTR_NULLMAP_EXT;
     }
 
+    /* Parted column: null out segment pointers to detach ownership */
+    if (TD_IS_PARTED(v->type)) {
+        int64_t n_segs = v->len;
+        td_t** segs = (td_t**)td_data(v);
+        for (int64_t i = 0; i < n_segs; i++)
+            segs[i] = NULL;
+        return;
+    }
+
+    if (v->type == TD_MAPCOMMON) {
+        td_t** ptrs = (td_t**)td_data(v);
+        ptrs[0] = NULL;
+        ptrs[1] = NULL;
+        return;
+    }
+
     if (v->type == TD_TABLE) {
         td_t** slots = (td_t**)td_data(v);
         slots[0] = NULL;
@@ -471,6 +515,8 @@ void td_free(td_t* v) {
 
     td_release_owned_refs(v);
 
+    /* NOTE: direct-mmap blocks (mmod==2) must be freed from the allocating
+       thread. Cross-thread free of direct blocks silently leaks. */
     if (v->mmod == 2) {
         td_direct_block_t** pp = &td_tl_direct_blocks;
         while (*pp) {
@@ -495,7 +541,10 @@ void td_free(td_t* v) {
         return;
     }
 
+    /* mmod==1 is only used for simple vectors (td_col_mmap). Tables and
+       lists should never have mmod==1; bail out to avoid incorrect size. */
     if (v->mmod == 1) {
+        if (v->type == TD_TABLE || v->type == TD_LIST) return;
         if (v->type > 0 && v->type < TD_TYPE_COUNT) {
             uint8_t esz = td_elem_size(v->type);
             size_t data_size = 32 + (size_t)v->len * esz;
@@ -536,6 +585,8 @@ void td_free(td_t* v) {
 
     td_buddy_free(&a->buddy, v, order);
     td_tl_stats.free_count++;
+    /* Stats are per-thread; cross-thread freed blocks are decremented on
+       the owning thread via return queue drain. */
     td_tl_stats.bytes_allocated -= block_size;
 }
 
@@ -564,10 +615,12 @@ td_t* td_alloc_copy(td_t* v) {
     td_t* copy = td_alloc(data_size);
     if (!copy) return NULL;
 
+    /* Save allocator metadata before memcpy overwrites the header */
+    uint8_t new_order = copy->order;
+    uint8_t new_mmod  = copy->mmod;
     memcpy(copy, v, 32 + data_size);
-    copy->mmod = 0;
-    copy->order = td_order_for_size(data_size);
-    if (copy->order < TD_ORDER_MIN) copy->order = TD_ORDER_MIN;
+    copy->mmod  = new_mmod;
+    copy->order = new_order;
     atomic_store_explicit(&copy->rc, 1, memory_order_relaxed);
     td_retain_owned_refs(copy);
     return copy;

@@ -50,6 +50,9 @@ void td_release(td_t* v) {
 
 td_t* td_cow(td_t* v) {
     if (!v || TD_IS_ERR(v)) return v;
+    /* Caller must hold exclusive logical ownership — no concurrent
+       td_retain/td_release allowed. The acquire load ensures visibility
+       of prior writes by threads that have released their reference. */
     uint32_t rc = atomic_load_explicit(&v->rc, memory_order_acquire);
     if (rc == 1) return v;  /* sole owner -- mutate in place */
     td_t* copy = td_alloc_copy(v);

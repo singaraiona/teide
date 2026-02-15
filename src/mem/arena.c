@@ -501,6 +501,10 @@ void td_free(td_t* v) {
             size_t data_size = 32 + (size_t)v->len * esz;
             size_t mapped_size = (data_size + 4095) & ~(size_t)4095; /* round up to page */
             td_vm_unmap_file(v, mapped_size);
+        } else {
+            /* Invalid type — still unmap to avoid leak (header-only page) */
+            size_t mapped_size = 4096; /* 32-byte header rounded up to page */
+            td_vm_unmap_file(v, mapped_size);
         }
         td_tl_stats.free_count++;
         return;

@@ -56,7 +56,8 @@ td_err_t td_splay_save(td_t* tbl, const char* dir, const char* sym_path) {
     td_t* schema = td_table_schema(tbl);
     if (schema) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s/.d", dir);
+        int path_len = snprintf(path, sizeof(path), "%s/.d", dir);
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) return TD_ERR_IO;
         td_err_t err = td_col_save(schema, path);
         if (err != TD_OK) return err;
     }
@@ -100,7 +101,9 @@ td_t* td_splay_load(const char* dir) {
 
     /* Load .d schema */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.d", dir);
+    int path_len = snprintf(path, sizeof(path), "%s/.d", dir);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path))
+        return TD_ERR_PTR(TD_ERR_IO);
     td_t* schema = td_col_load(path);
     if (!schema || TD_IS_ERR(schema)) return schema;
 
@@ -158,7 +161,9 @@ td_t* td_splay_open(const char* dir, const char* sym_path) {
 
     /* Load .d schema (small, use td_col_load — buddy copy is fine) */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.d", dir);
+    int path_len = snprintf(path, sizeof(path), "%s/.d", dir);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path))
+        return TD_ERR_PTR(TD_ERR_IO);
     td_t* schema = td_col_load(path);
     if (!schema || TD_IS_ERR(schema)) return schema;
 

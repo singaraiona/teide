@@ -24,6 +24,7 @@
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
 use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::sync::atomic::AtomicU32;
 
 // ===== Type Constants =====
 
@@ -326,8 +327,11 @@ pub struct td_t_sso {
 }
 
 /// The 32-byte block header. Layout must match C exactly.
+///
+/// Not `Copy`/`Clone` because the `rc` field is `AtomicU32` (matching the C
+/// `_Atomic(uint32_t)`). This is fine — Rust code only ever handles `td_t`
+/// through `*mut td_t` pointers, never by value.
 #[repr(C)]
-#[derive(Copy, Clone)]
 pub struct td_t {
     /// Bytes 0-15
     pub head: td_t_head,
@@ -339,9 +343,13 @@ pub struct td_t {
     pub type_: i8,
     /// Byte 19
     pub attrs: u8,
-    /// Bytes 20-23: reference count (C: `_Atomic(uint32_t)`).
-    /// Layout-compatible with u32 on all targets; all atomic ops go through C FFI.
-    pub rc: u32,
+    /// Bytes 20-23: reference count.
+    /// In C this is `_Atomic(uint32_t)`. We use `AtomicU32` to match the C
+    /// type exactly. `AtomicU32` is guaranteed to have the same size and
+    /// alignment as `u32` on all targets, so the struct layout is unchanged.
+    /// All atomic operations on `rc` go through the C FFI (`td_retain`,
+    /// `td_release`); Rust never manipulates this field directly.
+    pub rc: AtomicU32,
     /// Bytes 24-31
     pub val: td_t_val,
 }

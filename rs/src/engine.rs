@@ -250,6 +250,15 @@ struct EngineGuard;
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
+        // Teardown order matters and is correct:
+        // 1. td_pool_destroy() — sets the shutdown flag, signals all workers,
+        //    then calls td_thread_join() on each worker thread. This is fully
+        //    synchronous: all workers have exited (and destroyed their own
+        //    thread-local arenas) before this call returns.
+        // 2. td_sym_destroy() — tears down the global symbol table. Safe
+        //    because no worker threads are running.
+        // 3. td_arena_destroy_all() — tears down the main thread's arena.
+        //    Must come last because sym_destroy may reference arena memory.
         unsafe {
             ffi::td_pool_destroy();
             ffi::td_sym_destroy();
@@ -1236,8 +1245,8 @@ impl Graph<'_> {
         let optimized = unsafe { ffi::td_optimize(self.raw, root.raw) };
         let result = unsafe { ffi::td_execute(self.raw, optimized) };
         let result = check_ptr(result)?;
-        // Retain so Table's Drop can release it
-        unsafe { ffi::td_retain(result) };
+        // td_execute returns a freshly allocated td_t* with rc=1 (caller owns it).
+        // No td_retain needed — Table::drop will call td_release to free it.
         Ok(Table {
             raw: result,
             engine: self.engine.clone(),
@@ -1246,12 +1255,14 @@ impl Graph<'_> {
     }
 
     /// Execute a graph node and return the raw result (vector or table).
-    /// Caller is responsible for releasing the result.
+    /// Caller is responsible for releasing the result via `td_release`.
+    ///
+    /// td_execute returns with rc=1 (caller owns it), so no extra retain
+    /// is needed. The caller must call `td_release` exactly once when done.
     pub fn execute_raw(&self, root: Column) -> Result<*mut ffi::td_t> {
         let optimized = unsafe { ffi::td_optimize(self.raw, root.raw) };
         let result = unsafe { ffi::td_execute(self.raw, optimized) };
         let result = check_ptr(result)?;
-        unsafe { ffi::td_retain(result) };
         Ok(result)
     }
 

@@ -38,11 +38,13 @@
 #endif
 
 #include "csv.h"
+#include "mem/sys.h"
 #include "ops/pool.h"
 #include "ops/hash.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>  /* strtoll fallback for fast_i64 overflow */
 #include <sys/stat.h>
 #include <fcntl.h>
 #ifndef _WIN32
@@ -355,7 +357,7 @@ static csv_type_t promote_csv_type(csv_type_t cur, csv_type_t obs) {
 static const char* scan_field_quoted(const char* p, const char* buf_end,
                                      char delim,
                                      const char** out, size_t* out_len,
-                                     char* esc_buf) {
+                                     char* esc_buf, char** dyn_esc) {
     p++; /* skip opening quote */
     const char* fld_start = p;
     bool has_escape = false;
@@ -376,28 +378,35 @@ static const char* scan_field_quoted(const char* p, const char* buf_end,
     if (p < buf_end && *p == '"') p++; /* skip closing quote */
 
     if (has_escape) {
+        char* dest = esc_buf;
         if (TD_UNLIKELY(raw_len > 8192)) {
-            /* Field too large for stack buffer — use raw (quotes remain) */
-            *out = fld_start;
-            *out_len = raw_len;
-        } else {
-            size_t olen = 0;
-            for (const char* s = fld_start; s < fld_start + raw_len; s++) {
-                if (*s == '"' && s + 1 < fld_start + raw_len && *(s + 1) == '"') {
-                    esc_buf[olen++] = '"';
-                    s++;
-                } else {
-                    esc_buf[olen++] = *s;
-                }
+            /* Field too large for stack buffer — dynamically allocate */
+            dest = (char*)td_sys_alloc(raw_len);
+            if (!dest) {
+                /* OOM: fall back to raw (quotes remain) */
+                *out = fld_start;
+                *out_len = raw_len;
+                goto advance;
             }
-            *out = esc_buf;
-            *out_len = olen;
+            *dyn_esc = dest;
         }
+        size_t olen = 0;
+        for (const char* s = fld_start; s < fld_start + raw_len; s++) {
+            if (*s == '"' && s + 1 < fld_start + raw_len && *(s + 1) == '"') {
+                dest[olen++] = '"';
+                s++;
+            } else {
+                dest[olen++] = *s;
+            }
+        }
+        *out = dest;
+        *out_len = olen;
     } else {
         *out = fld_start;
         *out_len = raw_len;
     }
 
+advance:
     /* Advance past delimiter */
     if (p < buf_end && *p == delim) p++;
     /* Don't advance past newline — caller handles row boundaries */
@@ -407,7 +416,7 @@ static const char* scan_field_quoted(const char* p, const char* buf_end,
 TD_INLINE const char* scan_field(const char* p, const char* buf_end,
                                   char delim,
                                   const char** out, size_t* out_len,
-                                  char* esc_buf) {
+                                  char* esc_buf, char** dyn_esc) {
     if (TD_UNLIKELY(p >= buf_end)) {
         *out = p;
         *out_len = 0;
@@ -424,7 +433,7 @@ TD_INLINE const char* scan_field(const char* p, const char* buf_end,
         return p;
     }
 
-    return scan_field_quoted(p, buf_end, delim, out, out_len, esc_buf);
+    return scan_field_quoted(p, buf_end, delim, out, out_len, esc_buf, dyn_esc);
 }
 
 /* --------------------------------------------------------------------------
@@ -435,9 +444,23 @@ TD_INLINE int64_t fast_i64(const char* p, size_t len) {
     if (TD_UNLIKELY(len == 0)) return 0;
 
     const char* end = p + len;
+    const char* start = p;
     bool neg = false;
     if (*p == '-') { neg = true; p++; }
     else if (*p == '+') { p++; }
+
+    /* Count digit span; if >18, fall back to strtoll to avoid overflow */
+    size_t digit_len = 0;
+    for (const char* q = p; q < end && (unsigned char)(*q - '0') <= 9; q++)
+        digit_len++;
+    if (TD_UNLIKELY(digit_len > 18)) {
+        char tmp[32];
+        size_t slen = (size_t)(end - start);
+        if (slen > sizeof(tmp) - 1) slen = sizeof(tmp) - 1;
+        memcpy(tmp, start, slen);
+        tmp[slen] = '\0';
+        return strtoll(tmp, NULL, 10);
+    }
 
     uint64_t val = 0;
     while (p < end) {
@@ -795,7 +818,8 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
         for (int c = 0; c < ctx->n_cols; c++) {
             const char* fld;
             size_t flen;
-            p = scan_field(p, buf_end, ctx->delim, &fld, &flen, esc_buf);
+            char* dyn_esc = NULL;
+            p = scan_field(p, buf_end, ctx->delim, &fld, &flen, esc_buf, &dyn_esc);
 
             switch (ctx->col_types[c]) {
                 case CSV_TYPE_BOOL: {
@@ -820,13 +844,14 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     break;
                 case CSV_TYPE_STR: {
                     uint32_t lid = local_sym_intern(&my_syms[c], fld, flen);
-                    if (TD_UNLIKELY(lid == UINT32_MAX)) continue; /* skip row on OOM */
+                    if (TD_UNLIKELY(lid == UINT32_MAX)) { if (dyn_esc) td_sys_free(dyn_esc); continue; }
                     ((uint32_t*)ctx->col_data[c])[row] = PACK_SYM(worker_id, lid);
                     break;
                 }
                 default:
                     break;
             }
+            if (TD_UNLIKELY(dyn_esc != NULL)) td_sys_free(dyn_esc);
         }
     }
 }
@@ -848,7 +873,8 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
         for (int c = 0; c < n_cols; c++) {
             const char* fld;
             size_t flen;
-            p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf);
+            char* dyn_esc = NULL;
+            p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn_esc);
 
             switch (col_types[c]) {
                 case CSV_TYPE_BOOL: {
@@ -880,6 +906,7 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                 default:
                     break;
             }
+            if (TD_UNLIKELY(dyn_esc != NULL)) td_sys_free(dyn_esc);
         }
     }
 }
@@ -945,8 +972,10 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
         for (int c = 0; c < ncols; c++) {
             const char* fld;
             size_t flen;
-            p = scan_field(p, buf_end, delimiter, &fld, &flen, esc_buf);
+            char* dyn_esc = NULL;
+            p = scan_field(p, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
             col_name_ids[c] = td_sym_intern(fld, flen);
+            if (dyn_esc) td_sys_free(dyn_esc);
         }
         while (p < buf_end && (*p == '\r' || *p == '\n')) p++;
     } else {
@@ -996,8 +1025,10 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
             for (int c = 0; c < ncols; c++) {
                 const char* fld;
                 size_t flen;
-                rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf);
+                char* dyn_esc = NULL;
+                rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
                 csv_type_t t = detect_type(fld, flen);
+                if (dyn_esc) td_sys_free(dyn_esc);
                 col_types[c] = promote_csv_type(col_types[c], t);
             }
         }
@@ -1059,6 +1090,8 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
 
         if (use_parallel) {
             uint32_t n_workers = td_pool_total_workers(pool);
+            /* PACK_SYM uses upper 8 bits for worker_id (max 255) */
+            if (n_workers > 255) n_workers = 255;
 
             /* Allocate per-worker local sym tables for string columns.
              * Zero-init so workers can lazy-init on first use. */

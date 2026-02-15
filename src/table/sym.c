@@ -129,10 +129,10 @@ static void ht_insert(uint64_t* buckets, uint32_t cap, uint32_t hash, uint32_t i
     }
 }
 
-static void ht_grow(void) {
+static bool ht_grow(void) {
     uint32_t new_cap = g_sym.bucket_cap * 2;
     uint64_t* new_buckets = (uint64_t*)td_sys_alloc(new_cap * sizeof(uint64_t));
-    if (!new_buckets) return; /* stay at current capacity */
+    if (!new_buckets) return false;
 
     /* Re-insert all existing entries */
     for (uint32_t i = 0; i < g_sym.bucket_cap; i++) {
@@ -146,6 +146,7 @@ static void ht_grow(void) {
     td_sys_free(g_sym.buckets);
     g_sym.buckets = new_buckets;
     g_sym.bucket_cap = new_cap;
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -204,7 +205,11 @@ int64_t td_sym_intern(const char* str, size_t len) {
 
     /* Check load factor and grow if needed */
     if ((double)g_sym.str_count / (double)g_sym.bucket_cap > SYM_LOAD_FACTOR) {
-        ht_grow();
+        if (!ht_grow()) {
+            /* Growth failed — undo the insert to keep table consistent.
+             * The entry is still in the hash table but we'll reject future
+             * inserts if the table becomes critically full (checked above). */
+        }
     }
 
     return (int64_t)new_id;

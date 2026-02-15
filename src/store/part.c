@@ -132,12 +132,24 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     }
     all_dfs[0] = first;
 
+    int64_t fail_count = 0;
     for (int64_t p = 1; p < part_count; p++) {
         snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
         all_dfs[p] = td_splay_load(path);
         if (!all_dfs[p] || TD_IS_ERR(all_dfs[p])) {
             all_dfs[p] = NULL;
+            fail_count++;
         }
+    }
+    if (fail_count > 0) {
+        for (int64_t p = 0; p < part_count; p++) {
+            if (all_dfs[p] && !TD_IS_ERR(all_dfs[p]))
+                td_release(all_dfs[p]);
+            td_sys_free(part_dirs[p]);
+        }
+        td_sys_free(all_dfs);
+        td_sys_free(part_dirs);
+        return TD_ERR_PTR(TD_ERR_IO);
     }
 
     /* Build combined table by concatenating columns */

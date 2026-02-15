@@ -280,6 +280,21 @@ fn order_by_offset_limit() {
 }
 
 #[test]
+fn order_by_non_projected_column() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (mut session, _f) = setup_session();
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1 FROM csv ORDER BY id4 DESC, id1 ASC LIMIT 1")
+            .unwrap(),
+    );
+    assert_eq!(r.columns.len(), 1);
+    assert_eq!(r.table.ncols(), 1);
+    assert_eq!(r.table.nrows(), 1);
+    assert_eq!(r.table.get_str(0, 0).unwrap(), "id001");
+}
+
+#[test]
 fn distinct() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();

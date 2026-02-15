@@ -867,6 +867,11 @@ fn plan_query(
     };
     let select_items: &[SelectItem] = &select_items;
 
+    // ORDER/LIMIT/OFFSET metadata (used by planning decisions below and execution later).
+    let order_by_exprs = extract_order_by(query)?;
+    let offset_val = extract_offset(query)?;
+    let limit_val = extract_limit(query)?;
+
     // Stage 2: GROUP BY / aggregation / DISTINCT
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
         plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs, filter_mask)?
@@ -876,6 +881,9 @@ fn plan_query(
         plan_distinct(ctx, &working_table, &aliases, &schema)?
     } else {
         let aliases = extract_projection_aliases(select_items, &schema)?;
+        // SQL allows ORDER BY columns not present in SELECT output.
+        // Keep those as hidden columns during sorting, then trim before returning.
+        let hidden_order_cols = collect_hidden_order_columns(&order_by_exprs, &aliases, &schema);
         // Skip projection only for true identity projections (`SELECT *` or
         // selecting all base columns in table order). This prevents silently
         // returning wrong columns for reordered/missing identifiers.
@@ -883,7 +891,7 @@ fn plan_query(
         if can_passthrough {
             (working_table, aliases)
         } else {
-            plan_expr_select(ctx, &working_table, select_items, &schema)?
+            plan_expr_select(ctx, &working_table, select_items, &schema, &hidden_order_cols)?
         }
     };
 
@@ -911,11 +919,6 @@ fn plan_query(
     } else {
         result_table
     };
-
-    // Stage 3+4: ORDER BY (optionally fused with LIMIT)
-    let order_by_exprs = extract_order_by(query)?;
-    let offset_val = extract_offset(query)?;
-    let limit_val = extract_limit(query)?;
 
     let (result_table, limit_fused) = if !order_by_exprs.is_empty() {
         let table_col_names: Vec<String> = (0..result_table.ncols() as usize)
@@ -966,6 +969,9 @@ fn plan_query(
             (None, None) => result_table,
         }
     };
+
+    // Drop hidden ORDER BY helper columns (if any) before exposing SQL result.
+    let result_table = trim_to_visible_columns(ctx, result_table, &result_aliases)?;
 
     validate_result_table(&result_table)?;
     Ok(SqlResult {
@@ -1765,6 +1771,7 @@ fn plan_expr_select(
     working_table: &Table,
     select_items: &[SelectItem],
     schema: &HashMap<String, usize>,
+    hidden_order_cols: &[String],
 ) -> Result<(Table, Vec<String>), SqlError> {
     let mut g = ctx.graph(working_table)?;
     let table_node = g.const_table(working_table);
@@ -1794,6 +1801,17 @@ fn plan_expr_select(
             }
             _ => return Err(SqlError::Plan("Unsupported SELECT item".into())),
         }
+    }
+
+    // Keep non-projected ORDER BY source columns as hidden fields for sorting.
+    for name in hidden_order_cols {
+        if !schema.contains_key(name) {
+            return Err(SqlError::Plan(format!(
+                "ORDER BY column '{}' not found",
+                name
+            )));
+        }
+        proj_cols.push(g.scan(name)?);
     }
 
     let proj = g.select(table_node, &proj_cols)?;
@@ -2923,6 +2941,49 @@ fn is_identity_projection(
     projected_names == schema_names
 }
 
+/// Collect ORDER BY columns that are valid source columns but not part of the
+/// visible SELECT projection. These will be carried as hidden columns.
+fn collect_hidden_order_columns(
+    order_by: &[(OrderByItem, bool, Option<bool>)],
+    visible_aliases: &[String],
+    schema: &HashMap<String, usize>,
+) -> Vec<String> {
+    let mut extra = Vec::new();
+    for (item, _, _) in order_by {
+        let OrderByItem::Name(name) = item else {
+            continue;
+        };
+        if visible_aliases.iter().any(|a| a == name) {
+            continue;
+        }
+        if schema.contains_key(name) && !extra.iter().any(|c| c == name) {
+            extra.push(name.clone());
+        }
+    }
+    extra
+}
+
+/// Ensure the physical table column count matches visible SQL columns by
+/// projecting away any hidden helper columns.
+fn trim_to_visible_columns(
+    ctx: &Context,
+    table: Table,
+    visible_aliases: &[String],
+) -> Result<Table, SqlError> {
+    if table.ncols() as usize == visible_aliases.len() {
+        return Ok(table);
+    }
+
+    let g = ctx.graph(&table)?;
+    let table_node = g.const_table(&table);
+    let proj_cols: Vec<Column> = visible_aliases
+        .iter()
+        .map(|name| g.scan(name))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let proj = g.select(table_node, &proj_cols)?;
+    Ok(g.execute(proj)?)
+}
+
 /// An ORDER BY item: either a column name, positional index, or arbitrary expression.
 enum OrderByItem {
     Name(String),
@@ -2971,11 +3032,20 @@ fn plan_order_by(
     result_aliases: &[String],
     table_col_names: &[String],
 ) -> Result<Column, SqlError> {
-    // Build a schema from the result aliases for expression planning
+    // Build a schema for expression planning:
+    // 1) visible result aliases (take precedence), then
+    // 2) physical table column names (includes hidden ORDER BY helpers).
     let schema: HashMap<String, usize> = result_aliases
         .iter()
         .enumerate()
         .map(|(i, name)| (name.clone(), i))
+        .chain(
+            table_col_names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| !result_aliases.contains(name))
+                .map(|(i, name)| (name.clone(), i)),
+        )
         .collect();
 
     let mut sort_keys = Vec::new();
@@ -2986,12 +3056,16 @@ fn plan_order_by(
     for (item, desc, nulls_first) in order_by {
         let key = match item {
             OrderByItem::Name(name) => {
-                let idx = result_aliases.iter().position(|a| a == name).ok_or_else(|| {
-                    SqlError::Plan(format!(
-                        "ORDER BY column '{}' not found in result columns",
-                        name
-                    ))
-                })?;
+                let idx = result_aliases
+                    .iter()
+                    .position(|a| a == name)
+                    .or_else(|| table_col_names.iter().position(|c| c == name))
+                    .ok_or_else(|| {
+                        SqlError::Plan(format!(
+                            "ORDER BY column '{}' not found",
+                            name
+                        ))
+                    })?;
                 // Use actual table column name, not the SQL alias
                 g.scan(&table_col_names[idx])?
             }

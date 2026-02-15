@@ -31,6 +31,11 @@ SELECT COUNT(*) FROM (SELECT DISTINCT(id1) FROM csv)
 ----
 5
 
+query T
+SELECT id1 FROM csv ORDER BY id4 DESC, id1 ASC LIMIT 1
+----
+id001
+
 statement ok
 CREATE TABLE onecol (a INTEGER)
 

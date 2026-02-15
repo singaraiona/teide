@@ -328,6 +328,25 @@ static void td_release_owned_refs(td_t* v) {
         v->ext_nullmap && !TD_IS_ERR(v->ext_nullmap))
         td_release(v->ext_nullmap);
 
+    /* Parted column: release all segment vectors */
+    if (TD_IS_PARTED(v->type)) {
+        int64_t n_segs = v->len;
+        td_t** segs = (td_t**)td_data(v);
+        for (int64_t i = 0; i < n_segs; i++) {
+            if (segs[i] && !TD_IS_ERR(segs[i]))
+                td_release(segs[i]);
+        }
+        return;
+    }
+
+    /* MAPCOMMON: release key_values and row_counts vectors */
+    if (v->type == TD_MAPCOMMON) {
+        td_t** ptrs = (td_t**)td_data(v);
+        if (ptrs[0] && !TD_IS_ERR(ptrs[0])) td_release(ptrs[0]);
+        if (ptrs[1] && !TD_IS_ERR(ptrs[1])) td_release(ptrs[1]);
+        return;
+    }
+
     if (v->type == TD_TABLE) {
         td_t** slots = (td_t**)td_data(v);
         td_t* schema = slots[0];
@@ -368,6 +387,25 @@ static void td_retain_owned_refs(td_t* v) {
     if ((v->attrs & TD_ATTR_NULLMAP_EXT) &&
         v->ext_nullmap && !TD_IS_ERR(v->ext_nullmap))
         td_retain(v->ext_nullmap);
+
+    /* Parted column: retain all segment vectors */
+    if (TD_IS_PARTED(v->type)) {
+        int64_t n_segs = v->len;
+        td_t** segs = (td_t**)td_data(v);
+        for (int64_t i = 0; i < n_segs; i++) {
+            if (segs[i] && !TD_IS_ERR(segs[i]))
+                td_retain(segs[i]);
+        }
+        return;
+    }
+
+    /* MAPCOMMON: retain key_values and row_counts vectors */
+    if (v->type == TD_MAPCOMMON) {
+        td_t** ptrs = (td_t**)td_data(v);
+        if (ptrs[0] && !TD_IS_ERR(ptrs[0])) td_retain(ptrs[0]);
+        if (ptrs[1] && !TD_IS_ERR(ptrs[1])) td_retain(ptrs[1]);
+        return;
+    }
 
     if (v->type == TD_TABLE) {
         td_t** slots = (td_t**)td_data(v);
@@ -507,6 +545,10 @@ td_t* td_alloc_copy(td_t* v) {
         data_size = 0;
     } else if (v->type == TD_TABLE) {
         data_size = (size_t)(td_len(v) + 1) * sizeof(td_t*);
+    } else if (TD_IS_PARTED(v->type) || v->type == TD_MAPCOMMON) {
+        int64_t n_ptrs = v->len;
+        if (v->type == TD_MAPCOMMON) n_ptrs = 2;
+        data_size = (size_t)n_ptrs * sizeof(td_t*);
     } else {
         int8_t t = td_type(v);
         if (t <= 0 || t >= TD_TYPE_COUNT)
@@ -545,7 +587,11 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
             old_data = (size_t)td_len(v) * sizeof(td_t*);
         else if (v->type == TD_TABLE)
             old_data = (size_t)(td_len(v) + 1) * sizeof(td_t*);
-        else {
+        else if (TD_IS_PARTED(v->type) || v->type == TD_MAPCOMMON) {
+            int64_t n_ptrs = v->len;
+            if (v->type == TD_MAPCOMMON) n_ptrs = 2;
+            old_data = (size_t)n_ptrs * sizeof(td_t*);
+        } else {
             int8_t t = td_type(v);
             old_data = (t > 0 && t < TD_TYPE_COUNT) ?
                        (size_t)td_len(v) * td_elem_size(t) : 0;

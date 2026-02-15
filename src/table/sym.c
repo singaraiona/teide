@@ -246,3 +246,119 @@ uint32_t td_sym_count(void) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return 0;
     return g_sym.str_count;
 }
+
+/* --------------------------------------------------------------------------
+ * td_sym_save — serialize symbol table to a binary file
+ *
+ * Format:
+ *   [4B magic "TSYM"][4B count]
+ *   For each symbol: [4B len][len bytes data]
+ * -------------------------------------------------------------------------- */
+
+#include <stdio.h>
+
+td_err_t td_sym_save(const char* path) {
+    if (!path) return TD_ERR_IO;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return TD_ERR_IO;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return TD_ERR_IO;
+
+    uint32_t magic = 0x4D595354;  /* "TSYM" little-endian */
+    uint32_t count = g_sym.str_count;
+
+    if (fwrite(&magic, 4, 1, f) != 1 ||
+        fwrite(&count, 4, 1, f) != 1) {
+        fclose(f);
+        return TD_ERR_IO;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        td_t* s = g_sym.strings[i];
+        uint32_t len = (uint32_t)td_str_len(s);
+        const char* data = td_str_ptr(s);
+
+        if (fwrite(&len, 4, 1, f) != 1 ||
+            (len > 0 && fwrite(data, 1, len, f) != len)) {
+            fclose(f);
+            return TD_ERR_IO;
+        }
+    }
+
+    fclose(f);
+    return TD_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * td_sym_load — deserialize symbol table from a binary file
+ *
+ * Interns all symbols from the file into the global symbol table.
+ * Must be called after td_sym_init(). Existing symbols are preserved
+ * (td_sym_intern is idempotent for matching strings).
+ * -------------------------------------------------------------------------- */
+
+td_err_t td_sym_load(const char* path) {
+    if (!path) return TD_ERR_IO;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return TD_ERR_IO;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return TD_ERR_IO;
+
+    uint32_t magic, count;
+    if (fread(&magic, 4, 1, f) != 1 ||
+        fread(&count, 4, 1, f) != 1) {
+        fclose(f);
+        return TD_ERR_CORRUPT;
+    }
+
+    if (magic != 0x4D595354) {
+        fclose(f);
+        return TD_ERR_CORRUPT;
+    }
+
+    /* Read buffer — reuse for all strings */
+    char buf[4096];
+    char* heap_buf = NULL;
+    size_t heap_cap = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t len;
+        if (fread(&len, 4, 1, f) != 1) {
+            if (heap_buf) td_sys_free(heap_buf);
+            fclose(f);
+            return TD_ERR_CORRUPT;
+        }
+
+        char* dst = buf;
+        if (len > sizeof(buf)) {
+            if (len > heap_cap) {
+                char* nb = (char*)td_sys_realloc(heap_buf, len);
+                if (!nb) {
+                    if (heap_buf) td_sys_free(heap_buf);
+                    fclose(f);
+                    return TD_ERR_OOM;
+                }
+                heap_buf = nb;
+                heap_cap = len;
+            }
+            dst = heap_buf;
+        }
+
+        if (len > 0 && fread(dst, 1, len, f) != len) {
+            if (heap_buf) td_sys_free(heap_buf);
+            fclose(f);
+            return TD_ERR_CORRUPT;
+        }
+
+        int64_t id = td_sym_intern(dst, len);
+        if (id < 0) {
+            if (heap_buf) td_sys_free(heap_buf);
+            fclose(f);
+            return TD_ERR_OOM;
+        }
+    }
+
+    if (heap_buf) td_sys_free(heap_buf);
+    fclose(f);
+    return TD_OK;
+}

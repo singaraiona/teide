@@ -177,3 +177,202 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
     return result;
 }
+
+/* --------------------------------------------------------------------------
+ * td_part_open — zero-copy open of a partitioned table
+ *
+ * Builds parted columns (TD_PARTED_BASE + base_type) where each segment
+ * is an mmap'd vector from td_splay_open. Also builds a MAPCOMMON column
+ * with partition key names and row counts.
+ * -------------------------------------------------------------------------- */
+
+td_t* td_part_open(const char* db_root, const char* table_name) {
+    if (!db_root || !table_name) return TD_ERR_PTR(TD_ERR_IO);
+
+    /* Validate table_name: no path separators or traversal */
+    if (strchr(table_name, '/') || strchr(table_name, '\\') ||
+        strstr(table_name, "..") || table_name[0] == '.')
+        return TD_ERR_PTR(TD_ERR_IO);
+
+    /* Build sym_path */
+    char sym_path[1024];
+    snprintf(sym_path, sizeof(sym_path), "%s/sym", db_root);
+
+    /* Load global symfile */
+    td_err_t sym_err = td_sym_load(sym_path);
+    if (sym_err != TD_OK) return TD_ERR_PTR(sym_err);
+
+    /* Scan db_root for partition directories */
+    DIR* d = opendir(db_root);
+    if (!d) return TD_ERR_PTR(TD_ERR_IO);
+
+    char** part_dirs = NULL;
+    int64_t part_count = 0;
+    int64_t part_cap = 0;
+
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (strcmp(ent->d_name, "sym") == 0) continue;
+
+        /* Validate: digits and dots only */
+        bool valid = false;
+        for (const char* c = ent->d_name; *c; c++) {
+            if (*c == '.') { valid = true; continue; }
+            if (*c >= '0' && *c <= '9') continue;
+            valid = false; break;
+        }
+        if (!valid) continue;
+
+        if (part_count >= part_cap) {
+            part_cap = part_cap == 0 ? 16 : part_cap * 2;
+            char** tmp = (char**)td_sys_realloc(part_dirs, (size_t)part_cap * sizeof(char*));
+            if (!tmp) break;
+            part_dirs = tmp;
+        }
+        char* dup = td_sys_strdup(ent->d_name);
+        if (!dup) break;
+        part_dirs[part_count++] = dup;
+    }
+    closedir(d);
+
+    if (part_count == 0) {
+        td_sys_free(part_dirs);
+        return TD_ERR_PTR(TD_ERR_IO);
+    }
+
+    /* Sort partition names for deterministic order */
+    for (int64_t i = 0; i < part_count - 1; i++) {
+        for (int64_t j = i + 1; j < part_count; j++) {
+            if (strcmp(part_dirs[i], part_dirs[j]) > 0) {
+                char* tmp = part_dirs[i];
+                part_dirs[i] = part_dirs[j];
+                part_dirs[j] = tmp;
+            }
+        }
+    }
+
+    /* Open each partition via td_splay_open */
+    td_t** part_tables = (td_t**)td_sys_alloc((size_t)part_count * sizeof(td_t*));
+    if (!part_tables) goto fail_dirs;
+
+    char path[1024];
+    for (int64_t p = 0; p < part_count; p++) {
+        snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
+        part_tables[p] = td_splay_open(path, sym_path);
+        if (!part_tables[p] || TD_IS_ERR(part_tables[p])) {
+            part_tables[p] = NULL;
+            goto fail_tables;
+        }
+    }
+
+    /* Get schema from first partition */
+    int64_t ncols = td_table_ncols(part_tables[0]);
+    if (ncols <= 0) goto fail_tables;
+
+    /* Build result table: ncols data columns + 1 MAPCOMMON */
+    td_t* result = td_table_new(ncols + 2);
+    if (!result || TD_IS_ERR(result)) goto fail_tables;
+
+    /* For each column: build a parted wrapper */
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t name_id = td_table_col_name(part_tables[0], c);
+        td_t* first_seg = td_table_get_col_idx(part_tables[0], c);
+        if (!first_seg) continue;
+
+        /* Allocate parted wrapper via buddy */
+        td_t* parted = td_alloc((size_t)part_count * sizeof(td_t*));
+        if (!parted || TD_IS_ERR(parted)) {
+            td_release(result);
+            goto fail_tables;
+        }
+        parted->type = TD_PARTED_BASE + first_seg->type;
+        parted->len = part_count;
+        parted->attrs = 0;
+        memset(parted->nullmap, 0, 16);
+
+        td_t** segs = (td_t**)td_data(parted);
+        for (int64_t p = 0; p < part_count; p++) {
+            td_t* seg = td_table_get_col_idx(part_tables[p], c);
+            if (!seg) {
+                /* Fill with NULL on schema mismatch — shouldn't happen */
+                segs[p] = NULL;
+                continue;
+            }
+            td_retain(seg);
+            segs[p] = seg;
+        }
+
+        result = td_table_add_col(result, name_id, parted);
+        td_release(parted); /* table_add_col retains it */
+    }
+
+    /* Build MAPCOMMON column: [key_values (SYM), row_counts (I64)] */
+    td_t* key_values = td_vec_new(TD_SYM, part_count);
+    td_t* row_counts = td_vec_new(TD_I64, part_count);
+    if (!key_values || TD_IS_ERR(key_values) ||
+        !row_counts || TD_IS_ERR(row_counts)) {
+        if (key_values && !TD_IS_ERR(key_values)) td_release(key_values);
+        if (row_counts && !TD_IS_ERR(row_counts)) td_release(row_counts);
+        td_release(result);
+        goto fail_tables;
+    }
+
+    int64_t* kv_data = (int64_t*)td_data(key_values);
+    int64_t* rc_data = (int64_t*)td_data(row_counts);
+    for (int64_t p = 0; p < part_count; p++) {
+        kv_data[p] = td_sym_intern(part_dirs[p], strlen(part_dirs[p]));
+        rc_data[p] = td_table_nrows(part_tables[p]);
+    }
+    key_values->len = part_count;
+    row_counts->len = part_count;
+
+    /* Allocate MAPCOMMON wrapper: 2 pointers */
+    td_t* mapcommon = td_alloc(2 * sizeof(td_t*));
+    if (!mapcommon || TD_IS_ERR(mapcommon)) {
+        td_release(key_values);
+        td_release(row_counts);
+        td_release(result);
+        goto fail_tables;
+    }
+    mapcommon->type = TD_MAPCOMMON;
+    mapcommon->len = 2;
+    mapcommon->attrs = 0;
+    memset(mapcommon->nullmap, 0, 16);
+
+    td_t** mc_ptrs = (td_t**)td_data(mapcommon);
+    mc_ptrs[0] = key_values;  td_retain(key_values);
+    mc_ptrs[1] = row_counts;  td_retain(row_counts);
+
+    int64_t part_name_id = td_sym_intern("__part", 6);
+    result = td_table_add_col(result, part_name_id, mapcommon);
+
+    /* Release our local refs */
+    td_release(mapcommon);
+    td_release(key_values);
+    td_release(row_counts);
+
+    /* Release partition sub-tables (segment vectors survive via retain) */
+    for (int64_t p = 0; p < part_count; p++) {
+        if (part_tables[p]) td_release(part_tables[p]);
+        td_sys_free(part_dirs[p]);
+    }
+    td_sys_free(part_tables);
+    td_sys_free(part_dirs);
+
+    return result;
+
+fail_tables:
+    for (int64_t p = 0; p < part_count; p++) {
+        if (part_tables[p] && !TD_IS_ERR(part_tables[p]))
+            td_release(part_tables[p]);
+    }
+    td_sys_free(part_tables);
+
+fail_dirs:
+    for (int64_t p = 0; p < part_count; p++)
+        td_sys_free(part_dirs[p]);
+    td_sys_free(part_dirs);
+
+    return TD_ERR_PTR(TD_ERR_IO);
+}

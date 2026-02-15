@@ -302,60 +302,168 @@ td_execute       -> planner decides path
 td_release       -> free result (normal buddy free)
 ```
 
-## 10. Implementation Phases
+## 10. Parted Types & Partition-Aware Execution
+
+### Type Encoding
+
+Parted types use a composite offset in the `int8_t type` field, following the rayforce pattern:
+
+```c
+#define TD_PARTED_BASE  32
+// TD_PARTED_BASE + base_type:
+//   TD_PARTED_BOOL = 33, TD_PARTED_I32 = 37, TD_PARTED_I64 = 38,
+//   TD_PARTED_F64 = 39, TD_PARTED_ENUM = 47, ...
+#define TD_MAPCOMMON    48   // virtual partition column
+
+#define TD_IS_PARTED(t)       ((t) >= TD_PARTED_BASE && (t) < TD_MAPCOMMON)
+#define TD_PARTED_BASETYPE(t) ((t) - TD_PARTED_BASE)
+```
+
+Base types 0-15 map to parted types 32-47. `TD_MAPCOMMON (48)` is the virtual partition column. All fit within `int8_t` range.
+
+### Parted Column Layout
+
+A parted column is a `td_t` where:
+- `type = TD_PARTED_BASE + base_type` (e.g., 38 for parted I64)
+- `len = number of partitions` (NOT total rows)
+- Data at byte 32: `td_t*[]` — array of segment vectors, one per partition
+
+Each segment vector is a regular mmap'd `td_t*` (mmod=1) with the base type. The parted column retains all segment vectors.
+
+```
+td_t (parted I64):
+  type=38, len=5
+  byte 32: [seg0_ptr, seg1_ptr, seg2_ptr, seg3_ptr, seg4_ptr]
+            ↓          ↓
+         td_t*       td_t*
+         type=6      type=6
+         len=2M      len=2M
+         mmod=1      mmod=1
+         (mmap'd)    (mmap'd)
+```
+
+Total row count: sum of all segment lengths. Computed lazily by iterating segments.
+
+### Virtual Partition Column (TD_MAPCOMMON)
+
+The partition key column (e.g., date) is NOT stored on disk — every row in a partition has the same value. Instead:
+
+- `type = TD_MAPCOMMON`
+- `len = 2` (always a 2-element list)
+- Data at byte 32: `[td_t* key_values, td_t* row_counts]`
+  - `key_values`: vector of partition key values (one per partition, e.g., DATE vector)
+  - `row_counts`: I64 vector of per-partition row counts
+
+Zero storage per row. Partition key values reconstructed on demand.
+
+### Executor Dispatch (Approach B: Outer Loop)
+
+**Critical design decision**: parted awareness lives at the **outer dispatch level** only. Inner loops (DA accumulation, radix HT, radix sort, batch-column gather) never see parted types — they receive regular `td_t*` vectors with the base type.
+
+This preserves the tuned inner loops: no branches per element, no segment-boundary checks, prefetching works unchanged.
+
+**Group-by on data columns**:
+```
+for each partition p:
+    run existing 3-phase group-by on partition p's columns
+    → partial aggregation result (groups + accumulators)
+merge partial results:
+    SUM/COUNT: add
+    MIN: min of partials
+    MAX: max of partials
+    AVG: (sum_of_sums / sum_of_counts)
+```
+
+**Group-by on partition key (TD_MAPCOMMON)**: partitions ARE groups. Skip hashing entirely. Run aggregation functions directly on each partition's value columns. One result row per partition, zero hash overhead.
+
+**Sort**: run radix sort per partition → merge sorted runs (k-way merge). Same structure as external merge sort but segments are mmap'd not spilled.
+
+**Join**: executor processes left-side partitions independently against the right-side HT. Or co-partition if both sides are parted on the same key.
+
+**Filter on partition key**: evaluate predicate against MAPCOMMON key values → skip entire partitions that don't match. No per-row scan.
+
+### td_part_open
+
+`td_part_open` replaces the old `td_part_load` (which concatenated into buddy memory). It builds a table with parted columns:
+
+```c
+td_t* td_part_open(const char* db_root, const char* table_name);
+```
+
+1. Load symfile from `db_root/sym`
+2. Discover partition directories (YYYY.MM.DD format), sorted
+3. Open each partition via `td_splay_open` (mmap, zero-copy)
+4. For each column across all partitions: build `TD_PARTED_*` wrapper holding segment pointers
+5. Build `TD_MAPCOMMON` virtual column from partition directory names + row counts
+6. Return table with parted columns + virtual partition column
+
+Result: the table is "open" but no data has been read. The OS pages in column data on demand during query execution.
+
+## 11. Implementation Phases
 
 Each phase ships a testable, benchmarkable unit. No phase depends on a later phase.
 
-### Phase 1: mmap'd Column Vectors
+### Phase 1: mmap'd Column Vectors ✅
 
-- Add `mmod=2` (direct-mmap) to `td_t` header
-- Implement `td_col_mmap(path)` — zero-copy mmod=2 vector
-- `td_release` dispatch: mmod=0 → buddy free, mmod=2 → munmap
-- COW guard: mutation on mmod=2 triggers buddy copy
+- `mmod=1` (file-mmap) in `td_t` header
+- `td_col_mmap(path)` — zero-copy mmod=1 vector
+- `td_release` dispatch: mmod=0 → buddy free, mmod=1 → munmap
+- COW guard: mutation on mmod=1 triggers buddy copy
 - `td_splay_open(path, sym_path)` — uses `td_col_mmap` per column
 - `td_splay_save(table, path, sym_path)` — respects external sympath
+- `td_sym_save(path)` / `td_sym_load(path)` — binary symfile serialization
 
-**Verify**: load 10M-row groupby CSV as splayed table, `td_splay_open`, run all 7 groupby queries. Identical results. RSS near-zero until columns touched.
+**Verified**: 5-partition 10M-row dataset generated, `td_splay_open` zero-copy, all 7 groupby queries pass per partition. Open time: 0.3ms for 5 partitions (45 column files).
 
-### Phase 2: Partition Metadata & Pruning
+### Phase 2: Parted Types & td_part_open
+
+- Type constants: `TD_PARTED_BASE (32)`, `TD_MAPCOMMON (48)`, helper macros
+- `td_parted_nrows(v)` — sum segment lengths for total row count
+- `td_part_open(db_root, table_name)` — zero-copy parted table:
+  1. Load symfile via `td_sym_load`
+  2. Discover + sort partition dirs
+  3. `td_splay_open` per partition (mmap)
+  4. Build `TD_PARTED_*` columns wrapping segment vectors
+  5. Build `TD_MAPCOMMON` virtual partition column
+- `td_table_nrows` updated to handle parted columns
+- `td_release` updated to release segment vectors for parted types
+
+**Verify**: `td_part_open` on 5-partition dataset, verify nrows=10M, verify segment vectors are mmod=1, verify release frees all mmaps.
+
+### Phase 3: Partition-Aware Group-By
+
+- `exec_group` outer dispatch: detect parted input columns
+- **MAPCOMMON key path**: partitions ARE groups, skip hashing, aggregate per partition directly
+- **Data column key path**: run existing 3-phase group-by per partition, merge partial results
+  - SUM/COUNT: add partials
+  - MIN/MAX: min/max of partials
+  - AVG: sum_of_sums / sum_of_counts
+- Result: regular in-memory table (non-parted)
+
+**Verify**: all 7 groupby queries on parted table, compare results with in-memory CSV path. Timing should match per-partition sum (no concat overhead).
+
+### Phase 4: Partition-Aware Sort & Join
+
+- `exec_sort` on parted table: radix sort per partition → k-way merge of sorted runs
+- `exec_join` on parted table: process left partitions against right-side HT
+- Filter on MAPCOMMON: skip non-matching partitions entirely
+
+**Verify**: sort and join queries on parted table match in-memory results.
+
+### Phase 5: Partition Metadata & Pruning
 
 - `td_part_meta_t` with per-partition per-column min/max/count
 - `.meta` sidecar file: write on first scan, cache on subsequent opens
-- `td_part_open(db_root, table_name)` — loads symfile, builds metadata
 - `pass_partition_prune` optimizer pass
-- Planner decision: estimate working set, choose in-memory vs external
+- Planner decision: estimate working set, choose execution strategy
 
-**Verify**: 12-partition dataset, filter to 2, confirm only 2 partitions mmap'd.
+**Verify**: 12-partition dataset, filter to 2, confirm only 2 partitions touched.
 
-### Phase 3: Temp File Infrastructure
+### Phase 6: Temp File Infrastructure & External Algorithms
 
 - `td_spill_t` manager: mkdtemp, create/mmap temp files, cleanup
-- `td_spill_write` / `td_spill_free`
-- Memory budget tracking
+- External merge sort for sort queries exceeding memory budget
+- Grace hash for group-by exceeding memory budget
+- Grace hash join for join queries exceeding memory budget
 
-**Verify**: spill + read back 1M-row vector. Spill 100 vectors, verify cleanup.
-
-### Phase 4: External Merge Sort
-
-- Sorted run generation with existing `radix_sort_run`
-- K-way merge with min-heap
-- ENUM rank via loaded symfile
-- Multi-key composite sort keys
-
-**Verify**: sort 10M rows with budget=1MB. Match in-memory result exactly.
-
-### Phase 5: External Group-By
-
-- Extend 256-partition scatter with spill threshold
-- Per-partition aggregation on spilled data
-- Recursive re-partitioning for oversized partitions
-
-**Verify**: all 7 groupby queries with budget=1MB. Match in-memory exactly.
-
-### Phase 6: External Join
-
-- Co-partition both sides by join key hash
-- Per-partition in-memory join (existing HT build + probe)
-- Left-join unmatched row tracking
-
-**Verify**: j1 (inner) and j2 (left) with budget=1MB. Match in-memory exactly.
+**Verify**: sort/group/join with budget=1MB, match in-memory results exactly.

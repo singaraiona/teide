@@ -191,7 +191,39 @@ int64_t td_table_nrows(td_t* tbl) {
     td_t* first_col = cols[0];
     if (!first_col || TD_IS_ERR(first_col)) return 0;
 
+    if (TD_IS_PARTED(first_col->type) || first_col->type == TD_MAPCOMMON)
+        return td_parted_nrows(first_col);
+
     return first_col->len;
+}
+
+/* --------------------------------------------------------------------------
+ * td_parted_nrows
+ * -------------------------------------------------------------------------- */
+
+int64_t td_parted_nrows(td_t* v) {
+    if (!v || TD_IS_ERR(v)) return 0;
+    if (!TD_IS_PARTED(v->type) && v->type != TD_MAPCOMMON) return v->len;
+
+    if (v->type == TD_MAPCOMMON) {
+        td_t** ptrs = (td_t**)td_data(v);
+        td_t* counts = ptrs[1];
+        if (!counts || TD_IS_ERR(counts)) return 0;
+        int64_t total = 0;
+        int64_t* cdata = (int64_t*)td_data(counts);
+        for (int64_t i = 0; i < counts->len; i++)
+            total += cdata[i];
+        return total;
+    }
+
+    int64_t n_segs = v->len;
+    td_t** segs = (td_t**)td_data(v);
+    int64_t total = 0;
+    for (int64_t i = 0; i < n_segs; i++) {
+        if (segs[i] && !TD_IS_ERR(segs[i]))
+            total += segs[i]->len;
+    }
+    return total;
 }
 
 /* --------------------------------------------------------------------------

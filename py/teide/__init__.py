@@ -299,6 +299,13 @@ class TeideLib:
                                             ctypes.POINTER(ctypes.c_int8), ctypes.c_int32]
         lib.td_csv_read_opts.restype = c_td_p
 
+        # ===== Symbol serialization =====
+        lib.td_sym_save.argtypes = [ctypes.c_char_p]
+        lib.td_sym_save.restype = ctypes.c_int32  # td_err_t
+
+        lib.td_sym_load.argtypes = [ctypes.c_char_p]
+        lib.td_sym_load.restype = ctypes.c_int32  # td_err_t
+
         # ===== Storage (splay / partitioned) =====
         lib.td_splay_save.argtypes = [c_td_p, ctypes.c_char_p, ctypes.c_char_p]
         lib.td_splay_save.restype = ctypes.c_int32  # td_err_t
@@ -306,8 +313,14 @@ class TeideLib:
         lib.td_splay_load.argtypes = [ctypes.c_char_p]
         lib.td_splay_load.restype = c_td_p
 
+        lib.td_splay_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.td_splay_open.restype = c_td_p
+
         lib.td_part_load.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
         lib.td_part_load.restype = c_td_p
+
+        lib.td_part_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.td_part_open.restype = c_td_p
 
     # ===== Convenience methods =====
 
@@ -464,6 +477,12 @@ class TeideLib:
     def table_add_col(self, tbl, name_id, col):
         return self._lib.td_table_add_col(tbl, name_id, col)
 
+    def sym_save(self, path):
+        return self._lib.td_sym_save(path.encode('utf-8'))
+
+    def sym_load(self, path):
+        return self._lib.td_sym_load(path.encode('utf-8'))
+
     def splay_save(self, tbl, path, sym_path=None):
         sp = sym_path.encode('utf-8') if sym_path else None
         return self._lib.td_splay_save(tbl, path.encode('utf-8'), sp)
@@ -471,8 +490,16 @@ class TeideLib:
     def splay_load(self, path):
         return self._lib.td_splay_load(path.encode('utf-8'))
 
+    def splay_open(self, path, sym_path=None):
+        sp = sym_path.encode('utf-8') if sym_path else None
+        return self._lib.td_splay_open(path.encode('utf-8'), sp)
+
     def part_load(self, db_root, table_name):
         return self._lib.td_part_load(db_root.encode('utf-8'),
+                                       table_name.encode('utf-8'))
+
+    def part_open(self, db_root, table_name):
+        return self._lib.td_part_open(db_root.encode('utf-8'),
                                        table_name.encode('utf-8'))
 
 

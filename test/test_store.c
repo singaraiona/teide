@@ -308,6 +308,238 @@ static MunitResult test_splay_open_roundtrip(const void* params, void* fixture) 
     return MUNIT_OK;
 }
 
+/* ---- test_parted_nrows ------------------------------------------------- */
+
+static MunitResult test_parted_nrows(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build 3 segment vectors: 100, 200, 300 rows */
+    td_t* seg0 = td_vec_new(TD_I64, 100);
+    td_t* seg1 = td_vec_new(TD_I64, 200);
+    td_t* seg2 = td_vec_new(TD_I64, 300);
+    munit_assert_false(TD_IS_ERR(seg0));
+    munit_assert_false(TD_IS_ERR(seg1));
+    munit_assert_false(TD_IS_ERR(seg2));
+    seg0->len = 100;
+    seg1->len = 200;
+    seg2->len = 300;
+
+    /* Build a parted column: type = TD_PARTED_BASE + TD_I64, len = 3 segments */
+    size_t data_size = 3 * sizeof(td_t*);
+    td_t* parted = td_alloc(data_size);
+    munit_assert_ptr_not_null(parted);
+    munit_assert_false(TD_IS_ERR(parted));
+    parted->type = TD_PARTED_BASE + TD_I64;
+    parted->len = 3;
+    parted->attrs = 0;
+    memset(parted->nullmap, 0, 16);
+
+    td_t** segs = (td_t**)td_data(parted);
+    segs[0] = seg0; td_retain(seg0);
+    segs[1] = seg1; td_retain(seg1);
+    segs[2] = seg2; td_retain(seg2);
+
+    /* Verify td_parted_nrows returns 600 */
+    int64_t total = td_parted_nrows(parted);
+    munit_assert_int(total, ==, 600);
+
+    /* Non-parted vector falls through to v->len */
+    munit_assert_int(td_parted_nrows(seg0), ==, 100);
+
+    td_release(parted);
+    td_release(seg0);
+    td_release(seg1);
+    td_release(seg2);
+    return MUNIT_OK;
+}
+
+/* ---- test_table_nrows_parted ------------------------------------------- */
+
+static MunitResult test_table_nrows_parted(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build 2 segment vectors: 50 and 75 rows */
+    td_t* seg0 = td_vec_new(TD_I64, 50);
+    td_t* seg1 = td_vec_new(TD_I64, 75);
+    munit_assert_false(TD_IS_ERR(seg0));
+    munit_assert_false(TD_IS_ERR(seg1));
+    seg0->len = 50;
+    seg1->len = 75;
+
+    /* Build a parted column */
+    size_t data_size = 2 * sizeof(td_t*);
+    td_t* parted = td_alloc(data_size);
+    munit_assert_false(TD_IS_ERR(parted));
+    parted->type = TD_PARTED_BASE + TD_I64;
+    parted->len = 2;
+    parted->attrs = 0;
+    memset(parted->nullmap, 0, 16);
+
+    td_t** segs = (td_t**)td_data(parted);
+    segs[0] = seg0; td_retain(seg0);
+    segs[1] = seg1; td_retain(seg1);
+
+    /* Build a table with this parted column */
+    int64_t name_id = td_sym_intern("pcol", 4);
+    td_t* tbl = td_table_new(2);
+    munit_assert_false(TD_IS_ERR(tbl));
+    tbl = td_table_add_col(tbl, name_id, parted);
+    munit_assert_false(TD_IS_ERR(tbl));
+
+    /* Verify td_table_nrows returns 125 */
+    munit_assert_int(td_table_nrows(tbl), ==, 125);
+
+    td_release(tbl);
+    td_release(parted);
+    td_release(seg0);
+    td_release(seg1);
+    return MUNIT_OK;
+}
+
+/* ---- test_parted_release ----------------------------------------------- */
+
+static MunitResult test_parted_release(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build 2 segment vectors */
+    td_t* seg0 = td_vec_new(TD_I64, 10);
+    td_t* seg1 = td_vec_new(TD_I64, 20);
+    munit_assert_false(TD_IS_ERR(seg0));
+    munit_assert_false(TD_IS_ERR(seg1));
+    seg0->len = 10;
+    seg1->len = 20;
+
+    /* Build a parted column */
+    size_t data_size = 2 * sizeof(td_t*);
+    td_t* parted = td_alloc(data_size);
+    munit_assert_false(TD_IS_ERR(parted));
+    parted->type = TD_PARTED_BASE + TD_I64;
+    parted->len = 2;
+    parted->attrs = 0;
+    memset(parted->nullmap, 0, 16);
+
+    td_t** segs = (td_t**)td_data(parted);
+    segs[0] = seg0; td_retain(seg0);
+    segs[1] = seg1; td_retain(seg1);
+
+    /* Segments should have rc=2 (original + parted ref) */
+    munit_assert_uint(atomic_load_explicit(&seg0->rc, memory_order_relaxed), ==, 2);
+    munit_assert_uint(atomic_load_explicit(&seg1->rc, memory_order_relaxed), ==, 2);
+
+    /* Release parted column — segments' rc should drop to 1 */
+    td_release(parted);
+    munit_assert_uint(atomic_load_explicit(&seg0->rc, memory_order_relaxed), ==, 1);
+    munit_assert_uint(atomic_load_explicit(&seg1->rc, memory_order_relaxed), ==, 1);
+
+    td_release(seg0);
+    td_release(seg1);
+    return MUNIT_OK;
+}
+
+/* ---- test_part_open ---------------------------------------------------- */
+
+#define TMP_PART_DB "/tmp/teide_test_parted_db"
+#define TMP_TABLE_NAME "test_tbl"
+
+static MunitResult test_part_open(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Setup: create a 2-partition db with 2 columns each */
+    (void)!system("rm -rf " TMP_PART_DB);
+    (void)!system("mkdir -p " TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME);
+    (void)!system("mkdir -p " TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME);
+
+    /* Partition 1: 3 rows */
+    int64_t raw_a1[] = {10, 20, 30};
+    double  raw_b1[] = {1.1, 2.2, 3.3};
+    td_t* a1 = td_vec_from_raw(TD_I64, raw_a1, 3);
+    td_t* b1 = td_vec_from_raw(TD_F64, raw_b1, 3);
+
+    td_t* tbl1 = td_table_new(3);
+    int64_t name_a = td_sym_intern("a", 1);
+    int64_t name_b = td_sym_intern("b", 1);
+    tbl1 = td_table_add_col(tbl1, name_a, a1);
+    tbl1 = td_table_add_col(tbl1, name_b, b1);
+    td_err_t err = td_splay_save(tbl1, TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME, NULL);
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Partition 2: 5 rows */
+    int64_t raw_a2[] = {40, 50, 60, 70, 80};
+    double  raw_b2[] = {4.4, 5.5, 6.6, 7.7, 8.8};
+    td_t* a2 = td_vec_from_raw(TD_I64, raw_a2, 5);
+    td_t* b2 = td_vec_from_raw(TD_F64, raw_b2, 5);
+
+    td_t* tbl2 = td_table_new(3);
+    tbl2 = td_table_add_col(tbl2, name_a, a2);
+    tbl2 = td_table_add_col(tbl2, name_b, b2);
+    err = td_splay_save(tbl2, TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME, NULL);
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Save symfile */
+    err = td_sym_save(TMP_PART_DB "/sym");
+    munit_assert_int(err, ==, TD_OK);
+
+    /* Cleanup in-memory tables */
+    td_release(a1); td_release(b1); td_release(tbl1);
+    td_release(a2); td_release(b2); td_release(tbl2);
+
+    /* Open via td_part_open */
+    td_t* parted = td_part_open(TMP_PART_DB, TMP_TABLE_NAME);
+    munit_assert_ptr_not_null(parted);
+    munit_assert_false(TD_IS_ERR(parted));
+
+    /* Should have 3 columns: a (parted I64), b (parted F64), __part (MAPCOMMON) */
+    int64_t ncols = td_table_ncols(parted);
+    munit_assert_int(ncols, ==, 3);
+
+    /* Total rows should be 8 */
+    int64_t nrows = td_table_nrows(parted);
+    munit_assert_int(nrows, ==, 8);
+
+    /* Verify first column is parted I64 */
+    td_t* col_a = td_table_get_col_idx(parted, 0);
+    munit_assert_ptr_not_null(col_a);
+    munit_assert_true(TD_IS_PARTED(col_a->type));
+    munit_assert_int(TD_PARTED_BASETYPE(col_a->type), ==, TD_I64);
+    munit_assert_int(col_a->len, ==, 2);
+
+    /* Verify segment 0 has 3 rows, mmod=1 (mmap'd) */
+    td_t** segs_a = (td_t**)td_data(col_a);
+    munit_assert_int(segs_a[0]->len, ==, 3);
+    munit_assert_uint(segs_a[0]->mmod, ==, 1);
+    munit_assert_int(segs_a[1]->len, ==, 5);
+    munit_assert_uint(segs_a[1]->mmod, ==, 1);
+
+    /* Verify data in segment 0 */
+    int64_t* data_a0 = (int64_t*)td_data(segs_a[0]);
+    munit_assert_int(data_a0[0], ==, 10);
+    munit_assert_int(data_a0[2], ==, 30);
+
+    /* Verify second column is parted F64 */
+    td_t* col_b = td_table_get_col_idx(parted, 1);
+    munit_assert_true(TD_IS_PARTED(col_b->type));
+    munit_assert_int(TD_PARTED_BASETYPE(col_b->type), ==, TD_F64);
+
+    /* Verify MAPCOMMON column (last column) */
+    td_t* mapcommon = td_table_get_col_idx(parted, ncols - 1);
+    munit_assert_ptr_not_null(mapcommon);
+    munit_assert_int(mapcommon->type, ==, TD_MAPCOMMON);
+
+    /* MAPCOMMON: [key_values, row_counts] */
+    td_t** mc_ptrs = (td_t**)td_data(mapcommon);
+    td_t* row_counts = mc_ptrs[1];
+    munit_assert_int(row_counts->len, ==, 2);
+    int64_t* rc_data = (int64_t*)td_data(row_counts);
+    munit_assert_int(rc_data[0], ==, 3);
+    munit_assert_int(rc_data[1], ==, 5);
+
+    /* Release — should unmap all segments */
+    td_release(parted);
+
+    (void)!system("rm -rf " TMP_PART_DB);
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest store_tests[] = {
@@ -318,6 +550,10 @@ static MunitTest store_tests[] = {
     { "/col_mmap_corrupt",     test_col_mmap_corrupt,     store_setup, store_teardown, 0, NULL },
     { "/col_mmap_nofile",      test_col_mmap_nofile,      store_setup, store_teardown, 0, NULL },
     { "/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown, 0, NULL },
+    { "/parted_nrows",        test_parted_nrows,         store_setup, store_teardown, 0, NULL },
+    { "/table_nrows_parted",  test_table_nrows_parted,   store_setup, store_teardown, 0, NULL },
+    { "/parted_release",      test_parted_release,        store_setup, store_teardown, 0, NULL },
+    { "/part_open",            test_part_open,            store_setup, store_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

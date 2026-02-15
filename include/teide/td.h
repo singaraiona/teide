@@ -89,6 +89,13 @@ extern "C" {
 #define TD_SYM       14
 #define TD_ENUM      15
 
+/* Parted types: composite of TD_PARTED_BASE + base type */
+#define TD_PARTED_BASE   32
+#define TD_MAPCOMMON     48   /* virtual partition column */
+
+#define TD_IS_PARTED(t)       ((t) >= TD_PARTED_BASE && (t) < TD_MAPCOMMON)
+#define TD_PARTED_BASETYPE(t) ((t) - TD_PARTED_BASE)
+
 /* Atom variants (negative type tags) */
 #define TD_ATOM_BOOL       (-TD_BOOL)
 #define TD_ATOM_U8         (-TD_U8)
@@ -533,6 +540,8 @@ int64_t  td_sym_intern(const char* str, size_t len);
 int64_t  td_sym_find(const char* str, size_t len);
 td_t*    td_sym_str(int64_t id);
 uint32_t td_sym_count(void);
+td_err_t td_sym_save(const char* path);
+td_err_t td_sym_load(const char* path);
 
 /* ===== Table API ===== */
 
@@ -543,6 +552,7 @@ td_t*       td_table_get_col_idx(td_t* tbl, int64_t idx);
 int64_t     td_table_col_name(td_t* tbl, int64_t idx);
 int64_t     td_table_ncols(td_t* tbl);
 int64_t     td_table_nrows(td_t* tbl);
+int64_t     td_parted_nrows(td_t* parted_col);
 td_t*       td_table_schema(td_t* tbl);
 
 /* ===== Morsel Iterator API ===== */
@@ -674,6 +684,7 @@ td_t*    td_splay_open(const char* dir, const char* sym_path);
 
 /* Partitioned table */
 td_t*    td_part_load(const char* db_root, const char* table_name);
+td_t*    td_part_open(const char* db_root, const char* table_name);
 
 /* Metadata */
 td_err_t td_meta_save_d(td_t* schema, const char* path);

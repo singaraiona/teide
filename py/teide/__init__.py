@@ -300,7 +300,7 @@ class TeideLib:
         lib.td_csv_read_opts.restype = c_td_p
 
         # ===== Storage (splay / partitioned) =====
-        lib.td_splay_save.argtypes = [c_td_p, ctypes.c_char_p]
+        lib.td_splay_save.argtypes = [c_td_p, ctypes.c_char_p, ctypes.c_char_p]
         lib.td_splay_save.restype = ctypes.c_int32  # td_err_t
 
         lib.td_splay_load.argtypes = [ctypes.c_char_p]
@@ -464,8 +464,9 @@ class TeideLib:
     def table_add_col(self, tbl, name_id, col):
         return self._lib.td_table_add_col(tbl, name_id, col)
 
-    def splay_save(self, tbl, path):
-        return self._lib.td_splay_save(tbl, path.encode('utf-8'))
+    def splay_save(self, tbl, path, sym_path=None):
+        sp = sym_path.encode('utf-8') if sym_path else None
+        return self._lib.td_splay_save(tbl, path.encode('utf-8'), sp)
 
     def splay_load(self, path):
         return self._lib.td_splay_load(path.encode('utf-8'))

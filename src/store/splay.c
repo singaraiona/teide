@@ -40,9 +40,12 @@
  * td_splay_save — save a table to a splayed table directory
  * -------------------------------------------------------------------------- */
 
-td_err_t td_splay_save(td_t* tbl, const char* dir) {
+td_err_t td_splay_save(td_t* tbl, const char* dir, const char* sym_path) {
     if (!tbl || TD_IS_ERR(tbl)) return TD_ERR_TYPE;
     if (!dir) return TD_ERR_IO;
+
+    /* sym_path saving is Phase 2 — ignore for now */
+    (void)sym_path;
 
     /* Create directory */
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return TD_ERR_IO;
@@ -129,6 +132,63 @@ td_t* td_splay_load(const char* dir) {
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
 
         td_t* col = td_col_load(path);
+        if (!col || TD_IS_ERR(col)) continue;
+
+        td_t* new_df = td_table_add_col(tbl, name_id, col);
+        if (!new_df || TD_IS_ERR(new_df)) continue;
+        tbl = new_df;
+    }
+
+    td_release(schema);
+    return tbl;
+}
+
+/* --------------------------------------------------------------------------
+ * td_splay_open — zero-copy splayed table load via mmap (mmod=1)
+ *
+ * Nearly identical to td_splay_load, but uses td_col_mmap for each column
+ * file. The .d schema is still loaded via td_col_load (small, buddy copy).
+ * -------------------------------------------------------------------------- */
+
+td_t* td_splay_open(const char* dir, const char* sym_path) {
+    if (!dir) return TD_ERR_PTR(TD_ERR_IO);
+
+    /* sym_path loading is Phase 2 — ignore for now */
+    (void)sym_path;
+
+    /* Load .d schema (small, use td_col_load — buddy copy is fine) */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.d", dir);
+    td_t* schema = td_col_load(path);
+    if (!schema || TD_IS_ERR(schema)) return schema;
+
+    int64_t ncols = schema->len;
+    int64_t* name_ids = (int64_t*)td_data(schema);
+
+    td_t* tbl = td_table_new(ncols);
+    if (!tbl || TD_IS_ERR(tbl)) {
+        td_release(schema);
+        return tbl;
+    }
+
+    /* Load each column via mmap (zero-copy) */
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t name_id = name_ids[c];
+        td_t* name_atom = td_sym_str(name_id);
+        if (!name_atom) continue;
+
+        const char* name = td_str_ptr(name_atom);
+        size_t name_len = td_str_len(name_atom);
+
+        if (name_len == 0 || name[0] == '.' ||
+            memchr(name, '/', name_len) || memchr(name, '\\', name_len) ||
+            memchr(name, '\0', name_len))
+            continue;
+
+        int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
+
+        td_t* col = td_col_mmap(path);
         if (!col || TD_IS_ERR(col)) continue;
 
         td_t* new_df = td_table_add_col(tbl, name_id, col);

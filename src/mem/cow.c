@@ -31,6 +31,9 @@
 
 void td_retain(td_t* v) {
     if (!v || TD_IS_ERR(v)) return;
+    /* conc-L3: Relaxed ordering is sufficient for retain — the caller already
+     * holds a valid reference, so no inter-thread synchronization is needed
+     * for the increment itself. Release synchronizes via td_release's acq_rel. */
     atomic_fetch_add_explicit(&v->rc, 1, memory_order_relaxed);
 }
 
@@ -57,7 +60,7 @@ td_t* td_cow(td_t* v) {
     if (rc == 1) return v;  /* sole owner -- mutate in place */
     td_t* copy = td_alloc_copy(v);
     if (!copy || TD_IS_ERR(copy)) return copy;
-    atomic_store_explicit(&copy->rc, 1, memory_order_relaxed);
+    /* L3: td_alloc_copy() already sets copy->rc = 1, so no redundant store needed. */
     td_release(v);
     return copy;
 }

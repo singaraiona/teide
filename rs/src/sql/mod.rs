@@ -98,9 +98,13 @@ impl Clone for StoredTable {
 }
 
 /// A stateful SQL session that maintains a table registry across queries.
+///
+// pub(crate) access allows planner to manage table registry directly.
+// This is intentional for simplicity; encapsulation via methods would
+// add complexity without safety benefit since planner is the only consumer.
 pub struct Session {
-    tables: HashMap<String, StoredTable>,
-    ctx: Context,
+    pub(crate) tables: HashMap<String, StoredTable>,
+    pub(crate) ctx: Context,
 }
 
 impl Session {
@@ -120,6 +124,9 @@ impl Session {
 
     /// Execute a multi-statement SQL script (statements separated by `;`).
     /// Returns the result of the last statement.
+    ///
+    /// Note: Naive ';' split; does not respect string literals.
+    /// Use execute() for statements containing semicolons in string values.
     pub fn execute_script(&mut self, sql: &str) -> Result<ExecResult, SqlError> {
         let mut last = None;
         for stmt in sql.split(';') {

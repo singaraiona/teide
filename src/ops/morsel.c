@@ -72,7 +72,9 @@ bool td_morsel_next(td_morsel_t* m) {
             td_t* ext = m->vec->ext_nullmap;
             m->null_bits = (uint8_t*)td_data(ext) + (m->offset / 8);
         } else if (m->offset < 128) {
-            /* Inline bitmap */
+            /* Inline bitmap is 16 bytes = 128 bits; vectors with HAS_NULLS
+             * and >128 elements must use external nullmap (TD_ATTR_NULLMAP_EXT).
+             * Returns null_bits=NULL for offset>=128 when using inline bitmap. */
             m->null_bits = m->vec->nullmap + (m->offset / 8);
         }
     }

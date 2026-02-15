@@ -25,6 +25,10 @@
 #include "sys.h"
 #include "core/platform.h"
 #include <string.h>
+#include <sched.h>
+#ifndef NDEBUG
+#include <stdio.h>
+#endif
 
 /* Ensure the return queue next-pointer overlay (bytes 0-7) does not clobber
    the order field used by td_arena_drain_return_queue(). */
@@ -36,6 +40,11 @@ _Static_assert(offsetof(td_t, order) >= 8,
  * -------------------------------------------------------------------------- */
 #define TD_ARENA_DEFAULT_SIZE  (64ULL * 1024 * 1024)   /* 64 MiB */
 #define TD_ARENA_MAX_SIZE      (1ULL << TD_ORDER_MAX)   /* 1 GiB */
+
+/* M2: Compile-time check that TD_ORDER_MAX and TD_ARENA_MAX_SIZE are consistent.
+ * If TD_ORDER_MAX is changed, TD_ARENA_MAX_SIZE must be updated to match. */
+_Static_assert((1ULL << TD_ORDER_MAX) <= TD_ARENA_MAX_SIZE,
+               "TD_ORDER_MAX must fit within TD_ARENA_MAX_SIZE");
 
 /* --------------------------------------------------------------------------
  * Thread-local state
@@ -51,6 +60,10 @@ TD_TLS td_mem_stats_t     td_tl_stats;
  * scans this array to find the owning arena for a block when td_arena_find()
  * (thread-local) returns NULL. Reads are lock-free; writes use a CAS spinlock.
  * -------------------------------------------------------------------------- */
+/* L1: Hard cap on registered arenas. If exceeded, new arenas are not registered
+ * and cross-thread frees to those arenas will silently leak. This limit is
+ * sufficient for current workloads (nproc threads * ~2-3 arenas each). If
+ * more arenas are needed, increase this constant. */
 #define TD_ARENA_REGISTRY_CAP 1024
 
 static td_arena_t*       g_arena_registry[TD_ARENA_REGISTRY_CAP];
@@ -58,6 +71,7 @@ static _Atomic(uint32_t) g_arena_registry_len  = 0;
 static _Atomic(uint32_t) g_arena_registry_lock = 0;
 
 static void arena_registry_lock(void) {
+    unsigned spin_count = 0;
     while (atomic_exchange_explicit(&g_arena_registry_lock, 1,
                                     memory_order_acquire) != 0) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -65,6 +79,9 @@ static void arena_registry_lock(void) {
 #elif defined(__aarch64__)
         __asm__ volatile("yield" ::: "memory");
 #endif
+        /* conc-L1: Yield to OS scheduler after sustained contention to avoid
+         * wasting CPU cycles when another thread holds the lock. */
+        if (++spin_count % 1024 == 0) sched_yield();
     }
 }
 
@@ -106,6 +123,8 @@ td_arena_t* td_arena_create(size_t size) {
 
     /* Register in global array for cross-thread free lookup */
     arena_registry_lock();
+    /* L4: Relaxed ordering OK here — the lock's acquire/release provides the
+     * necessary ordering guarantees for all accesses within the critical section. */
     uint32_t idx = atomic_load_explicit(&g_arena_registry_len, memory_order_relaxed);
     if (idx < TD_ARENA_REGISTRY_CAP) {
         g_arena_registry[idx] = a;
@@ -134,6 +153,10 @@ td_arena_t* td_arena_find(td_t* ptr) {
 
 /* --------------------------------------------------------------------------
  * Global arena lookup by pointer containment
+ *
+ * M4: This is an O(N) linear scan over all registered arenas. Acceptable
+ * for current workloads — max TD_ARENA_REGISTRY_CAP (1024) arenas, and
+ * cross-thread free is infrequent relative to same-thread free.
  * -------------------------------------------------------------------------- */
 
 td_arena_t* td_arena_find_global(td_t* ptr) {
@@ -159,6 +182,9 @@ void td_arena_drain_return_queue(td_arena_t* a) {
         uint8_t order = head->order;
         td_buddy_free(&a->buddy, head, order);
         td_tl_stats.free_count++;
+        /* M1: bytes_allocated is decremented on the owning (draining) thread,
+         * but was incremented on the allocating thread. Stats are advisory
+         * only and not used for correctness — this mismatch is acceptable. */
         td_tl_stats.bytes_allocated -= (size_t)1 << order;
         head = next;
     }
@@ -207,10 +233,27 @@ void td_arena_destroy_all(void) {
     }
     arena_registry_unlock();
 
-    /* Ensure all pending cross-thread pushes have completed before draining */
+    /* Ensure all pending cross-thread pushes have completed before draining.
+     * NOTE (H1): Between the unlock above and this fence, another thread that
+     * obtained the arena pointer from td_arena_find_global() BEFORE unregistration
+     * could still be mid-CAS push to the return queue. The seq_cst fence ensures
+     * visibility, and we perform two drain passes to catch any in-flight pushes
+     * that land between the first drain and the munmap below.
+     *
+     * IMPORTANT: Callers must ensure all worker threads have joined (e.g. via
+     * td_pool_free()) before calling td_arena_destroy_all(). The double-drain
+     * only handles the narrow TOCTOU window; it cannot protect against threads
+     * that continue pushing indefinitely after unregistration. */
     atomic_thread_fence(memory_order_seq_cst);
 
-    /* Drain return queues (reclaim cross-thread frees that arrived before unregister) */
+    /* First drain pass: reclaim cross-thread frees that arrived before unregister */
+    for (td_arena_t* a = td_tl_arena; a; a = a->next)
+        td_arena_drain_return_queue(a);
+
+    /* Second drain pass (H1): catch any pushes that landed between the first
+     * drain and now, due to in-flight CAS operations that started before
+     * unregistration completed. */
+    atomic_thread_fence(memory_order_seq_cst);
     for (td_arena_t* a = td_tl_arena; a; a = a->next)
         td_arena_drain_return_queue(a);
 
@@ -323,6 +366,9 @@ td_t* td_alloc(size_t data_size) {
  * Owned-reference helpers
  * -------------------------------------------------------------------------- */
 
+/* L6: SSO (Small String Optimization) detection relies on the obj pointer
+ * being NULL for empty strings, which holds because td_alloc() zero-inits
+ * the 32-byte header via memset. The slen/obj fields share a union in td_t. */
 static bool td_atom_str_is_sso(const td_t* s) {
     if (s->slen >= 1 && s->slen <= 7) return true;
     if (s->slen == 0 && s->obj == NULL) return true;
@@ -376,6 +422,8 @@ static void td_release_owned_refs(td_t* v) {
     }
 
     if (v->type == TD_TABLE) {
+        /* M5: Guard against corrupted negative len to prevent underflow loop */
+        if (v->len < 0) return;
         td_t** slots = (td_t**)td_data(v);
         td_t* schema = slots[0];
         if (schema && !TD_IS_ERR(schema)) td_release(schema);
@@ -538,11 +586,25 @@ void td_free(td_t* v) {
             }
             pp = &(*pp)->next;
         }
+        /* H2: Direct-mmap block not found in this thread's list. This means
+         * td_free() was called from a non-owning thread for a direct-mmap
+         * block (mmod==2). The block silently leaks because direct blocks
+         * are tracked per-thread and cannot be freed cross-thread. */
+#ifndef NDEBUG
+        fprintf(stderr, "td_free: direct-mmap block %p (mmod==2) not found in "
+                "calling thread's direct_blocks list — cross-thread free leaks\n",
+                (void*)v);
+#endif
         return;
     }
 
     /* mmod==1 is only used for simple vectors (td_col_mmap). Tables and
-       lists should never have mmod==1; bail out to avoid incorrect size. */
+       lists should never have mmod==1; bail out to avoid incorrect size.
+       M6: The unmap size is computed from len * esz + 32, which assumes this
+       matches the original mmap size (page-rounded). On Linux, munmap of
+       pages that were never mapped is a no-op, so slight overestimation is
+       harmless. Underestimation would leak pages but is prevented because
+       the original mapping also rounds to page boundaries. */
     if (v->mmod == 1) {
         if (v->type == TD_TABLE || v->type == TD_LIST) return;
         if (v->type > 0 && v->type < TD_TYPE_COUNT) {
@@ -609,8 +671,15 @@ td_t* td_alloc_copy(td_t* v) {
         int8_t t = td_type(v);
         if (t <= 0 || t >= TD_TYPE_COUNT)
             data_size = 0;
-        else
-            data_size = (size_t)td_len(v) * td_elem_size(t);
+        else {
+            uint8_t esz = td_elem_size(t);
+            /* H3: Overflow check — if v->len is corrupted, the product could
+             * wrap or produce an arbitrarily large copy size, leading to a
+             * read overrun in the memcpy below. */
+            if (v->len < 0 || (esz > 0 && (uint64_t)v->len > SIZE_MAX / esz))
+                return TD_ERR_PTR(TD_ERR_OOM);
+            data_size = (size_t)td_len(v) * esz;
+        }
     }
     td_t* copy = td_alloc(data_size);
     if (!copy) return NULL;

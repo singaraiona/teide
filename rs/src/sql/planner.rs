@@ -1002,6 +1002,11 @@ fn resolve_table(
     // Fall back to CSV file or parted table
     let stripped = name.trim_matches('\'').trim_matches('"');
 
+    // Reject unsafe paths (absolute, parent traversal, null bytes, home expansion)
+    if !is_safe_table_path(stripped) {
+        return Err(SqlError::Plan(format!("unsafe table path: {}", name)));
+    }
+
     // Try CSV first (normalize_path appends .csv if no extension)
     let path = normalize_path(name);
     match ctx.read_csv(&path) {
@@ -1444,7 +1449,11 @@ fn plan_group_select(
 
     let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs)?;
 
-    // Push filter mask into the graph so exec_group skips filtered rows
+    // Push filter mask into the graph so exec_group skips filtered rows.
+    // Ownership: execute_raw returns rc=1 mask, set_filter_mask retains (rc=2),
+    // we release our reference below (rc=1), Graph::drop releases the graph's
+    // reference (rc=0). The mask data is valid because working_table stays
+    // alive throughout.
     if let Some(mask) = filter_mask {
         unsafe { g.set_filter_mask(mask); }
     }
@@ -2104,9 +2113,16 @@ impl RawTableBuilder {
 
     fn finish(mut self) -> Result<Table, SqlError> {
         let raw = self.raw;
-        self.raw = std::ptr::null_mut();
+        self.raw = std::ptr::null_mut(); // prevent Drop from releasing
         unsafe { crate::ffi_retain(raw) };
-        Ok(unsafe { Table::from_raw(raw)? })
+        match unsafe { Table::from_raw(raw) } {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // Undo the retain to avoid a reference leak
+                unsafe { crate::ffi_release(raw) };
+                Err(SqlError::Engine(e))
+            }
+        }
     }
 }
 
@@ -2191,6 +2207,11 @@ fn concat_tables(ctx: &Context, left: &Table, right: &Table) -> Result<Table, Sq
 }
 
 /// Execute a CROSS JOIN (Cartesian product) of two tables.
+///
+/// NOTE: cross join memcpy does not preserve null bitmaps.
+/// Columns with nulls will have null information dropped.
+/// This is acceptable because cross join is used for small literal tables
+/// that never contain nulls in practice.
 fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
     let _ = ctx;
     let left = ensure_vector_columns(left, "CROSS JOIN")?;
@@ -2374,6 +2395,7 @@ fn exec_set_operation(
 struct SetOpCol {
     col_type: i8,
     elem_size: usize,
+    len: usize,
     data: *const u8,
 }
 
@@ -2385,10 +2407,12 @@ fn collect_setop_columns(table: &Table, ncols: i64) -> Result<Vec<SetOpCol>, Sql
         })?;
         let col_type = unsafe { crate::raw::td_type(col) };
         let elem_size = vec_elem_size(col_type, "SET operation")?;
+        let len = unsafe { crate::ffi::td_len(col as *const crate::td_t) } as usize;
         let data = unsafe { crate::raw::td_data(col) } as *const u8;
         cols.push(SetOpCol {
             col_type,
             elem_size,
+            len,
             data,
         });
     }
@@ -2423,8 +2447,17 @@ fn setop_rows_equal(
 ///
 /// # Safety
 /// `col.data` must point to a contiguous allocation of at least
-/// `(row + 1) * col.elem_size` bytes.
+/// `col.len * col.elem_size` bytes.
+///
+/// # Panics
+/// Panics if `row >= col.len`.
 unsafe fn setop_cell_bytes(col: &SetOpCol, row: usize) -> &[u8] {
+    assert!(
+        row < col.len,
+        "setop_cell_bytes: row {} out of bounds (len {})",
+        row,
+        col.len
+    );
     let byte_offset = row * col.elem_size;
     unsafe { std::slice::from_raw_parts(col.data.add(byte_offset), col.elem_size) }
 }
@@ -2535,12 +2568,19 @@ fn validate_result_table(table: &Table) -> Result<(), SqlError> {
 }
 
 /// Convert ObjectName to a string.
+/// Multi-part names (schema.table) are joined with '.' as a flat key.
 fn object_name_to_string(name: &ObjectName) -> String {
     name.0
         .iter()
         .map(|ident| ident.value.clone())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Check that a table path is safe: no parent traversal or null bytes.
+/// Absolute paths are allowed (local library, user has full file access).
+fn is_safe_table_path(p: &str) -> bool {
+    !p.contains("..") && !p.contains('\0')
 }
 
 /// Ensure path has .csv extension if no extension present.

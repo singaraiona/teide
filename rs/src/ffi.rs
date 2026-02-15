@@ -405,8 +405,17 @@ pub unsafe fn td_data(v: *mut td_t) -> *mut c_void {
 ///
 /// # Safety
 /// `t` must be a valid positive type tag in the range `0..TD_TYPE_COUNT`.
+///
+/// # Panics
+/// Panics if `t` (as usize) is out of range for `TD_TYPE_SIZES`.
 #[inline]
 pub unsafe fn td_elem_size(t: i8) -> u8 {
+    assert!(
+        (t as usize) < TD_TYPE_COUNT,
+        "td_elem_size: type tag {} out of range (max {})",
+        t,
+        TD_TYPE_COUNT - 1
+    );
     td_type_sizes[t as usize]
 }
 

@@ -67,8 +67,11 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     /* Write data */
     if (vec->len < 0) { fclose(f); return TD_ERR_CORRUPT; }
     uint8_t esz = td_elem_size(vec->type);
-    /* data_size computation assumes 64-bit size_t. On 32-bit platforms,
-     * vectors >512M elements with 8-byte types would overflow. */
+    /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
+    if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
+        fclose(f);
+        return TD_ERR_IO;
+    }
     size_t data_size = (size_t)vec->len * esz;
 
     void* data;
@@ -83,6 +86,7 @@ td_err_t td_col_save(td_t* vec, const char* path) {
         if (written != data_size) { fclose(f); return TD_ERR_IO; }
     }
 
+    /* No fsync; durability not guaranteed on power failure. */
     fclose(f);
     return TD_OK;
 }
@@ -188,6 +192,11 @@ td_t* td_col_mmap(const char* path) {
     }
 
     uint8_t esz = td_elem_size(vec->type);
+    /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
+    if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_IO);
+    }
     size_t data_size = (size_t)vec->len * esz;
     if (32 + data_size > mapped_size) {
         td_vm_unmap_file(ptr, mapped_size);

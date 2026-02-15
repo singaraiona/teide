@@ -173,6 +173,8 @@ static void local_sym_free(local_sym_t* ls) {
     memset(ls, 0, sizeof(*ls));
 }
 
+/* OOM during rehash degrades to O(n) lookup but doesn't crash.
+ * Load factor 0.7 ensures probing terminates. */
 static void local_sym_rehash(local_sym_t* ls) {
     uint32_t new_cap = ls->bucket_cap * 2;
     uint64_t* new_buckets = (uint64_t*)td_sys_alloc(new_cap * sizeof(uint64_t));
@@ -226,6 +228,9 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
         ls->lens = new_lens;
         ls->cap = new_cap;
     }
+
+    /* Guard against u32 truncation when storing arena offset */
+    if (ls->arena_used > UINT32_MAX - len - 1) return UINT32_MAX;
 
     if (ls->arena_used + len > ls->arena_cap) {
         size_t new_acap = ls->arena_cap * 2;
@@ -383,6 +388,7 @@ static const char* scan_field_quoted(const char* p, const char* buf_end,
     if (p < buf_end && *p == '"') p++; /* skip closing quote */
 
     if (has_escape) {
+        /* raw_len >= output length (quotes are collapsed); no overflow. */
         char* dest = esc_buf;
         if (TD_UNLIKELY(raw_len > 8192)) {
             /* Field too large for stack buffer — dynamically allocate */
@@ -459,6 +465,7 @@ TD_INLINE int64_t fast_i64(const char* p, size_t len) {
     for (const char* q = p; q < end && (unsigned char)(*q - '0') <= 9; q++)
         digit_len++;
     if (TD_UNLIKELY(digit_len > 18)) {
+        /* max int64 = 20 chars; 31-byte limit safe for valid integers. */
         char tmp[32];
         size_t slen = (size_t)(end - start);
         if (slen > sizeof(tmp) - 1) slen = sizeof(tmp) - 1;
@@ -548,6 +555,10 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
         int exp_val = 0;
         while (p < end && (unsigned)(*p - '0') < 10) {
             exp_val = exp_val * 10 + (*p - '0');
+            /* Clamp exponent to avoid int overflow on crafted input (e.g. 1e9999999999).
+             * 10^999 is far beyond double range (max ~10^308), so the result
+             * will be inf/0.0 anyway, but the integer arithmetic stays defined. */
+            if (exp_val > 999) exp_val = 999;
             p++;
         }
         if (exp_val <= 22) {
@@ -655,7 +666,9 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
     while (p < end && (*p == '\r' || *p == '\n')) p++;
     if (p >= end) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
 
-    /* Estimate capacity: ~40 bytes per row + headroom */
+    /* Estimate capacity: ~40 bytes per row + headroom.
+     * 40 bytes/row is conservative for typical CSVs; realloc path handles
+     * underestimates. */
     size_t remaining = (size_t)(end - p);
     int64_t est = (int64_t)(remaining / 40) + 16;
     td_t* hdr = NULL;
@@ -1037,6 +1050,7 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
             p++;
         }
     }
+    /* Columns beyond CSV_MAX_COLS (256) are silently dropped. */
     if (ncols > CSV_MAX_COLS) ncols = CSV_MAX_COLS;
 
     /* ---- 5. Parse header row ---- */
@@ -1095,8 +1109,9 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
         /* Auto-infer from sample rows */
         csv_type_t col_types[CSV_MAX_COLS];
         memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
-        /* Type inference uses first CSV_SAMPLE_ROWS rows. Files where early rows
-         * don't represent the full type range may be mistyped. */
+        /* Type inference from first 100 rows. Heterogeneous CSVs with type
+         * changes after row 100 will be mistyped. Use explicit schema
+         * (col_types_in) for such files. */
         int64_t sample_n = (n_rows < CSV_SAMPLE_ROWS) ? n_rows : CSV_SAMPLE_ROWS;
         for (int64_t r = 0; r < sample_n; r++) {
             const char* rp = buf + row_offsets[r];
@@ -1137,6 +1152,8 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
             for (int j = 0; j < c; j++) td_release(col_vecs[j]);
             goto fail_offsets;
         }
+        /* len set early so parallel workers can write to full extent;
+         * parse errors return before table is used. */
         col_vecs[c]->len = n_rows;
         col_data[c] = td_data(col_vecs[c]);
     }

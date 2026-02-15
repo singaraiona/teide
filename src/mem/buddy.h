@@ -54,6 +54,10 @@ typedef struct {
 /* Number of orders: ORDER_MIN (5) through ORDER_MAX (30) */
 #define TD_ORDER_COUNT (TD_ORDER_MAX - TD_ORDER_MIN + 1)
 
+/* L2: Sentinel value returned by td_order_for_size() when a block exceeds
+ * the buddy allocator's maximum order. Caller should use direct mmap. */
+#define TD_ORDER_SENTINEL (TD_ORDER_MAX + 1)
+
 /* --------------------------------------------------------------------------
  * Buddy allocator state for one arena region
  * -------------------------------------------------------------------------- */

@@ -216,6 +216,9 @@ static inline uint64_t td_hash_i64(int64_t val) {
  *
  * Normalizes negative zero to positive zero so that -0.0 and +0.0
  * hash identically (they compare equal via ==).
+ *
+ * Note: different NaN bit patterns hash differently; SQL NULL is
+ * handled separately at a higher level and never reaches this path.
  */
 static inline uint64_t td_hash_f64(double val) {
     uint64_t bits;

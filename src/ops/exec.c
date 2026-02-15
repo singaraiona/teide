@@ -551,7 +551,7 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
     if (!expr_is_elementwise(root->opcode)) return false;
 
     uint32_t nc = g->node_count;
-    if (nc > 65536) return false; /* guard against stack overflow from VLA */
+    if (nc > 4096) return false; /* guard against stack overflow from VLA */
     uint8_t node_reg[nc];
     memset(node_reg, 0xFF, nc * sizeof(uint8_t));
 
@@ -1753,6 +1753,9 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op);
  * Sort comparator: compare two row indices across all sort keys.
  * Returns negative if a < b, positive if a > b, 0 if equal.
  * -------------------------------------------------------------------------- */
+/* Sort comparison context.
+ * Bounds on desc[] and nulls_first[] are guaranteed by graph construction:
+ * n_sort is uint8_t (max 255), and arrays are allocated to that size. */
 typedef struct {
     td_t**       vecs;
     uint8_t*     desc;
@@ -1900,7 +1903,9 @@ static void radix_scatter_fn(void* arg, uint32_t wid, int64_t start, int64_t end
 
 /* Run radix sort on pre-encoded uint64_t keys + int64_t indices.
  * Returns pointer to the final sorted index array (either `indices` or
- * `idx_tmp`).  Caller must keep both alive until done reading indices.
+ * `idx_tmp`).  Caller must keep both alive until done reading indices
+ * (the result may point into idx_tmp if an odd number of passes executed).
+ * The corresponding itmp_hdr must not be freed until after gather completes.
  * Returns NULL on failure. */
 static int64_t* radix_sort_run(td_pool_t* pool,
                                 uint64_t* keys, int64_t* indices,
@@ -4039,6 +4044,8 @@ typedef struct {
     const uint8_t* mask;
 } da_ctx_t;
 
+/* Composite GID from multi-key.  Arithmetic overflow is prevented in practice
+ * by the DA budget check (DA_PER_WORKER_MAX) which limits total_slots to 262K. */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
     for (uint8_t k = 0; k < c->n_keys; k++) {
@@ -4172,7 +4179,8 @@ static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
     return (int64_t)((const uint8_t*)ptr)[r];
 }
 
-/* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask) */
+/* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask).
+ * Note: int64 sum can overflow; caller responsibility to use appropriate types. */
 static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
@@ -6036,6 +6044,10 @@ static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
  * CAS contention.
  * ──────────────────────────────────────────────────────────────────── */
 
+/* Note: ht_heads is accessed via GCC/Clang __atomic builtins on plain int64_t.
+ * Technically UB per C11 (requires _Atomic), but universally supported by
+ * GCC/Clang and generates correct code.  Changing to _Atomic(int64_t) could
+ * affect scratch_alloc alignment requirements, so we keep plain type. */
 typedef struct {
     int64_t* ht_heads;     /* shared, protected by atomic CAS */
     int64_t* ht_next;      /* per-row, no contention */
@@ -6551,7 +6563,9 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
  * OP_LIKE: SQL LIKE pattern matching on SYM/ENUM columns
  * ============================================================================ */
 
-/* Simple SQL LIKE matcher: % = any (including empty), _ = single char */
+/* Simple SQL LIKE matcher: % = any (including empty), _ = single char.
+ * Pattern is re-interpreted per row; could be optimized with precompilation
+ * (e.g., compile once to NFA/DFA) for large datasets. */
 static bool like_match(const char* str, size_t slen, const char* pat, size_t plen) {
     size_t si = 0, pi = 0;
     size_t star_p = (size_t)-1, star_s = 0;
@@ -6622,6 +6636,10 @@ static td_t* exec_like(td_graph_t* g, td_op_t* op) {
 
 /* ============================================================================
  * String functions: UPPER, LOWER, TRIM, STRLEN, SUBSTR, REPLACE, CONCAT
+ *
+ * These functions call td_sym_intern() per output row, which is
+ * O(n * sym_table_lookup) per string op.  Acceptable for current workloads;
+ * could be optimized with batch interning if profiling shows a bottleneck.
  * ============================================================================ */
 
 /* Helper: resolve sym/enum element to string */
@@ -6653,8 +6671,14 @@ static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
     for (int64_t i = 0; i < len; i++) {
         const char* sp; size_t sl;
         sym_elem(input, i, &sp, &sl);
-        char buf[1024];
-        size_t out_len = sl < sizeof(buf) ? sl : sizeof(buf) - 1;
+        char sbuf[8192];
+        char* buf = sbuf;
+        td_t* dyn_hdr = NULL;
+        if (sl >= sizeof(sbuf)) {
+            buf = (char*)scratch_alloc(&dyn_hdr, sl + 1);
+            if (!buf) { buf = sbuf; sl = sizeof(sbuf) - 1; }
+        }
+        size_t out_len = sl;
         if (opc == OP_UPPER) {
             for (size_t j = 0; j < out_len; j++) buf[j] = (char)toupper((unsigned char)sp[j]);
         } else if (opc == OP_LOWER) {
@@ -6664,11 +6688,11 @@ static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
             while (start < sl && isspace((unsigned char)sp[start])) start++;
             while (end > start && isspace((unsigned char)sp[end - 1])) end--;
             out_len = end - start;
-            if (out_len > sizeof(buf) - 1) out_len = sizeof(buf) - 1;
             memcpy(buf, sp + start, out_len);
         }
         buf[out_len] = '\0';
         dst[i] = td_sym_intern(buf, out_len);
+        scratch_free(dyn_hdr);
     }
     td_release(input);
     return result;
@@ -6713,34 +6737,43 @@ static td_t* exec_substr(td_graph_t* g, td_op_t* op) {
     result->len = nrows;
     int64_t* dst = (int64_t*)td_data(result);
 
-    /* start_v and len_v may be atom scalars or vectors */
+    /* start_v and len_v may be atom scalars or vectors.
+     * Handle TD_I32 vectors correctly (read as int32_t, not int64_t). */
     int64_t s_scalar = 0, l_scalar = 0;
     const int64_t* s_data = NULL;
     const int64_t* l_data = NULL;
+    const int32_t* s_data_i32 = NULL;
+    const int32_t* l_data_i32 = NULL;
     if (start_v->type == TD_ATOM_I64) s_scalar = start_v->i64;
     else if (start_v->type == TD_ATOM_F64) s_scalar = (int64_t)start_v->f64;
     else if (start_v->len == 1) {
         if (start_v->type == TD_F64)
             s_scalar = (int64_t)((double*)td_data(start_v))[0];
+        else if (start_v->type == TD_I32)
+            s_scalar = (int64_t)((int32_t*)td_data(start_v))[0];
         else
             s_scalar = ((int64_t*)td_data(start_v))[0];
     }
+    else if (start_v->type == TD_I32) s_data_i32 = (const int32_t*)td_data(start_v);
     else s_data = (const int64_t*)td_data(start_v);
     if (len_v->type == TD_ATOM_I64) l_scalar = len_v->i64;
     else if (len_v->type == TD_ATOM_F64) l_scalar = (int64_t)len_v->f64;
     else if (len_v->len == 1) {
         if (len_v->type == TD_F64)
             l_scalar = (int64_t)((double*)td_data(len_v))[0];
+        else if (len_v->type == TD_I32)
+            l_scalar = (int64_t)((int32_t*)td_data(len_v))[0];
         else
             l_scalar = ((int64_t*)td_data(len_v))[0];
     }
+    else if (len_v->type == TD_I32) l_data_i32 = (const int32_t*)td_data(len_v);
     else l_data = (const int64_t*)td_data(len_v);
 
     for (int64_t i = 0; i < nrows; i++) {
         const char* sp; size_t sl;
         sym_elem(input, i, &sp, &sl);
-        int64_t st = (s_data ? s_data[i] : s_scalar) - 1; /* 1-based → 0-based */
-        int64_t ln = l_data ? l_data[i] : l_scalar;
+        int64_t st = (s_data ? s_data[i] : s_data_i32 ? (int64_t)s_data_i32[i] : s_scalar) - 1; /* 1-based → 0-based */
+        int64_t ln = l_data ? l_data[i] : l_data_i32 ? (int64_t)l_data_i32[i] : l_scalar;
         if (st < 0) st = 0;
         if ((size_t)st >= sl) { dst[i] = td_sym_intern("", 0); continue; }
         if (ln < 0 || ln > (int64_t)(sl - (size_t)st)) ln = (int64_t)sl - st;
@@ -6778,19 +6811,31 @@ static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
         const char* sp; size_t sl;
         sym_elem(input, i, &sp, &sl);
         /* Simple find-and-replace-all */
-        char buf[4096];
+        /* Worst case: every char is a match, each replaced by to_len bytes */
+        size_t worst = (from_len > 0)
+            ? sl / from_len * to_len + (sl % from_len) + 1
+            : sl + 1;
+        char sbuf[8192];
+        char* buf = sbuf;
+        td_t* dyn_hdr = NULL;
+        if (worst > sizeof(sbuf)) {
+            buf = (char*)scratch_alloc(&dyn_hdr, worst);
+            if (!buf) { buf = sbuf; worst = sizeof(sbuf); }
+        }
+        size_t buf_cap = dyn_hdr ? worst : sizeof(sbuf);
         size_t bi = 0;
         for (size_t j = 0; j < sl; ) {
             if (from_len > 0 && j + from_len <= sl && memcmp(sp + j, from_str, from_len) == 0) {
-                if (bi + to_len < sizeof(buf)) { memcpy(buf + bi, to_str, to_len); bi += to_len; }
+                if (bi + to_len < buf_cap) { memcpy(buf + bi, to_str, to_len); bi += to_len; }
                 j += from_len;
             } else {
-                if (bi < sizeof(buf) - 1) buf[bi++] = sp[j];
+                if (bi < buf_cap - 1) buf[bi++] = sp[j];
                 j++;
             }
         }
         buf[bi] = '\0';
         dst[i] = td_sym_intern(buf, bi);
+        scratch_free(dyn_hdr);
     }
     td_release(input); td_release(from_v); td_release(to_v);
     return result;
@@ -6802,6 +6847,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
     int n_args = (int)ext->sym;
     if (n_args < 2) return TD_ERR_PTR(TD_ERR_DOMAIN);
+    if (n_args > 255) n_args = 255; /* cap to prevent excessive trailing reads */
 
     /* Evaluate all inputs */
     td_t* args_stack[16];
@@ -6841,23 +6887,44 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     int64_t* dst = (int64_t*)td_data(result);
 
     for (int64_t r = 0; r < nrows; r++) {
-        char buf[4096];
+        /* Pre-scan to compute total concat length for this row */
+        size_t total = 0;
+        for (int a = 0; a < n_args; a++) {
+            int8_t t = args[a]->type;
+            if (t == TD_SYM || t == TD_ENUM) {
+                const char* sp; size_t sl;
+                sym_elem(args[a], r, &sp, &sl);
+                total += sl;
+            } else if (t == TD_STR || t == TD_ATOM_STR) {
+                size_t sl = td_str_len(args[a]);
+                total += sl;
+            }
+        }
+        char sbuf[8192];
+        char* buf = sbuf;
+        td_t* dyn_hdr = NULL;
+        size_t buf_cap = sizeof(sbuf);
+        if (total >= sizeof(sbuf)) {
+            buf = (char*)scratch_alloc(&dyn_hdr, total + 1);
+            if (!buf) { buf = sbuf; buf_cap = sizeof(sbuf); }
+            else buf_cap = total + 1;
+        }
         size_t bi = 0;
         for (int a = 0; a < n_args; a++) {
             int8_t t = args[a]->type;
             if (t == TD_SYM || t == TD_ENUM) {
                 const char* sp; size_t sl;
                 sym_elem(args[a], r, &sp, &sl);
-                if (bi + sl < sizeof(buf)) { memcpy(buf + bi, sp, sl); bi += sl; }
+                if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             } else if (t == TD_STR || t == TD_ATOM_STR) {
-                /* String constant (atom or vector) */
                 const char* sp = td_str_ptr(args[a]);
                 size_t sl = td_str_len(args[a]);
-                if (sp && bi + sl < sizeof(buf)) { memcpy(buf + bi, sp, sl); bi += sl; }
+                if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
             }
         }
         buf[bi] = '\0';
         dst[r] = td_sym_intern(buf, bi);
+        scratch_free(dyn_hdr);
     }
     for (int i = 0; i < n_args; i++) td_release(args[i]);
     scratch_free(args_hdr);
@@ -6954,6 +7021,7 @@ static td_t* exec_extract(td_graph_t* g, td_op_t* op) {
                     static const int dbm[13] = {
                         0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
                     };
+                    if (mo < 1 || mo > 12) { out[off + i] = 0; continue; }
                     int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
                     int64_t doy_jan = dbm[mo] + (int64_t)d;
                     if (mo > 2 && leap) doy_jan++;
@@ -7192,6 +7260,7 @@ static void win_compute_partition(
     const int64_t* sorted_idx, int64_t ps, int64_t pe,
     td_t** result_vecs, const bool* is_f64)
 {
+    if (ps >= pe) return; /* empty partition — nothing to compute */
     int64_t part_len = pe - ps;
 
     for (uint8_t f = 0; f < n_funcs; f++) {
@@ -7592,6 +7661,8 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     }
 
     /* --- Phase 0: Resolve key and func_input vectors --- */
+    /* VLAs below are bounded by uint8_t limits (max 255 each),
+     * so max ~10KB on stack; bounded by uint8_t limits. */
     td_t* sort_vecs[n_sort > 0 ? n_sort : 1];
     uint8_t sort_owned[n_sort > 0 ? n_sort : 1];
     uint8_t sort_descs[n_sort > 0 ? n_sort : 1];
@@ -7894,17 +7965,24 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     int64_t n_parts = 0;
 
     if (n_part > 0) {
-        /* Check if we can pack partition keys into uint64 for fast gather */
+        /* Check if we can pack partition keys into uint64 for fast gather.
+         * Multi-key packing shifts each key by 32 bits, so any key requiring
+         * >32 bits in a multi-key scenario would be truncated.  Force fallback
+         * when any 64-bit key appears alongside other keys. */
         uint8_t pk_bits = 0;
         bool can_pack = true;
+        bool has_64bit_key = false;
         for (uint8_t k = 0; k < n_part; k++) {
             int8_t t = sort_vecs[k]->type;
             if (t == TD_ENUM || t == TD_I32 || t == TD_DATE || t == TD_TIME) pk_bits += 32;
             else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP ||
-                     t == TD_F64) pk_bits += 64;
+                     t == TD_F64) { pk_bits += 64; has_64bit_key = true; }
             else { can_pack = false; break; }
             if (pk_bits > 64) { can_pack = false; break; }
         }
+        /* If multi-key with any 64-bit type, the <<32 packing truncates.
+         * Force sequential fallback for correctness. */
+        if (can_pack && n_part > 1 && has_64bit_key) can_pack = false;
 
         td_t* pkey_hdr = NULL;
         uint64_t* pkey_sorted = can_pack ?
@@ -7938,6 +8016,9 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
         }
         part_offsets[++n_parts] = nrows;
     } else {
+        /* No partition keys: entire table is one partition.
+         * Minor memory waste (part_offsets sized for nrows+1) but no
+         * correctness issue — only indices 0 and 1 are used. */
         part_offsets[1] = nrows;
         n_parts = 1;
     }
@@ -8038,7 +8119,8 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     for (uint8_t f = 0; f < n_funcs; f++) {
         char buf[16] = "_w";
         int pos = 2;
-        if (f >= 10) buf[pos++] = '0' + (f / 10);
+        if (f >= 100) buf[pos++] = '0' + (f / 100);
+        if (f >= 10)  buf[pos++] = '0' + ((f / 10) % 10);
         buf[pos++] = '0' + (f % 10);
         buf[pos] = '\0';
         int64_t name_id = td_sym_intern(buf, (size_t)pos);
@@ -8369,7 +8451,9 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                         char name_buf[16];
                         int n = 0;
                         name_buf[n++] = '_'; name_buf[n++] = 'e';
-                        name_buf[n++] = '0' + c;
+                        if (c >= 100) name_buf[n++] = '0' + (c / 100);
+                        if (c >= 10)  name_buf[n++] = '0' + ((c / 10) % 10);
+                        name_buf[n++] = '0' + (c % 10);
                         int64_t name_id = td_sym_intern(name_buf, (size_t)n);
                         result = td_table_add_col(result, name_id, vec);
                         td_release(vec);

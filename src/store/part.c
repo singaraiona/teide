@@ -35,6 +35,9 @@
  *   db_root/sym              — global symbol intern table
  *   db_root/YYYY.MM.DD/      — partition directories
  *   db_root/YYYY.MM.DD/table — splayed table per partition
+ *
+ * No symlink check: local-trust file format; path traversal checks
+ * cover main attack vector.
  * -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------
@@ -67,7 +70,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         if (ent->d_name[0] == '.') continue;
 
         /* Partition directory names validated as digit+dot sequences.
-         * Non-conforming entries are harmless — they fail on splay load if invalid. */
+         * Non-conforming entries are harmless and silently skipped.
+         * Format is loosely validated — they fail on splay load if truly invalid. */
         bool valid = false;
         for (const char* c = ent->d_name; *c; c++) {
             if (*c == '.') { valid = true; continue; }
@@ -94,7 +98,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         return TD_ERR_PTR(TD_ERR_IO);
     }
 
-    /* Sort partition names for deterministic order */
+    /* Sort partition names for deterministic order.
+     * O(n^2) but partition count is typically small (< 1000 daily partitions). */
     for (int64_t i = 0; i < part_count - 1; i++) {
         for (int64_t j = i + 1; j < part_count; j++) {
             if (strcmp(part_dirs[i], part_dirs[j]) > 0) {
@@ -105,7 +110,8 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         }
     }
 
-    /* Load first partition to get schema */
+    /* Load first partition to get schema.
+     * Path buffer limited to 1024 chars — paths exceeding this are silently truncated. */
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[0], table_name);
     td_t* first = td_splay_load(path);
@@ -135,6 +141,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 
     int64_t fail_count = 0;
     for (int64_t p = 1; p < part_count; p++) {
+        /* Path buffer limited to 1024 chars — paths exceeding this are silently truncated. */
         snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
         all_dfs[p] = td_splay_load(path);
         if (!all_dfs[p] || TD_IS_ERR(all_dfs[p])) {
@@ -207,7 +214,8 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
         strstr(table_name, "..") || table_name[0] == '.')
         return TD_ERR_PTR(TD_ERR_IO);
 
-    /* Build sym_path */
+    /* Build sym_path.
+     * Path buffer limited to 1024 chars — paths exceeding this are silently truncated. */
     char sym_path[1024];
     snprintf(sym_path, sizeof(sym_path), "%s/sym", db_root);
 
@@ -254,7 +262,8 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
         return TD_ERR_PTR(TD_ERR_IO);
     }
 
-    /* Sort partition names for deterministic order */
+    /* Sort partition names for deterministic order.
+     * O(n^2) but partition count is typically small (< 1000 daily partitions). */
     for (int64_t i = 0; i < part_count - 1; i++) {
         for (int64_t j = i + 1; j < part_count; j++) {
             if (strcmp(part_dirs[i], part_dirs[j]) > 0) {
@@ -269,6 +278,7 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
     td_t** part_tables = (td_t**)td_sys_alloc((size_t)part_count * sizeof(td_t*));
     if (!part_tables) goto fail_dirs;
 
+    /* Path buffer limited to 1024 chars — paths exceeding this are silently truncated. */
     char path[1024];
     for (int64_t p = 0; p < part_count; p++) {
         snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);

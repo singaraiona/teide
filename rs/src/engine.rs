@@ -328,10 +328,12 @@ fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
 /// Safe to call from any thread (e.g. a signal handler or a separate
 /// cancellation thread). The next morsel boundary in the executor will
 /// observe the flag and return `Error::Cancel`.
+///
+/// This calls td_cancel() directly without acquiring the engine guard,
+/// because td_cancel() only sets an atomic flag and is safe to call
+/// from any thread without holding the guard. Acquiring the guard here
+/// would risk triggering EngineGuard drop from the wrong thread.
 pub fn cancel() {
-    if acquire_existing_engine_guard().is_err() {
-        return; // Engine not initialized, nothing to cancel
-    }
     unsafe { ffi::td_cancel(); }
 }
 
@@ -345,6 +347,9 @@ pub fn cancel() {
 pub fn sym_intern(s: &str) -> Result<i64> {
     let _guard = acquire_existing_engine_guard()
         .map_err(|_| Error::EngineNotInitialized)?;
+    // SAFETY: td_sym_intern takes (const char*, size_t len) and uses the length
+    // parameter, not NUL termination. Rust &str bytes are valid for the duration
+    // of this call.
     Ok(unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) })
 }
 
@@ -441,6 +446,8 @@ impl Context {
     /// Create a new operation graph bound to a table.
     pub fn graph<'a>(&self, table: &'a Table) -> Result<Graph<'a>> {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
+        // Defensive check; td_graph_new only returns null on failure.
+        // The td_is_err check is retained as a safeguard.
         if raw.is_null() || ffi::td_is_err(raw as *const ffi::td_t) {
             return Err(Error::Oom);
         }
@@ -805,8 +812,13 @@ impl Drop for Table {
 // Column — thin wrapper around *mut td_op_t (graph-owned, no Drop)
 // ---------------------------------------------------------------------------
 
-/// A reference to an operation node in a `Graph`. Does not own memory —
+/// A reference to an operation node in a `Graph`. Does not own memory --
 /// the `Graph` owns all nodes.
+///
+/// SAFETY: Column holds a raw pointer into Graph's node array.
+/// It must not be used after the Graph is dropped or with a different Graph.
+/// The current API enforces this by requiring &self on Graph methods that
+/// accept Column arguments.
 #[derive(Clone, Copy)]
 pub struct Column {
     raw: *mut ffi::td_op_t,
@@ -854,7 +866,7 @@ impl Graph<'_> {
 
     fn check_op(raw: *mut ffi::td_op_t) -> Result<Column> {
         if raw.is_null() {
-            return Err(Error::Oom);
+            return Err(Error::NullPointer);  // graph operation failed (null result)
         }
         Ok(Column { raw })
     }

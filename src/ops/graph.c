@@ -71,6 +71,8 @@ static void graph_fixup_ext_ptrs(td_graph_t* g, ptrdiff_t delta) {
                 for (uint8_t f = 0; f < ext->window.n_funcs; f++)
                     ext->window.func_inputs[f] = graph_fix_ptr(ext->window.func_inputs[f], delta);
                 break;
+            /* M5: PROJECT/SELECT intentionally alias sort union for column
+               storage — same pointer layout (columns[], n_cols). */
             case OP_PROJECT:
             case OP_SELECT:
                 for (uint8_t k = 0; k < ext->sort.n_cols; k++)
@@ -93,6 +95,8 @@ static void graph_fixup_ptrs(td_graph_t* g, td_op_t* old_nodes) {
     graph_fixup_ext_ptrs(g, delta);
 }
 
+/* L3: node_count is uint32_t — theoretical overflow at 2^32 nodes is
+   unreachable in practice (would require ~128 GB for the nodes array). */
 static td_op_t* graph_alloc_node(td_graph_t* g) {
     if (g->node_count >= g->node_cap) {
         td_op_t* old_nodes = g->nodes;
@@ -128,7 +132,10 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
         graph_fixup_ptrs(g, old_nodes);
     }
     ext->base.id = g->node_count;
-    g->nodes[g->node_count] = ext->base;
+    /* H4: Do NOT copy ext->base to nodes[] here — the caller fills in
+       fields first and then syncs via g->nodes[ext->base.id] = ext->base. */
+    memset(&g->nodes[g->node_count], 0, sizeof(td_op_t));
+    g->nodes[g->node_count].id = g->node_count;
     g->node_count++;
 
     /* Track ext node for cleanup */
@@ -178,6 +185,13 @@ td_graph_t* td_graph_new(td_t* tbl) {
 void td_graph_free(td_graph_t* g) {
     if (!g) return;
 
+    /* M6: Release OP_CONST literal values before freeing ext nodes */
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        td_op_ext_t* ext = g->ext_nodes[i];
+        if (ext && g->nodes[ext->base.id].opcode == OP_CONST && ext->literal) {
+            td_release(ext->literal);
+        }
+    }
     /* Free extended nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {
         td_sys_free(g->ext_nodes[i]);
@@ -227,6 +241,8 @@ td_op_t* td_const_f64(td_graph_t* g, double val) {
     ext->base.arity = 0;
     ext->base.out_type = TD_F64;
     ext->literal = td_f64(val);
+    /* L4: null/error check on allocation result */
+    if (!ext->literal || TD_IS_ERR(ext->literal)) ext->literal = NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -240,6 +256,8 @@ td_op_t* td_const_i64(td_graph_t* g, int64_t val) {
     ext->base.arity = 0;
     ext->base.out_type = TD_I64;
     ext->literal = td_i64(val);
+    /* L4: null/error check on allocation result */
+    if (!ext->literal || TD_IS_ERR(ext->literal)) ext->literal = NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -253,6 +271,8 @@ td_op_t* td_const_bool(td_graph_t* g, bool val) {
     ext->base.arity = 0;
     ext->base.out_type = TD_BOOL;
     ext->literal = td_bool(val);
+    /* L4: null/error check on allocation result */
+    if (!ext->literal || TD_IS_ERR(ext->literal)) ext->literal = NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -266,6 +286,8 @@ td_op_t* td_const_str(td_graph_t* g, const char* s) {
     ext->base.arity = 0;
     ext->base.out_type = TD_STR;
     ext->literal = td_str(s, strlen(s));
+    /* L4: null/error check on allocation result */
+    if (!ext->literal || TD_IS_ERR(ext->literal)) ext->literal = NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -486,6 +508,8 @@ td_op_t* td_replace(td_graph_t* g, td_op_t* str, td_op_t* from, td_op_t* to) {
 td_op_t* td_concat(td_graph_t* g, td_op_t** args, int n) {
     /* Variadic: first 2 in inputs[], rest in trailing IDs */
     if (!args || n < 2) return NULL;
+    /* M4: Guard VLA upper bound */
+    if (n > 256) return NULL;
     size_t n_args = (size_t)n;
     if (n_args > (SIZE_MAX / sizeof(uint32_t))) return NULL;
     size_t extra = (n > 2) ? (size_t)(n - 2) * sizeof(uint32_t) : 0;
@@ -556,6 +580,7 @@ td_op_t* td_sort_op(td_graph_t* g, td_op_t* table_node,
                      td_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
                      uint8_t n_cols) {
     uint32_t table_id = table_node->id;
+    /* L5: n_cols is uint8_t (max 255) so 256-element array is always sufficient. */
     uint32_t key_ids[256];
     for (uint8_t i = 0; i < n_cols; i++) key_ids[i] = keys[i]->id;
 
@@ -863,6 +888,8 @@ td_op_t* td_select(td_graph_t* g, td_op_t* input,
     return &g->nodes[ext->base.id];
 }
 
+/* L6: When n (stored as ext->sym) is 0, HEAD produces an empty result
+   with the same schema as the input. */
 td_op_t* td_head(td_graph_t* g, td_op_t* input, int64_t n) {
     uint32_t input_id = input->id;
     td_op_ext_t* ext = graph_alloc_ext_node(g);

@@ -42,7 +42,9 @@ static bool is_elementwise(uint16_t opcode) {
            (opcode >= OP_ADD && opcode <= OP_MAX2);
 }
 
-/* O(n) scan — acceptable for typical graph sizes (tens to hundreds of nodes). */
+/* O(ext_count) per call; acceptable for typical graph sizes (tens to
+   hundreds of nodes).  L2: intentional duplication to keep files
+   self-contained — also present in opt.c. */
 static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
     for (uint32_t i = 0; i < g->ext_count; i++) {
         if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
@@ -93,6 +95,60 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
                     uint32_t arg_id = trail[i - 2];
                     if (arg_id < nc && sp < (int)stack_cap)
                         stack[sp++] = arg_id;
+                }
+            }
+        }
+        /* H2: Count refs for ext node children (GROUP keys/aggs,
+           SORT/PROJECT/SELECT columns, JOIN keys, WINDOW inputs)
+           so fusion ref counts are accurate. */
+        if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
+            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW ||
+            n->opcode == OP_PROJECT || n->opcode == OP_SELECT) {
+            td_op_ext_t* ext = find_ext(g, nid);
+            if (ext) {
+                switch (n->opcode) {
+                    case OP_GROUP:
+                        for (uint8_t k = 0; k < ext->n_keys; k++) {
+                            if (ext->keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->keys[k]->id;
+                        }
+                        for (uint8_t a = 0; a < ext->n_aggs; a++) {
+                            if (ext->agg_ins[a] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins[a]->id;
+                        }
+                        break;
+                    case OP_SORT:
+                    case OP_PROJECT:
+                    case OP_SELECT:
+                        for (uint8_t k = 0; k < ext->sort.n_cols; k++) {
+                            if (ext->sort.columns[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->sort.columns[k]->id;
+                        }
+                        break;
+                    case OP_JOIN:
+                        for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                            if (ext->join.left_keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->join.left_keys[k]->id;
+                            if (ext->join.right_keys && ext->join.right_keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->join.right_keys[k]->id;
+                        }
+                        break;
+                    case OP_WINDOW:
+                        for (uint8_t k = 0; k < ext->window.n_part_keys; k++) {
+                            if (ext->window.part_keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->window.part_keys[k]->id;
+                        }
+                        for (uint8_t k = 0; k < ext->window.n_order_keys; k++) {
+                            if (ext->window.order_keys[k] && sp < (int)stack_cap)
+                                stack[sp++] = ext->window.order_keys[k]->id;
+                        }
+                        for (uint8_t f = 0; f < ext->window.n_funcs; f++) {
+                            if (ext->window.func_inputs[f] && sp < (int)stack_cap)
+                                stack[sp++] = ext->window.func_inputs[f]->id;
+                        }
+                        break;
+                    default:
+                        break;
                 }
             }
         }

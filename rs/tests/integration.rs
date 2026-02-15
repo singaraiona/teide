@@ -811,8 +811,10 @@ fn cancel_resets_between_queries() {
     let ctx = Context::new().unwrap();
     let table = ctx.read_csv(&path).unwrap();
 
-    // Set cancel before executing — the flag is reset at td_execute() entry,
-    // so the query should still succeed (the reset happens before any dispatch).
+    // Assumption: td_execute() resets the cancel flag at entry, before any
+    // morsel dispatch. This test relies on that C-side implementation detail.
+    // If td_execute changes to check the flag before resetting it, this test
+    // would fail and need updating.
     teide::cancel();
 
     let g = ctx.graph(&table).unwrap();

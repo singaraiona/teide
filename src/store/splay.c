@@ -34,6 +34,9 @@
  * Format:
  *   dir/.d        — I64 vector of column name symbol IDs
  *   dir/<colname> — column file per column
+ *
+ * No symlink check: local-trust file format; path traversal checks
+ * (rejecting '/', '\\', '..', leading '.') cover main attack vector.
  * -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------

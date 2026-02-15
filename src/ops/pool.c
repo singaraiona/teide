@@ -88,6 +88,8 @@ static void worker_loop(void* arg) {
  * -------------------------------------------------------------------------- */
 
 td_err_t td_pool_create(td_pool_t* pool, uint32_t n_workers) {
+    /* conc-L7: memset zeroes all fields including the `cancelled` atomic,
+     * which resets any cancellation state from a prior pool instance. */
     memset(pool, 0, sizeof(*pool));
 
     if (n_workers == 0) {
@@ -202,7 +204,10 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
     int64_t grain = TASK_GRAIN;
     uint32_t n_tasks = (uint32_t)((total_elems + grain - 1) / grain);
 
-    /* Grow ring if needed */
+    /* conc-L6: Ring growth is safe without synchronization because dispatch is
+     * single-producer: only the main thread (the dispatch caller) writes to
+     * task_head, tasks[], and task_cap. Workers only read via task_tail after
+     * the publish fence (task_count store-release). */
     if (n_tasks > pool->task_cap) {
         uint32_t new_cap = pool->task_cap;
         while (new_cap < n_tasks && new_cap < MAX_RING_CAP) new_cap *= 2;
@@ -379,17 +384,24 @@ td_pool_t* td_pool_get(void) {
             return NULL;
         }
     }
-    /* Spin while another thread initializes */
-    for (;;) {
-        uint32_t s = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
-        if (s == 2) return &g_pool;
-        if (s == 0) return NULL;  /* init failed or not started */
-        /* s == 1: still initializing, spin */
+    /* Spin while another thread initializes or destroys.
+     * M7: state==3 means the pool is being destroyed — treat as unavailable
+     * and wait for it to return to state 0 (then return NULL), or become
+     * state 2 if re-initialized by another thread. */
+    {
+        unsigned spin_count = 0;
+        for (;;) {
+            uint32_t s = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
+            if (s == 2) return &g_pool;
+            if (s == 0) return NULL;  /* init failed, not started, or destroy completed */
+            /* s == 1: still initializing, s == 3: destroying — spin */
 #if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
+            __builtin_ia32_pause();
 #elif defined(__aarch64__)
-        __asm__ volatile("yield" ::: "memory");
+            __asm__ volatile("yield" ::: "memory");
 #endif
+            if (++spin_count % 1024 == 0) sched_yield();
+        }
     }
 }
 
@@ -397,6 +409,10 @@ td_pool_t* td_pool_get(void) {
  * Public API wrappers (declared in td.h)
  * -------------------------------------------------------------------------- */
 
+/* conc-L4: If td_pool_init() is called when the pool is already initialized
+ * (state==2), the n_workers parameter is silently ignored and the existing
+ * pool configuration is preserved. This is by design — the pool is a
+ * singleton and reconfiguration requires td_pool_destroy() + td_pool_init(). */
 td_err_t td_pool_init(uint32_t n_workers) {
     uint32_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&g_pool_init_state, &expected, 1,

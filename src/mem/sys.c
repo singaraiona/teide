@@ -78,6 +78,9 @@ void td_sys_free(void* ptr) {
                                memory_order_relaxed);
 }
 
+/* L5: td_sys_realloc(ptr, 0) frees ptr and returns NULL, matching the
+ * behavior of some realloc implementations. Callers should not rely on
+ * this as a general-purpose free — use td_sys_free() explicitly. */
 void* td_sys_realloc(void* ptr, size_t new_size) {
     if (!ptr) return td_sys_alloc(new_size);
     if (new_size == 0) { td_sys_free(ptr); return NULL; }

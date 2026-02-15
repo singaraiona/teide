@@ -82,6 +82,7 @@ void td_sym_init(void) {
         return; /* already initialized by another thread */
 
     g_sym.bucket_cap = SYM_INIT_CAP;
+    /* td_sys_alloc uses mmap(MAP_ANONYMOUS) which zero-initializes. */
     g_sym.buckets = (uint64_t*)td_sys_alloc(g_sym.bucket_cap * sizeof(uint64_t));
     if (!g_sym.buckets) {
         atomic_store_explicit(&g_sym_inited, false, memory_order_release);
@@ -238,13 +239,17 @@ int64_t td_sym_intern(const char* str, size_t len) {
 int64_t td_sym_find(const char* str, size_t len) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
 
+    /* Lock required: concurrent td_sym_intern may trigger ht_grow which
+     * frees and replaces g_sym.buckets — reading without lock is UAF. */
+    sym_lock();
+
     uint32_t hash = fnv1a(str, len);
     uint32_t mask = g_sym.bucket_cap - 1;
     uint32_t slot = hash & mask;
 
     for (;;) {
         uint64_t e = g_sym.buckets[slot];
-        if (e == 0) return -1;  /* empty — not found */
+        if (e == 0) { sym_unlock(); return -1; }  /* empty — not found */
 
         uint32_t e_hash = (uint32_t)(e >> 32);
         if (e_hash == hash) {
@@ -252,6 +257,7 @@ int64_t td_sym_find(const char* str, size_t len) {
             td_t* existing = g_sym.strings[e_id];
             if (td_str_len(existing) == len &&
                 memcmp(td_str_ptr(existing), str, len) == 0) {
+                sym_unlock();
                 return (int64_t)e_id;
             }
         }
@@ -263,10 +269,17 @@ int64_t td_sym_find(const char* str, size_t len) {
  * td_sym_str
  * -------------------------------------------------------------------------- */
 
+/* Returns unretained internal pointer. Caller must not store across sym table
+ * mutations (ht_grow). Safe during read-only access phase. */
 td_t* td_sym_str(int64_t id) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return NULL;
-    if (id < 0 || (uint32_t)id >= g_sym.str_count) return NULL;
-    return g_sym.strings[id];
+
+    /* Lock required: concurrent td_sym_intern may realloc g_sym.strings. */
+    sym_lock();
+    if (id < 0 || (uint32_t)id >= g_sym.str_count) { sym_unlock(); return NULL; }
+    td_t* s = g_sym.strings[id];
+    sym_unlock();
+    return s;
 }
 
 /* --------------------------------------------------------------------------
@@ -275,7 +288,12 @@ td_t* td_sym_str(int64_t id) {
 
 uint32_t td_sym_count(void) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return 0;
-    return g_sym.str_count;
+
+    /* Lock required: concurrent td_sym_intern may modify str_count. */
+    sym_lock();
+    uint32_t count = g_sym.str_count;
+    sym_unlock();
+    return count;
 }
 
 /* --------------------------------------------------------------------------

@@ -37,7 +37,7 @@ static uint8_t ceil_log2(size_t n) {
 }
 
 uint8_t td_order_for_size(size_t data_size) {
-    if (data_size > SIZE_MAX - 32) return TD_ORDER_MAX + 1;
+    if (data_size > SIZE_MAX - 32) return TD_ORDER_SENTINEL;
     size_t total = data_size + 32;  /* header is 32 bytes */
     uint8_t k = ceil_log2(total);
     if (k < TD_ORDER_MIN) k = TD_ORDER_MIN;
@@ -243,6 +243,9 @@ td_t* td_buddy_alloc(td_buddy_t* b, uint8_t order) {
  * -------------------------------------------------------------------------- */
 
 void td_buddy_free(td_buddy_t* b, td_t* block, uint8_t order) {
+    /* M3: Validate order to prevent out-of-bounds bitmap access */
+    if (order < TD_ORDER_MIN || order > TD_ORDER_MAX) return;
+
     uint8_t* ptr = (uint8_t*)block;
     size_t offset = (size_t)(ptr - b->base);
 

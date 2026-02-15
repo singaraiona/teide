@@ -25,6 +25,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -316,6 +318,9 @@ pub fn sym_intern(s: &str) -> i64 {
 /// Only one `Context` should exist at a time. The C engine uses global state.
 pub struct Context {
     engine: Arc<EngineGuard>,
+    /// Cache of opened parted tables, keyed by "db_root/table_name" path.
+    /// Avoids re-opening (mmap + sym_load) on every query.
+    parted_cache: RefCell<HashMap<String, Table>>,
     // *mut () makes Context !Send + !Sync (C engine uses thread-local arenas)
     _not_send_sync: PhantomData<*mut ()>,
 }
@@ -327,6 +332,7 @@ impl Context {
         let engine = acquire_engine_guard()?;
         Ok(Context {
             engine,
+            parted_cache: RefCell::new(HashMap::new()),
             _not_send_sync: PhantomData,
         })
     }
@@ -371,16 +377,29 @@ impl Context {
     /// `db_root` is the database directory (e.g. `/tmp/teide_db`),
     /// `table_name` is the table name within each date partition.
     /// The symfile at `db_root/sym` is loaded automatically.
+    /// Results are cached — subsequent calls with the same path return a
+    /// clone_ref of the cached table (no re-open, no sym_load).
     pub fn part_open(&self, db_root: &str, table_name: &str) -> Result<Table> {
+        let cache_key = format!("{db_root}/{table_name}");
+
+        // Return cached table if available
+        if let Some(cached) = self.parted_cache.borrow().get(&cache_key) {
+            return Ok(cached.clone_ref());
+        }
+
         let c_root = CString::new(db_root).map_err(|_| Error::InvalidInput)?;
         let c_name = CString::new(table_name).map_err(|_| Error::InvalidInput)?;
         let ptr = unsafe { ffi::td_part_open(c_root.as_ptr(), c_name.as_ptr()) };
         let ptr = check_ptr(ptr)?;
-        Ok(Table {
+        let table = Table {
             raw: ptr,
             engine: self.engine.clone(),
             _not_send_sync: PhantomData,
-        })
+        };
+
+        // Cache for future queries
+        self.parted_cache.borrow_mut().insert(cache_key, table.clone_ref());
+        Ok(table)
     }
 
     /// Create a new operation graph bound to a table.

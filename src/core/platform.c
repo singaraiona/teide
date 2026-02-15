@@ -73,6 +73,26 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
     return p;
 }
 
+void* td_vm_map_file_ro(const char* path, size_t* out_size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t len = (size_t)st.st_size;
+    void* p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (p == MAP_FAILED) return NULL;
+
+    *out_size = len;
+    return p;
+}
+
 void td_vm_unmap_file(void* ptr, size_t size) {
     if (ptr) munmap(ptr, size);
 }
@@ -223,6 +243,33 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
     void* p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
 
     /* We can close both handles; the mapping keeps the file open internally. */
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+
+    if (!p) return NULL;
+
+    *out_size = (size_t)file_size.QuadPart;
+    return p;
+}
+
+void* td_vm_map_file_ro(const char* path, size_t* out_size) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(hFile, &file_size)) {
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    void* p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(hMap);
     CloseHandle(hFile);
 

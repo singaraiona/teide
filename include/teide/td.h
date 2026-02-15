@@ -449,6 +449,7 @@ typedef void (*td_thread_fn)(void* arg);
 void* td_vm_alloc(size_t size);
 void  td_vm_free(void* ptr, size_t size);
 void* td_vm_map_file(const char* path, size_t* out_size);
+void* td_vm_map_file_ro(const char* path, size_t* out_size);
 void  td_vm_unmap_file(void* ptr, size_t size);
 void  td_vm_advise_seq(void* ptr, size_t size);
 void  td_vm_release(void* ptr, size_t size);
@@ -665,6 +666,7 @@ td_t* td_execute(td_graph_t* g, td_op_t* root);
 /* Column file I/O */
 td_err_t td_col_save(td_t* vec, const char* path);
 td_t*    td_col_load(const char* path);
+td_t*    td_col_mmap(const char* path);
 
 /* Splayed table I/O */
 td_err_t td_splay_save(td_t* tbl, const char* dir);

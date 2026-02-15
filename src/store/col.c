@@ -143,3 +143,55 @@ td_t* td_col_load(const char* path) {
 
     return vec;
 }
+
+/* --------------------------------------------------------------------------
+ * td_col_mmap — zero-copy column load via mmap (mmod=1)
+ *
+ * Returns a td_t* backed directly by the file's mmap region.
+ * MAP_PRIVATE gives COW semantics — only the header page gets a private
+ * copy when we write mmod/rc. All data pages stay shared with page cache.
+ * td_release -> td_free -> munmap.
+ * -------------------------------------------------------------------------- */
+
+td_t* td_col_mmap(const char* path) {
+    if (!path) return TD_ERR_PTR(TD_ERR_IO);
+
+    size_t mapped_size = 0;
+    void* ptr = td_vm_map_file(path, &mapped_size);
+    if (!ptr) return TD_ERR_PTR(TD_ERR_IO);
+
+    if (mapped_size < 32) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    td_t* vec = (td_t*)ptr;
+
+    /* Validate type from untrusted file data */
+    if (vec->type == TD_STR || vec->type == TD_LIST || vec->type == TD_TABLE) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_NYI);
+    }
+    if (vec->type <= 0 || vec->type >= TD_TYPE_COUNT) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+    if (vec->len < 0) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    uint8_t esz = td_elem_size(vec->type);
+    size_t data_size = (size_t)vec->len * esz;
+    if (32 + data_size > mapped_size) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
+    /* Patch header — MAP_PRIVATE COW: only the header page gets copied */
+    vec->mmod = 1;
+    vec->order = 0;
+    atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
+
+    return vec;
+}

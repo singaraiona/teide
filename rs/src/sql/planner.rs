@@ -1004,7 +1004,7 @@ fn resolve_table(
     // Try CSV first (normalize_path appends .csv if no extension)
     let path = normalize_path(name);
     match ctx.read_csv(&path) {
-        Ok(table) => return Ok(table),
+        Ok(table) => Ok(table),
         Err(_csv_err) => {
             // Try parted table: interpret as db_root/table_name
             if let Some(pos) = stripped.rfind('/') {

@@ -131,7 +131,7 @@ td_t* td_splay_load(const char* dir) {
             memchr(name, '\0', name_len))
             continue;
 
-        int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+        path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) continue;
 
         td_t* col = td_col_load(path);

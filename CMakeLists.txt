@@ -8,7 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(TEIDE_PORTABLE "Build portable binary (no -march=native)" OFF)
 
 # Collect all source files under src/
-file(GLOB_RECURSE TEIDE_SOURCES "src/**/*.c")
+file(GLOB_RECURSE TEIDE_SOURCES CONFIGURE_DEPENDS "src/**/*.c")
 
 # Static library
 add_library(teide_static STATIC ${TEIDE_SOURCES})
@@ -60,7 +60,7 @@ endif()
 
 # Test executable
 enable_testing()
-file(GLOB TEST_SOURCES "test/*.c")
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "test/*.c")
 if(TEST_SOURCES)
     add_executable(test_teide ${TEST_SOURCES})
     target_link_libraries(test_teide PRIVATE teide_static)

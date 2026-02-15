@@ -408,10 +408,9 @@ td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_va
     td_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
 
-    /* Re-resolve after potential realloc */
+    /* Re-resolve after potential realloc (else_val stored as index, not pointer) */
     cond = &g->nodes[cond_id];
     then_val = &g->nodes[then_id];
-    else_val = &g->nodes[else_id];
 
     ext->base.opcode = OP_IF;
     ext->base.arity = 2;  /* inputs[0]=cond, inputs[1]=then; else via ext */

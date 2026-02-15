@@ -53,7 +53,7 @@ pub const TD_MAPCOMMON: i8 = 48;
 
 #[inline]
 pub fn td_is_parted(t: i8) -> bool {
-    t >= TD_PARTED_BASE && t < TD_MAPCOMMON
+    (TD_PARTED_BASE..TD_MAPCOMMON).contains(&t)
 }
 
 #[inline]

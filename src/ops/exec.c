@@ -2786,7 +2786,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         uint64_t range = (uint64_t)(kmax - kmin);
-                        uint8_t bits = (range == 0) ? 1 : 1;
+                        uint8_t bits = 1;
                         while (((uint64_t)1 << bits) <= range && bits < 64)
                             bits++;
                         total_bits += bits;
@@ -2824,7 +2824,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         uint64_t range = (uint64_t)(kmax - kmin);
-                        uint8_t bits = (range == 0) ? 1 : 1;
+                        uint8_t bits = 1;
                         while (((uint64_t)1 << bits) <= range && bits < 64)
                             bits++;
                         total_bits += bits;
@@ -2840,7 +2840,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                     for (int k = n_sort - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
                         uint64_t range = (uint64_t)(maxs[k] - mins[k]);
-                        uint8_t bits = (range == 0) ? 1 : 1;
+                        uint8_t bits = 1;
                         while (((uint64_t)1 << bits) <= range && bits < 64)
                             bits++;
                         accum += bits;

@@ -540,6 +540,108 @@ static MunitResult test_part_open(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
+/* ---- test_group_parted ------------------------------------------------- */
+
+static MunitResult test_group_parted(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Build a 2-partition parted table with columns id1 (I64) and v1 (I64).
+     * Partition 0: id1=[0,0,1,1,2], v1=[10,20,30,40,50]
+     * Partition 1: id1=[0,1,1,2,2], v1=[60,70,80,90,100]
+     * GROUP BY id1 SUM(v1) should give:
+     *   id1=0: 10+20+60 = 90
+     *   id1=1: 30+40+70+80 = 220
+     *   id1=2: 50+90+100 = 240
+     */
+
+    /* Build segment vectors */
+    td_t* id1_0 = td_vec_new(TD_I64, 5);
+    td_t* v1_0  = td_vec_new(TD_I64, 5);
+    munit_assert_ptr_not_null(id1_0);
+    munit_assert_ptr_not_null(v1_0);
+    id1_0->len = v1_0->len = 5;
+    int64_t id1_0_data[] = {0,0,1,1,2};
+    int64_t v1_0_data[]  = {10,20,30,40,50};
+    memcpy(td_data(id1_0), id1_0_data, sizeof(id1_0_data));
+    memcpy(td_data(v1_0),  v1_0_data,  sizeof(v1_0_data));
+
+    td_t* id1_1 = td_vec_new(TD_I64, 5);
+    td_t* v1_1  = td_vec_new(TD_I64, 5);
+    munit_assert_ptr_not_null(id1_1);
+    munit_assert_ptr_not_null(v1_1);
+    id1_1->len = v1_1->len = 5;
+    int64_t id1_1_data[] = {0,1,1,2,2};
+    int64_t v1_1_data[]  = {60,70,80,90,100};
+    memcpy(td_data(id1_1), id1_1_data, sizeof(id1_1_data));
+    memcpy(td_data(v1_1),  v1_1_data,  sizeof(v1_1_data));
+
+    /* Build parted columns (2 segments each) */
+    td_t* id1_parted = td_alloc(2 * sizeof(td_t*));
+    munit_assert_ptr_not_null(id1_parted);
+    id1_parted->type = TD_PARTED_BASE + TD_I64;
+    id1_parted->len = 2;
+    ((td_t**)td_data(id1_parted))[0] = id1_0;
+    ((td_t**)td_data(id1_parted))[1] = id1_1;
+
+    td_t* v1_parted = td_alloc(2 * sizeof(td_t*));
+    munit_assert_ptr_not_null(v1_parted);
+    v1_parted->type = TD_PARTED_BASE + TD_I64;
+    v1_parted->len = 2;
+    ((td_t**)td_data(v1_parted))[0] = v1_0;
+    ((td_t**)td_data(v1_parted))[1] = v1_1;
+
+    /* Build parted table */
+    int64_t sym_id1 = td_sym_intern("id1", 3);
+    int64_t sym_v1  = td_sym_intern("v1",  2);
+
+    td_t* tbl = td_table_new(2);
+    munit_assert_ptr_not_null(tbl);
+    tbl = td_table_add_col(tbl, sym_id1, id1_parted);
+    tbl = td_table_add_col(tbl, sym_v1,  v1_parted);
+    munit_assert_int(td_table_nrows(tbl), ==, 10);
+
+    /* Build graph: GROUP BY id1 SUM(v1) */
+    td_graph_t* g = td_graph_new(tbl);
+    munit_assert_ptr_not_null(g);
+    td_op_t* scan_id1 = td_scan(g, "id1");
+    td_op_t* scan_v1  = td_scan(g, "v1");
+    td_op_t* keys[] = { scan_id1 };
+    uint16_t ops[]  = { OP_SUM };
+    td_op_t* ins[]  = { scan_v1 };
+    td_op_t* root = td_group(g, keys, 1, ops, ins, 1);
+    root = td_optimize(g, root);
+    td_t* result = td_execute(g, root);
+
+    munit_assert_ptr_not_null(result);
+    munit_assert_false(TD_IS_ERR(result));
+    munit_assert_int(td_table_nrows(result), ==, 3); /* groups: 0, 1, 2 */
+
+    /* Verify sums — extract key and agg columns, match by key value */
+    td_t* rk = td_table_get_col_idx(result, 0); /* id1 key column */
+    td_t* rv = td_table_get_col_idx(result, 1); /* v1_sum agg column */
+    munit_assert_ptr_not_null(rk);
+    munit_assert_ptr_not_null(rv);
+
+    int64_t* rk_data = (int64_t*)td_data(rk);
+    int64_t* rv_data = (int64_t*)td_data(rv);
+    int64_t expected_sums[3] = {0, 0, 0}; /* for keys 0, 1, 2 */
+    for (int i = 0; i < 3; i++) {
+        int64_t key = rk_data[i];
+        munit_assert_true(key >= 0 && key <= 2);
+        expected_sums[key] = rv_data[i];
+    }
+    munit_assert_int(expected_sums[0], ==, 90);
+    munit_assert_int(expected_sums[1], ==, 220);
+    munit_assert_int(expected_sums[2], ==, 240);
+
+    td_release(result);
+    td_graph_free(g);
+    td_release(id1_parted);
+    td_release(v1_parted);
+    td_release(tbl);
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest store_tests[] = {
@@ -554,6 +656,7 @@ static MunitTest store_tests[] = {
     { "/table_nrows_parted",  test_table_nrows_parted,   store_setup, store_teardown, 0, NULL },
     { "/parted_release",      test_parted_release,        store_setup, store_teardown, 0, NULL },
     { "/part_open",            test_part_open,            store_setup, store_teardown, 0, NULL },
+    { "/group_parted",         test_group_parted,         store_setup, store_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

@@ -4308,8 +4308,98 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     }
 }
 
+/* ============================================================================
+ * Partition-aware group-by: detect parted columns, concatenate segments into
+ * a flat table, then run standard exec_group once.
+ * ============================================================================ */
+static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl); /* forward decl */
+
+static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
+    int64_t ncols = td_table_ncols(parted_tbl);
+    if (ncols <= 0) return TD_ERR_PTR(TD_ERR_NYI);
+
+    /* Find partition count and total rows from first parted column */
+    int32_t n_parts = 0;
+    int64_t total_rows = 0;
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(parted_tbl, c);
+        if (col && TD_IS_PARTED(col->type)) {
+            n_parts = (int32_t)col->len;
+            total_rows = td_parted_nrows(col);
+            break;
+        }
+    }
+    if (n_parts <= 0 || total_rows <= 0) return TD_ERR_PTR(TD_ERR_NYI);
+
+    /* Build flat table: concatenate segment vectors per column */
+    td_t* flat_tbl = td_table_new(ncols);
+    if (!flat_tbl || TD_IS_ERR(flat_tbl)) return flat_tbl;
+
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(parted_tbl, c);
+        int64_t name_id = td_table_col_name(parted_tbl, c);
+        if (!col) continue;
+
+        if (col->type == TD_MAPCOMMON) {
+            /* Skip MAPCOMMON — partition key groupby not yet supported */
+            continue;
+        }
+
+        if (!TD_IS_PARTED(col->type)) {
+            /* Non-parted column (shouldn't occur in parted table, but be safe) */
+            td_retain(col);
+            flat_tbl = td_table_add_col(flat_tbl, name_id, col);
+            td_release(col);
+            continue;
+        }
+
+        /* Parted column: concatenate segments into one flat vector */
+        int8_t base_type = (int8_t)TD_PARTED_BASETYPE(col->type);
+        td_t* flat = td_vec_new(base_type, total_rows);
+        if (!flat || TD_IS_ERR(flat)) {
+            td_release(flat_tbl);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        flat->len = total_rows;
+
+        td_t** segs = (td_t**)td_data(col);
+        size_t elem_size = (size_t)td_elem_size(base_type);
+        int64_t offset = 0;
+        for (int32_t p = 0; p < n_parts; p++) {
+            td_t* seg = segs[p];
+            if (!seg || seg->len <= 0) continue;
+            memcpy((char*)td_data(flat) + (size_t)offset * elem_size,
+                   td_data(seg), (size_t)seg->len * elem_size);
+            offset += seg->len;
+        }
+
+        flat_tbl = td_table_add_col(flat_tbl, name_id, flat);
+        td_release(flat);
+    }
+
+    /* Run standard exec_group on the flat table */
+    td_t* saved = g->table;
+    g->table = flat_tbl;
+    td_t* result = exec_group(g, op, flat_tbl);
+    g->table = saved;
+
+    td_release(flat_tbl);
+    return result;
+}
+
 static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
     if (!tbl || TD_IS_ERR(tbl)) return tbl;
+
+    /* Parted dispatch: detect parted input columns */
+    {
+        int64_t nc = td_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            td_t* col = td_table_get_col_idx(tbl, c);
+            if (col && (TD_IS_PARTED(col->type) || col->type == TD_MAPCOMMON)) {
+                return exec_group_parted(g, op, tbl);
+            }
+        }
+    }
 
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);

@@ -132,10 +132,19 @@ def main():
             print(f"Opened: {nrows:,} total rows x {ncols} cols (parted) in {open_ms:.1f} ms")
             print(f"  (includes {ncols - 1} data cols + 1 MAPCOMMON virtual partition col)")
 
-            # Note: running queries on parted tables requires Phase 3
-            # (partition-aware executor). For now, just verify the table is
-            # structurally correct.
-            print(f"  td_table_nrows = {nrows:,}")
+            # Run groupby benchmarks on the parted table
+            print(f"\n  {'Query':12s}  {'Time':>8s}       Result")
+            print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
+
+            run_groupby(lib, parted_tbl, "q1", ["id1"], [OP_SUM], ["v1"])
+            run_groupby(lib, parted_tbl, "q2", ["id1", "id2"], [OP_SUM], ["v1"])
+            run_groupby(lib, parted_tbl, "q3", ["id3"], [OP_SUM, OP_AVG], ["v1", "v3"])
+            run_groupby(lib, parted_tbl, "q4", ["id4"], [OP_AVG, OP_AVG, OP_AVG], ["v1", "v2", "v3"])
+            run_groupby(lib, parted_tbl, "q5", ["id6"], [OP_SUM, OP_SUM, OP_SUM], ["v1", "v2", "v3"])
+            run_groupby(lib, parted_tbl, "q6", ["id3"], [OP_MAX, OP_MIN], ["v1", "v2"])
+            run_groupby(lib, parted_tbl, "q7",
+                        ["id1", "id2", "id3", "id4", "id5", "id6"],
+                        [OP_SUM, OP_COUNT], ["v3", "v1"])
 
             lib.release(parted_tbl)
         print()

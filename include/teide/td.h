@@ -449,7 +449,6 @@ typedef void (*td_thread_fn)(void* arg);
 void* td_vm_alloc(size_t size);
 void  td_vm_free(void* ptr, size_t size);
 void* td_vm_map_file(const char* path, size_t* out_size);
-void* td_vm_map_file_ro(const char* path, size_t* out_size);
 void  td_vm_unmap_file(void* ptr, size_t size);
 void  td_vm_advise_seq(void* ptr, size_t size);
 void  td_vm_release(void* ptr, size_t size);

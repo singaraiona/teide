@@ -458,9 +458,11 @@ void td_free(td_t* v) {
     }
 
     if (v->mmod == 1) {
-        uint8_t esz = td_elem_size(v->type);
-        size_t mapped_size = 32 + (size_t)v->len * esz;
-        td_vm_unmap_file(v, mapped_size);
+        if (v->type > 0 && v->type < TD_TYPE_COUNT) {
+            uint8_t esz = td_elem_size(v->type);
+            size_t mapped_size = 32 + (size_t)v->len * esz;
+            td_vm_unmap_file(v, mapped_size);
+        }
         td_tl_stats.free_count++;
         return;
     }

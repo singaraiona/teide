@@ -998,17 +998,35 @@ fn resolve_table(
         }
     }
 
-    // Fall back to CSV file (only if it looks like a path)
+    // Fall back to CSV file or parted table
+    let stripped = name.trim_matches('\'').trim_matches('"');
+
+    // Try CSV first (normalize_path appends .csv if no extension)
     let path = normalize_path(name);
-    ctx.read_csv(&path).map_err(|e| {
-        // If the name looks like a bare identifier (no path separators, no extension),
-        // report it as a missing table rather than an I/O error.
-        if !name.contains('/') && !name.contains('\\') && !name.contains('.') {
-            SqlError::Plan(format!("Table '{}' not found", name))
-        } else {
-            SqlError::from(e)
+    match ctx.read_csv(&path) {
+        Ok(table) => return Ok(table),
+        Err(_csv_err) => {
+            // Try parted table: interpret as db_root/table_name
+            if let Some(pos) = stripped.rfind('/') {
+                let db_root = &stripped[..pos];
+                let table_name = &stripped[pos + 1..];
+                if !db_root.is_empty() && !table_name.is_empty() {
+                    if let Ok(table) = ctx.part_open(db_root, table_name) {
+                        return Ok(table);
+                    }
+                }
+            }
+
+            // Neither CSV nor parted succeeded
+            if !name.contains('/') && !name.contains('\\') && !name.contains('.') {
+                Err(SqlError::Plan(format!("Table '{}' not found", name)))
+            } else {
+                Err(SqlError::Plan(format!(
+                    "Could not open '{}' as CSV or partitioned table", stripped
+                )))
+            }
         }
-    })
+    }
 }
 
 /// Extract equi-join keys from an ON condition.
@@ -2494,6 +2512,11 @@ fn validate_result_table(table: &Table) -> Result<(), SqlError> {
                 table.col_name_str(col_idx as usize),
                 col_type
             )));
+        }
+        // TD_PARTED and MAPCOMMON columns: len = partition count, not row count.
+        // Skip the length check — td_table_nrows() already handles them correctly.
+        if crate::ffi::td_is_parted(col_type) || col_type == crate::ffi::TD_MAPCOMMON {
+            continue;
         }
         let len = unsafe { crate::raw::td_len(col) };
         if len != nrows {

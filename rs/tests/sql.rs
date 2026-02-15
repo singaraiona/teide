@@ -1565,3 +1565,207 @@ fn variance_single_element_group_returns_nan() {
     let vr = r.table.get_f64(1, 0).unwrap();
     assert!(vr.is_nan(), "VARIANCE of single-element group should be NaN, got {vr}");
 }
+
+// ---------------------------------------------------------------------------
+// Parted table SQL tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a small 2-partition parted DB in a tempdir.
+/// Returns (tempdir, db_root_path).
+fn create_parted_db() -> (tempfile::TempDir, String) {
+    use std::ffi::CString;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_root = dir.path().to_str().unwrap().to_string();
+
+    // Create test CSV on disk
+    let (file, csv_path) = create_test_csv();
+
+    // Read CSV into a table
+    let ctx = teide::Context::new().unwrap();
+    let full_table = ctx.read_csv(&csv_path).unwrap();
+    let nrows = full_table.nrows();
+    let ncols = full_table.ncols();
+    assert!(nrows == 20);
+
+    let half = nrows / 2; // 10 rows per partition
+
+    // Create 2 partitions: 2024.01.01 and 2024.01.02
+    for part in 0..2i64 {
+        let start = part * half;
+        let prows = if part == 1 { nrows - start } else { half };
+        let date_str = format!("2024.01.{:02}", part + 1);
+        let part_dir = format!("{db_root}/{date_str}/data");
+        std::fs::create_dir_all(&part_dir).unwrap();
+
+        unsafe {
+            let mut sub_tbl = teide::ffi::td_table_new(ncols);
+            for c in 0..ncols {
+                let col = teide::ffi::td_table_get_col_idx(full_table.as_raw(), c);
+                let name_id = teide::ffi::td_table_col_name(full_table.as_raw(), c);
+                let sliced = teide::ffi::td_vec_slice(col, start, prows);
+                assert!(!sliced.is_null());
+                sub_tbl = teide::ffi::td_table_add_col(sub_tbl, name_id, sliced);
+                teide::ffi::td_release(sliced);
+            }
+
+            let c_dir = CString::new(part_dir.as_str()).unwrap();
+            let sym_path = format!("{db_root}/sym");
+            let c_sym = CString::new(sym_path.as_str()).unwrap();
+            let err = teide::ffi::td_splay_save(sub_tbl, c_dir.as_ptr(), c_sym.as_ptr());
+            assert_eq!(err, teide::ffi::td_err_t::TD_OK, "splay_save failed for partition {part}");
+            teide::ffi::td_release(sub_tbl);
+        }
+    }
+
+    // Save shared symfile
+    unsafe {
+        let sym_path = format!("{db_root}/sym");
+        let c_sym = CString::new(sym_path.as_str()).unwrap();
+        let err = teide::ffi::td_sym_save(c_sym.as_ptr());
+        assert_eq!(err, teide::ffi::td_err_t::TD_OK, "sym_save failed");
+    }
+
+    drop(full_table);
+    drop(ctx);
+    drop(file);
+    (dir, db_root)
+}
+
+#[test]
+fn parted_sql_groupby() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    // Query the parted table via path syntax: 'db_root/table_name'
+    let r = unwrap_query(
+        session
+            .execute(&format!("SELECT id1, SUM(v1) as s FROM '{db_root}/data' GROUP BY id1 ORDER BY id1"))
+            .unwrap(),
+    );
+
+    // 5 distinct id1 groups (id001..id005), 20 rows total
+    assert_eq!(r.table.nrows(), 5, "expected 5 groups");
+
+    // Verify first group: id001 has v1 = 1+2+3+4 = 10
+    let sum0 = r.table.get_i64(1, 0).or_else(|| r.table.get_f64(1, 0).map(|f| f as i64));
+    assert_eq!(sum0, Some(10), "SUM(v1) for id001 should be 10");
+}
+
+#[test]
+fn parted_sql_count() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    let r = unwrap_query(
+        session
+            .execute(&format!("SELECT COUNT(*) as cnt FROM '{db_root}/data'"))
+            .unwrap(),
+    );
+
+    assert_eq!(r.table.nrows(), 1);
+    let cnt = r.table.get_i64(0, 0).unwrap();
+    assert_eq!(cnt, 20, "parted table should have 20 rows total");
+}
+
+#[test]
+fn parted_sql_create_table_as_groupby() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    // Register a derived table from a GROUP BY on the parted table
+    session
+        .execute(&format!(
+            "CREATE TABLE agg AS SELECT id1, SUM(v1) as s FROM '{db_root}/data' GROUP BY id1"
+        ))
+        .unwrap();
+
+    // Query the registered (flat) table
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, s FROM agg ORDER BY id1")
+            .unwrap(),
+    );
+
+    assert_eq!(r.table.nrows(), 5, "expected 5 groups from registered agg table");
+}
+
+#[test]
+fn parted_sql_multi_key_groupby() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    // Multi-key GROUP BY on parted table
+    let r = unwrap_query(
+        session
+            .execute(&format!(
+                "SELECT id1, id2, SUM(v1) as s FROM '{db_root}/data' GROUP BY id1, id2 ORDER BY id1, id2"
+            ))
+            .unwrap(),
+    );
+
+    // 5 id1 values × 2 id2 values = 10 groups
+    assert_eq!(r.table.nrows(), 10, "expected 10 groups for (id1, id2)");
+}
+
+#[test]
+fn parted_sql_select_star() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    // SELECT * on a parted table — should see all 20 rows
+    let r = unwrap_query(
+        session
+            .execute(&format!("SELECT * FROM '{db_root}/data'"))
+            .unwrap(),
+    );
+
+    assert_eq!(r.table.nrows(), 20, "SELECT * should return all 20 rows");
+    // 9 data columns (no MAPCOMMON in result since we didn't add Date)
+    assert!(r.table.ncols() >= 9, "expected at least 9 columns");
+
+    // Verify row access works across partition boundaries
+    // First partition has rows 0-9, second has rows 10-19
+    let v1_row0 = r.table.get_i64(6, 0); // v1 col, first row
+    let v1_row10 = r.table.get_i64(6, 10); // v1 col, first row of 2nd partition
+    assert!(v1_row0.is_some(), "should read v1 from partition 0");
+    assert!(v1_row10.is_some(), "should read v1 from partition 1");
+
+    // id1 is ENUM column — verify string access works across partitions
+    let id1_row0 = r.table.get_str(0, 0);
+    let id1_row19 = r.table.get_str(0, 19);
+    assert!(id1_row0.is_some(), "should read id1 from first row");
+    assert!(id1_row19.is_some(), "should read id1 from last row");
+}
+
+#[test]
+fn parted_sql_create_table_select_star() {
+    let _guard = ENGINE_LOCK.lock().unwrap();
+    let (_dir, db_root) = create_parted_db();
+
+    let mut session = Session::new().unwrap();
+
+    // CREATE TABLE AS SELECT * from parted table
+    session
+        .execute(&format!("CREATE TABLE flat AS SELECT * FROM '{db_root}/data'"))
+        .unwrap();
+
+    // Query the registered table — should work with GROUP BY
+    let r = unwrap_query(
+        session
+            .execute("SELECT id1, SUM(v1) as s FROM flat GROUP BY id1 ORDER BY id1")
+            .unwrap(),
+    );
+
+    assert_eq!(r.table.nrows(), 5, "expected 5 groups from registered flat table");
+}

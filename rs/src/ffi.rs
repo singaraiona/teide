@@ -46,6 +46,20 @@ pub const TD_ENUM: i8 = 15;
 
 pub const TD_TYPE_COUNT: usize = 16;
 
+// Parted types
+pub const TD_PARTED_BASE: i8 = 32;
+pub const TD_MAPCOMMON: i8 = 48;
+
+#[inline]
+pub fn td_is_parted(t: i8) -> bool {
+    t >= TD_PARTED_BASE && t < TD_MAPCOMMON
+}
+
+#[inline]
+pub fn td_parted_basetype(t: i8) -> i8 {
+    t - TD_PARTED_BASE
+}
+
 // Atom variants (negative type tags)
 pub const TD_ATOM_BOOL: i8 = -TD_BOOL;
 pub const TD_ATOM_U8: i8 = -TD_U8;
@@ -793,8 +807,13 @@ extern "C" {
     pub fn td_splay_load(dir: *const c_char) -> *mut td_t;
     pub fn td_splay_open(dir: *const c_char, sym_path: *const c_char) -> *mut td_t;
     pub fn td_part_load(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
+    pub fn td_part_open(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
     pub fn td_meta_save_d(schema: *mut td_t, path: *const c_char) -> td_err_t;
     pub fn td_meta_load_d(path: *const c_char) -> *mut td_t;
+
+    // --- Symbol Persistence ---
+    pub fn td_sym_save(path: *const c_char) -> td_err_t;
+    pub fn td_sym_load(path: *const c_char) -> td_err_t;
 
     // --- CSV API ---
     pub fn td_csv_read(path: *const c_char) -> *mut td_t;

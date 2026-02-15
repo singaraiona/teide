@@ -366,6 +366,23 @@ impl Context {
         })
     }
 
+    /// Open a partitioned table from disk (zero-copy mmap).
+    ///
+    /// `db_root` is the database directory (e.g. `/tmp/teide_db`),
+    /// `table_name` is the table name within each date partition.
+    /// The symfile at `db_root/sym` is loaded automatically.
+    pub fn part_open(&self, db_root: &str, table_name: &str) -> Result<Table> {
+        let c_root = CString::new(db_root).map_err(|_| Error::InvalidInput)?;
+        let c_name = CString::new(table_name).map_err(|_| Error::InvalidInput)?;
+        let ptr = unsafe { ffi::td_part_open(c_root.as_ptr(), c_name.as_ptr()) };
+        let ptr = check_ptr(ptr)?;
+        Ok(Table {
+            raw: ptr,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        })
+    }
+
     /// Create a new operation graph bound to a table.
     pub fn graph<'a>(&self, table: &'a Table) -> Result<Graph<'a>> {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
@@ -556,53 +573,102 @@ impl Table {
     }
 
     /// Type tag of the column at `idx`.
+    /// For parted columns, returns the base type (e.g. TD_I64 not TD_PARTED_BASE+TD_I64).
     pub fn col_type(&self, idx: usize) -> i8 {
         match self.get_col_idx(idx as i64) {
-            Some(col) => unsafe { ffi::td_type(col) },
+            Some(col) => {
+                let t = unsafe { ffi::td_type(col) };
+                if ffi::td_is_parted(t) {
+                    ffi::td_parted_basetype(t)
+                } else {
+                    t
+                }
+            }
             None => 0,
         }
+    }
+
+    /// Resolve a logical row in a TD_PARTED column to (segment_data_ptr, local_row).
+    /// Returns None if the row is out of range.
+    unsafe fn resolve_parted_row(vec: *mut ffi::td_t, row: usize) -> Option<(*mut ffi::td_t, usize)> {
+        let n_segs = unsafe { ffi::td_len(vec) } as usize;
+        let segs = unsafe { ffi::td_data(vec) as *const *mut ffi::td_t };
+        let mut offset = 0usize;
+        for s in 0..n_segs {
+            let seg = unsafe { *segs.add(s) };
+            if seg.is_null() { continue; }
+            let seg_len = unsafe { ffi::td_len(seg) } as usize;
+            if row < offset + seg_len {
+                return Some((seg, row - offset));
+            }
+            offset += seg_len;
+        }
+        None
     }
 
     /// Read an i64 value from column `col`, row `row`.
     pub fn get_i64(&self, col: usize, row: usize) -> Option<i64> {
         let vec = self.get_col_idx(col as i64)?;
+        let t = unsafe { ffi::td_type(vec) };
+
+        // Handle parted columns: resolve to segment
+        if ffi::td_is_parted(t) {
+            let (seg, local_row) = unsafe { Self::resolve_parted_row(vec, row)? };
+            let base_t = ffi::td_parted_basetype(t);
+            return unsafe { Self::read_i64_from_vec(seg, base_t, local_row) };
+        }
+
         let len = unsafe { ffi::td_len(vec) } as usize;
         if row >= len {
             return None;
         }
-        let t = unsafe { ffi::td_type(vec) };
-        unsafe {
-            let data = ffi::td_data(vec);
-            match t {
-                ffi::TD_I64 | ffi::TD_SYM | ffi::TD_TIME | ffi::TD_TIMESTAMP => {
-                    let p = data as *const i64;
-                    Some(*p.add(row))
-                }
-                ffi::TD_BOOL => {
-                    let p = data as *const u8;
-                    Some(*p.add(row) as i64)
-                }
-                ffi::TD_I32 | ffi::TD_DATE => {
-                    let p = data as *const i32;
-                    Some(*p.add(row) as i64)
-                }
-                ffi::TD_ENUM => {
-                    let p = data as *const u32;
-                    Some(*p.add(row) as i64)
-                }
-                _ => None,
+        unsafe { Self::read_i64_from_vec(vec, t, row) }
+    }
+
+    /// Read an i64 from a flat (non-parted) vector at the given row.
+    unsafe fn read_i64_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<i64> {
+        let data = unsafe { ffi::td_data(vec) };
+        match t {
+            ffi::TD_I64 | ffi::TD_SYM | ffi::TD_TIME | ffi::TD_TIMESTAMP => {
+                let p = data as *const i64;
+                Some(unsafe { *p.add(row) })
             }
+            ffi::TD_BOOL => {
+                let p = data as *const u8;
+                Some(unsafe { *p.add(row) } as i64)
+            }
+            ffi::TD_I32 | ffi::TD_DATE => {
+                let p = data as *const i32;
+                Some(unsafe { *p.add(row) } as i64)
+            }
+            ffi::TD_ENUM => {
+                let p = data as *const u32;
+                Some(unsafe { *p.add(row) } as i64)
+            }
+            _ => None,
         }
     }
 
     /// Read an f64 value from column `col`, row `row`.
     pub fn get_f64(&self, col: usize, row: usize) -> Option<f64> {
         let vec = self.get_col_idx(col as i64)?;
+        let t = unsafe { ffi::td_type(vec) };
+
+        // Handle parted columns
+        if ffi::td_is_parted(t) {
+            let base_t = ffi::td_parted_basetype(t);
+            if base_t != ffi::TD_F64 {
+                return None;
+            }
+            let (seg, local_row) = unsafe { Self::resolve_parted_row(vec, row)? };
+            let data = unsafe { ffi::td_data(seg) as *const f64 };
+            return Some(unsafe { *data.add(local_row) });
+        }
+
         let len = unsafe { ffi::td_len(vec) } as usize;
         if row >= len {
             return None;
         }
-        let t = unsafe { ffi::td_type(vec) };
         if t != ffi::TD_F64 {
             return None;
         }
@@ -615,19 +681,32 @@ impl Table {
     /// Read a string value from a SYM or ENUM column at `col`, `row`.
     pub fn get_str(&self, col: usize, row: usize) -> Option<&str> {
         let vec = self.get_col_idx(col as i64)?;
+        let t = unsafe { ffi::td_type(vec) };
+
+        // Handle parted columns
+        if ffi::td_is_parted(t) {
+            let base_t = ffi::td_parted_basetype(t);
+            let (seg, local_row) = unsafe { Self::resolve_parted_row(vec, row)? };
+            return unsafe { Self::read_str_from_vec(seg, base_t, local_row) };
+        }
+
         let len = unsafe { ffi::td_len(vec) } as usize;
         if row >= len {
             return None;
         }
-        let t = unsafe { ffi::td_type(vec) };
+        unsafe { Self::read_str_from_vec(vec, t, row) }
+    }
+
+    /// Read a string from a flat (non-parted) SYM or ENUM vector.
+    unsafe fn read_str_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<&'static str> {
         let sym_id = match t {
-            ffi::TD_SYM => unsafe {
-                let data = ffi::td_data(vec) as *const i64;
-                *data.add(row)
+            ffi::TD_SYM => {
+                let data = unsafe { ffi::td_data(vec) as *const i64 };
+                unsafe { *data.add(row) }
             },
-            ffi::TD_ENUM => unsafe {
-                let data = ffi::td_data(vec) as *const u32;
-                *data.add(row) as i64
+            ffi::TD_ENUM => {
+                let data = unsafe { ffi::td_data(vec) as *const u32 };
+                (unsafe { *data.add(row) }) as i64
             },
             _ => return None,
         };

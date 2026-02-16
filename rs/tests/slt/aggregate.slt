@@ -141,6 +141,20 @@ SELECT grp, SUM(val) AS total FROM agg GROUP BY grp ORDER BY total DESC
 2 150.0
 1 60.0
 
+# ORDER BY aggregate's input column name (resolves v1 → avg(val))
+query R
+SELECT AVG(val) FROM agg GROUP BY grp ORDER BY val
+----
+20.0
+50.0
+
+# Expression aggregate with WHERE filter (lazy sel → compact before expr eval)
+query R
+SELECT AVG(val + 10.0) FROM agg WHERE val > 20 GROUP BY grp ORDER BY 1
+----
+40.0
+60.0
+
 # --- DISTINCT ---
 
 query I rowsort

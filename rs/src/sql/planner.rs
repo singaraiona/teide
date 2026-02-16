@@ -870,7 +870,7 @@ fn plan_query(
 
     // Stage 1: WHERE filter (resolve subqueries first)
     // Uses effective_where which may have had predicates removed by pushdown above.
-    let (working_table, filter_mask): (Table, Option<*mut crate::td_t>) =
+    let (working_table, selection): (Table, Option<*mut crate::td_t>) =
         if let Some(ref where_expr) = effective_where {
             let resolved = if has_subqueries(where_expr) {
                 resolve_subqueries(ctx, where_expr, effective_tables)?
@@ -919,7 +919,7 @@ fn plan_query(
             &group_by_cols,
             &schema,
             &alias_exprs,
-            filter_mask,
+            selection,
         )?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
@@ -1378,10 +1378,10 @@ fn plan_group_select(
     group_by_cols: &[String],
     schema: &HashMap<String, usize>,
     alias_exprs: &HashMap<String, Expr>,
-    filter_mask: Option<*mut crate::td_t>,
+    selection: Option<*mut crate::td_t>,
 ) -> Result<(Table, Vec<String>), SqlError> {
-    // RAII guard: ensures the filter_mask is released on all exit paths
-    // (including early returns). set_filter_mask does its own retain, so the
+    // RAII guard: ensures the selection is released on all exit paths
+    // (including early returns). set_selection does its own retain, so the
     // graph keeps the mask alive independently.
     struct MaskGuard(*mut crate::td_t);
     impl Drop for MaskGuard {
@@ -1391,7 +1391,7 @@ fn plan_group_select(
             }
         }
     }
-    let _mask_guard = filter_mask.map(MaskGuard);
+    let _mask_guard = selection.map(MaskGuard);
 
     let has_group_by = !group_by_cols.is_empty();
 
@@ -1535,12 +1535,12 @@ fn plan_group_select(
     let group_node = g.group_by(&key_nodes, &agg_ops, &agg_inputs)?;
 
     // Push filter mask into the graph so exec_group skips filtered rows.
-    // Ownership: set_filter_mask retains (rc=2). MaskGuard (created at the
+    // Ownership: set_selection retains (rc=2). MaskGuard (created at the
     // top of this function) releases our reference on any exit path (rc=1).
     // Graph::drop releases the graph's reference (rc=0).
-    if let Some(mask) = filter_mask {
+    if let Some(mask) = selection {
         unsafe {
-            g.set_filter_mask(mask);
+            g.set_selection(mask);
         }
     }
     let group_result = g.execute(group_node)?;
@@ -3196,6 +3196,27 @@ fn plan_order_by(
                     .iter()
                     .position(|a| a == name)
                     .or_else(|| table_col_names.iter().position(|c| c == name))
+                    // Fallback: match aggregate input column name.
+                    // e.g. ORDER BY v1 resolves to avg(v1) when the result
+                    // alias is "avg(v1)" and the inner arg is "v1".
+                    .or_else(|| {
+                        let mut matches = result_aliases.iter().enumerate().filter(|(_, a)| {
+                            if let Some(start) = a.find('(') {
+                                if a.ends_with(')') {
+                                    let inner = &a[start + 1..a.len() - 1];
+                                    return inner == name.as_str();
+                                }
+                            }
+                            false
+                        });
+                        let first = matches.next();
+                        if first.is_some() && matches.next().is_none() {
+                            // Exactly one aggregate matches — unambiguous
+                            first.map(|(i, _)| i)
+                        } else {
+                            None
+                        }
+                    })
                     .ok_or_else(|| {
                         SqlError::Plan(format!("ORDER BY column '{}' not found", name))
                     })?;

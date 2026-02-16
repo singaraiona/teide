@@ -9023,7 +9023,43 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         }
 
         case OP_GROUP: {
-            td_t* result = exec_group(g, op, g->table);
+            td_t* tbl = g->table;
+            td_t* owned_tbl = NULL;
+            /* Compact lazy selection if group-by has expression inputs.
+             * Expression evaluation (expr_eval_full / exec_node) runs on
+             * all nrows — with lazy filter that's the full unfiltered table.
+             * Compacting first shrinks the input so expressions evaluate on
+             * only the passing rows. For simple SCAN inputs this is skipped
+             * and exec_group uses the bitmap for segment-level skip. */
+            if (g->selection && g->selection->type == TD_SEL) {
+                td_op_ext_t* gext = find_ext(g, op->id);
+                if (gext) {
+                    bool needs = false;
+                    for (uint8_t k = 0; k < gext->n_keys && !needs; k++) {
+                        td_op_ext_t* kx = find_ext(g, gext->keys[k]->id);
+                        if (!kx || kx->base.opcode != OP_SCAN)
+                            needs = true;
+                    }
+                    for (uint8_t a = 0; a < gext->n_aggs && !needs; a++) {
+                        if (gext->agg_ops[a] == OP_COUNT) continue;
+                        td_op_ext_t* ax = find_ext(g, gext->agg_ins[a]->id);
+                        if (!ax || (ax->base.opcode != OP_SCAN
+                                    && !(ax->base.opcode == OP_CONST
+                                         && ax->literal)))
+                            needs = true;
+                    }
+                    if (needs) {
+                        td_t* compacted = sel_compact(g, tbl, g->selection);
+                        if (!compacted || TD_IS_ERR(compacted)) return compacted;
+                        td_release(g->selection);
+                        g->selection = NULL;
+                        owned_tbl = compacted;
+                        tbl = compacted;
+                    }
+                }
+            }
+            td_t* result = exec_group(g, op, tbl);
+            if (owned_tbl) td_release(owned_tbl);
             return result;
         }
 

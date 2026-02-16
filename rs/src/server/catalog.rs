@@ -232,7 +232,13 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
             let has_tables = lower.contains("'r'") || lower.contains("'p'");
             if has_tables {
-                return Some(handle_pg_class(meta));
+                // If query selects OID (e.g. for constraint lookups), return oid + relname
+                if lower.contains("pg_class.oid") || lower.contains("c.oid") {
+                    return Some(handle_pg_class(meta));
+                }
+                // Table listing: return just relname
+                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
+                return Some(single_text_result("relname", &names));
             }
         }
         // Views, materialized views, foreign tables, or other schemas → empty

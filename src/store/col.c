@@ -172,6 +172,7 @@ td_t* td_col_load(const char* path) {
     /* Fix up header for buddy-allocated block */
     vec->mmod = 0;
     vec->order = saved_order;
+    vec->attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;
@@ -236,6 +237,7 @@ td_t* td_col_mmap(const char* path) {
     /* Patch header -- MAP_PRIVATE COW: only the header page gets copied */
     vec->mmod = 1;
     vec->order = 0;
+    vec->attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;

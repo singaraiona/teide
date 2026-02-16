@@ -39,6 +39,7 @@ static int64_t list_capacity(td_t* list) {
  * -------------------------------------------------------------------------- */
 
 td_t* td_list_new(int64_t capacity) {
+    if (capacity < 0) return TD_ERR_PTR(TD_ERR_RANGE);
     size_t data_size = (size_t)capacity * sizeof(td_t*);
 
     td_t* list = td_alloc(data_size);

@@ -75,7 +75,7 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
 
     if (p == MAP_FAILED) return NULL;
 
-    *out_size = len;
+    if (out_size) *out_size = len;
     return p;
 }
 
@@ -238,7 +238,7 @@ void* td_vm_map_file(const char* path, size_t* out_size) {
 
     if (!p) return NULL;
 
-    *out_size = (size_t)file_size.QuadPart;
+    if (out_size) *out_size = (size_t)file_size.QuadPart;
     return p;
 }
 

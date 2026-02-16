@@ -724,10 +724,12 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
                        (size_t)td_len(v) * td_elem_size(t) : 0;
         }
         size_t copy_data = old_data < new_data_size ? old_data : new_data_size;
+        /* Save allocator metadata before memcpy overwrites the header */
+        uint8_t new_mmod = new_v->mmod;
+        uint8_t new_order = new_v->order;
         memcpy(new_v, v, 32 + copy_data);
-        new_v->mmod = 0;
-        new_v->order = td_order_for_size(new_data_size);
-        if (new_v->order < TD_ORDER_MIN) new_v->order = TD_ORDER_MIN;
+        new_v->mmod = new_mmod;
+        new_v->order = new_order;
         atomic_store_explicit(&new_v->rc, 1, memory_order_relaxed);
         td_detach_owned_refs(v);
         td_free(v);

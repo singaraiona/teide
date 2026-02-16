@@ -144,6 +144,27 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                         if (ext->window.func_inputs[f] && !visited[ext->window.func_inputs[f]->id] && sp < (int)nc)
                             stack[sp++] = ext->window.func_inputs[f]->id;
                     break;
+                /* M3b: 3-input ops store third operand node ID in ext->literal */
+                case OP_IF:
+                case OP_SUBSTR:
+                case OP_REPLACE: {
+                    uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                    if (third_id < nc && !visited[third_id] && sp < (int)nc)
+                        stack[sp++] = third_id;
+                    break;
+                }
+                /* M3c: OP_CONCAT trailing arg node IDs beyond inputs[0..1] */
+                case OP_CONCAT:
+                    if (ext->sym >= 2) {
+                        int n_args = (int)ext->sym;
+                        uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                        for (int j = 2; j < n_args; j++) {
+                            uint32_t arg_id = trail[j - 2];
+                            if (arg_id < nc && !visited[arg_id] && sp < (int)nc)
+                                stack[sp++] = arg_id;
+                        }
+                    }
+                    break;
                 default:
                     break;
             }
@@ -494,6 +515,27 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                     for (uint8_t f = 0; f < ext->window.n_funcs; f++)
                         if (ext->window.func_inputs[f] && !visited[ext->window.func_inputs[f]->id] && sp < (int)nc)
                             stack[sp++] = ext->window.func_inputs[f]->id;
+                    break;
+                /* H1b: 3-input ops store third operand node ID in ext->literal */
+                case OP_IF:
+                case OP_SUBSTR:
+                case OP_REPLACE: {
+                    uint32_t third_id = (uint32_t)(uintptr_t)ext->literal;
+                    if (third_id < nc && !visited[third_id] && sp < (int)nc)
+                        stack[sp++] = third_id;
+                    break;
+                }
+                /* H1c: OP_CONCAT trailing arg node IDs beyond inputs[0..1] */
+                case OP_CONCAT:
+                    if (ext->sym >= 2) {
+                        int n_args = (int)ext->sym;
+                        uint32_t* trail = (uint32_t*)((char*)(ext + 1));
+                        for (int j = 2; j < n_args; j++) {
+                            uint32_t arg_id = trail[j - 2];
+                            if (arg_id < nc && !visited[arg_id] && sp < (int)nc)
+                                stack[sp++] = arg_id;
+                        }
+                    }
                     break;
                 default:
                     break;

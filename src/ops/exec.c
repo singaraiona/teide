@@ -246,8 +246,8 @@ static bool eval_const_numeric_expr(td_graph_t* g, td_op_t* op,
         case OP_ADD: r = (int64_t)((uint64_t)li + (uint64_t)ri); break;
         case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
         case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
-        case OP_DIV: r = ri != 0 ? li / ri : 0; break;
-        case OP_MOD: r = ri != 0 ? li % ri : 0; break;
+        case OP_DIV: r = (ri != 0 && !(li == INT64_MIN && ri == -1)) ? li / ri : 0; break;
+        case OP_MOD: r = (ri != 0 && !(li == INT64_MIN && ri == -1)) ? li % ri : 0; break;
         case OP_MIN2: r = li < ri ? li : ri; break;
         case OP_MAX2: r = li > ri ? li : ri; break;
         default: return false;
@@ -784,8 +784,8 @@ static void expr_exec_binary(uint8_t opcode, int8_t dt, void* dp,
             case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] + (uint64_t)b[j]); break;
             case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
-            case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] / b[j] : 0; break;
-            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0 ? a[j] % b[j] : 0; break;
+            case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = (b[j] != 0 && !(a[j] == INT64_MIN && b[j] == -1)) ? a[j] / b[j] : 0; break;
+            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = (b[j] != 0 && !(a[j] == INT64_MIN && b[j] == -1)) ? a[j] % b[j] : 0; break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
             default: break;
@@ -1146,8 +1146,8 @@ static void binary_range(td_op_t* op, int8_t out_type,
                 case OP_ADD: r = (int64_t)((uint64_t)li + (uint64_t)ri); break;
                 case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
                 case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
-                case OP_DIV: r = ri != 0 ? li / ri : 0; break;
-                case OP_MOD: r = ri != 0 ? li % ri : 0; break;
+                case OP_DIV: r = (ri != 0 && !(li == INT64_MIN && ri == -1)) ? li / ri : 0; break;
+                case OP_MOD: r = (ri != 0 && !(li == INT64_MIN && ri == -1)) ? li % ri : 0; break;
                 case OP_MIN2: r = li < ri ? li : ri; break;
                 case OP_MAX2: r = li > ri ? li : ri; break;
                 default: r = 0; break;
@@ -3908,15 +3908,15 @@ static inline void da_accum_free(da_accum_t* a) {
 
 /* Unified agg result emitter — used by both DA and HT paths.
  * Arrays indexed by [gi * n_aggs + a], counts by [gi]. */
-static void emit_agg_columns(td_t** result, td_graph_t* g, td_op_ext_t* ext,
+static void emit_agg_columns(td_t** result, td_graph_t* g, const td_op_ext_t* ext,
                               td_t** agg_vecs, uint32_t grp_count,
                               uint8_t n_aggs,
-                              double*  sum_f64,  int64_t* sum_i64,
-                              double*  min_f64,  double*  max_f64,
-                              int64_t* min_i64,  int64_t* max_i64,
-                              int64_t* counts,
+                              const double*  sum_f64,  const int64_t* sum_i64,
+                              const double*  min_f64,  const double*  max_f64,
+                              const int64_t* min_i64,  const int64_t* max_i64,
+                              const int64_t* counts,
                               const agg_affine_t* affine,
-                              double*  sumsq_f64) {
+                              const double*  sumsq_f64) {
     for (uint8_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         td_t* agg_col = agg_vecs[a];
@@ -4083,6 +4083,8 @@ static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
             val = ((const int64_t*)c->key_ptrs[k])[r];
         else if (t == TD_ENUM)
             val = (int64_t)((const uint32_t*)c->key_ptrs[k])[r];
+        else if (t == TD_BOOL || t == TD_U8)
+            val = (int64_t)((const uint8_t*)c->key_ptrs[k])[r];
         else /* TD_I32, TD_DATE, TD_TIME */
             val = (int64_t)((const int32_t*)c->key_ptrs[k])[r];
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
@@ -4428,6 +4430,7 @@ typedef struct {
     uint8_t     need_flags;
     uint8_t     n_aggs;
     const int8_t* agg_types;  /* per-agg value type (for typed merge) */
+    const uint16_t* agg_ops;  /* per-agg opcode (for FIRST/LAST merge) */
 } da_merge_ctx_t;
 
 static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
@@ -4447,7 +4450,16 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
             if (c->need_flags & DA_NEED_SUM) {
                 for (uint8_t a = 0; a < n_aggs; a++) {
                     size_t idx = base + a;
-                    if (agg_types[a] == TD_F64)
+                    uint16_t aop = c->agg_ops ? c->agg_ops[a] : OP_SUM;
+                    if (aop == OP_FIRST) {
+                        /* Keep worker 0 value; take from w only if merged has no data */
+                        if (merged->count[s] == 0 && wa->count[s] > 0)
+                            merged->sum[idx] = wa->sum[idx];
+                    } else if (aop == OP_LAST) {
+                        /* Overwrite with last worker that has data */
+                        if (wa->count[s] > 0)
+                            merged->sum[idx] = wa->sum[idx];
+                    } else if (agg_types[a] == TD_F64)
                         merged->sum[idx].f += wa->sum[idx].f;
                     else
                         merged->sum[idx].i += wa->sum[idx].i;
@@ -5303,6 +5315,7 @@ da_path:;
                     .need_flags    = need_flags,
                     .n_aggs        = n_aggs,
                     .agg_types     = agg_types,
+                    .agg_ops       = ext->agg_ops,
                 };
                 td_pool_dispatch(da_pool, da_merge_fn, &merge_ctx, (int64_t)n_slots);
             } else {
@@ -5314,12 +5327,22 @@ da_path:;
                             merged->sumsq_f64[i] += wa->sumsq_f64[i];
                     }
                     if (need_flags & DA_NEED_SUM) {
-                        for (size_t i = 0; i < total; i++) {
-                            uint8_t a = (uint8_t)(i % n_aggs);
-                            if (agg_types[a] == TD_F64)
-                                merged->sum[i].f += wa->sum[i].f;
-                            else
-                                merged->sum[i].i += wa->sum[i].i;
+                        for (uint32_t s = 0; s < n_slots; s++) {
+                            size_t base = (size_t)s * n_aggs;
+                            for (uint8_t a = 0; a < n_aggs; a++) {
+                                size_t idx = base + a;
+                                uint16_t aop = ext->agg_ops[a];
+                                if (aop == OP_FIRST) {
+                                    if (merged->count[s] == 0 && wa->count[s] > 0)
+                                        merged->sum[idx] = wa->sum[idx];
+                                } else if (aop == OP_LAST) {
+                                    if (wa->count[s] > 0)
+                                        merged->sum[idx] = wa->sum[idx];
+                                } else if (agg_types[a] == TD_F64)
+                                    merged->sum[idx].f += wa->sum[idx].f;
+                                else
+                                    merged->sum[idx].i += wa->sum[idx].i;
+                            }
                         }
                     }
                     if (need_flags & DA_NEED_MIN) {
@@ -6195,7 +6218,7 @@ fail:
  * ============================================================================ */
 
 /* Key equality helper — shared by count + fill phases */
-static inline bool join_keys_eq(td_t** l_vecs, td_t** r_vecs, uint8_t n_keys,
+static inline bool join_keys_eq(td_t* const* l_vecs, td_t* const* r_vecs, uint8_t n_keys,
                                  int64_t l, int64_t r) {
     for (uint8_t k = 0; k < n_keys; k++) {
         td_t* lc = l_vecs[k];
@@ -7435,7 +7458,7 @@ static td_t* exec_date_trunc(td_graph_t* g, td_op_t* op) {
  * ============================================================================ */
 
 /* Compare rows ra and rb on the given key columns. Returns true if any differ. */
-static inline bool win_keys_differ(td_t** vecs, uint8_t n_keys,
+static inline bool win_keys_differ(td_t* const* vecs, uint8_t n_keys,
                                     int64_t ra, int64_t rb) {
     for (uint8_t k = 0; k < n_keys; k++) {
         td_t* col = vecs[k];
@@ -7519,8 +7542,8 @@ static td_t* win_resolve_vec(td_graph_t* g, td_op_t* key_op, td_t* tbl,
 
 /* Compute window functions for one partition [ps, pe) in sorted_idx */
 static void win_compute_partition(
-    td_t** order_vecs, uint8_t n_order,
-    td_t** func_vecs, const uint8_t* func_kinds, const int64_t* func_params,
+    td_t* const* order_vecs, uint8_t n_order,
+    td_t* const* func_vecs, const uint8_t* func_kinds, const int64_t* func_params,
     uint8_t n_funcs,
     uint8_t frame_start, uint8_t frame_end,
     const int64_t* sorted_idx, int64_t ps, int64_t pe,

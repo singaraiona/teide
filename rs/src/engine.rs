@@ -623,11 +623,13 @@ impl Table {
                 ffi::td_retain(col);
                 let next_raw = ffi::td_table_add_col(new_raw, name_id, col);
                 if next_raw.is_null() {
+                    ffi::td_release(col);
                     ffi::td_release(new_raw);
                     return Err(Error::Oom);
                 }
                 if ffi::td_is_err(next_raw) {
                     let err = Error::from_code(ffi::td_err_code(next_raw));
+                    ffi::td_release(col);
                     ffi::td_release(new_raw);
                     return Err(err);
                 }

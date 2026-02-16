@@ -35,6 +35,10 @@ td_t* td_alloc(size_t size) {
 
 size_t td_block_size(td_t* v) {
     if (td_is_atom(v)) return 32;
+    /* LIST (type=0) stores child pointers */
+    if (v->type == TD_LIST) return 32 + (size_t)td_len(v) * sizeof(td_t*);
+    /* TABLE stores schema slot + ncols column pointers */
+    if (v->type == TD_TABLE) return 32 + (size_t)(td_len(v) + 1) * sizeof(td_t*);
     /* Vectors: header (32 bytes) + len * elem_size */
     int8_t t = td_type(v);
     if (t <= 0 || t >= TD_TYPE_COUNT) return 32;
@@ -45,7 +49,16 @@ td_t* td_block_copy(td_t* src) {
     size_t sz = td_block_size(src);
     td_t* dst = td_alloc(sz);
     if (!dst) return (td_t*)0;
+    /* Save allocator metadata before memcpy overwrites the header */
+    uint8_t new_mmod = dst->mmod;
+    uint8_t new_order = dst->order;
     memcpy(dst, src, sz);
+    dst->mmod = new_mmod;
+    dst->order = new_order;
     atomic_store_explicit(&dst->rc, 1, memory_order_relaxed);
+    /* TODO: td_retain_owned_refs(dst) should be called here to retain
+     * child pointers for STR/LIST/TABLE types. Currently the function is
+     * static in arena.c — callers of td_block_copy must ensure child refs
+     * are retained separately, or use td_alloc_copy() which handles this. */
     return dst;
 }

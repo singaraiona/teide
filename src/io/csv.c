@@ -1199,10 +1199,15 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
         td_pool_t* pool = td_pool_get();
         bool use_parallel = pool && n_rows > 8192;
 
+        /* PACK_SYM uses upper 8 bits for worker_id (IDs 0-255, max 256 workers).
+         * If pool has >256 workers and string columns exist, fall back to serial
+         * to avoid worker ID overflow in packed sym encoding. */
+        if (use_parallel && has_str_cols && td_pool_total_workers(pool) > 256) {
+            use_parallel = false;
+        }
+
         if (use_parallel) {
             uint32_t n_workers = td_pool_total_workers(pool);
-            /* PACK_SYM uses upper 8 bits for worker_id (max 255) */
-            if (n_workers > 255) n_workers = 255;
 
             /* Allocate per-worker local sym tables for string columns.
              * Zero-init so workers can lazy-init on first use. */

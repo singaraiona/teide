@@ -950,7 +950,7 @@ fn plan_query(
     } else {
         match (offset_val, limit_val) {
             (Some(off), Some(lim)) => {
-                let total = off + lim;
+                let total = off.saturating_add(lim);
                 let g = ctx.graph(&result_table)?;
                 let table_node = g.const_table(&result_table)?;
                 let head_node = g.head(table_node, total)?;
@@ -1315,7 +1315,7 @@ fn plan_group_select(
             unsafe { crate::ffi_release(self.0); }
         }
     }
-    let _mask_guard = filter_mask.map(|m| MaskGuard(m));
+    let _mask_guard = filter_mask.map(MaskGuard);
 
     let has_group_by = !group_by_cols.is_empty();
 
@@ -2117,11 +2117,11 @@ impl RawTableBuilder {
     fn finish(mut self) -> Result<Table, SqlError> {
         let raw = self.raw;
         self.raw = std::ptr::null_mut(); // prevent Drop from releasing
-        unsafe { crate::ffi_retain(raw) };
+        // No retain: transfer existing rc=1 ownership to Table
         match unsafe { Table::from_raw(raw) } {
             Ok(t) => Ok(t),
             Err(e) => {
-                // Undo the retain to avoid a reference leak
+                // Release the allocation's rc=1 to avoid a leak
                 unsafe { crate::ffi_release(raw) };
                 Err(SqlError::Engine(e))
             }
@@ -2491,7 +2491,7 @@ fn apply_post_processing(
         let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
 
         let total_limit = match (offset_val, limit_val) {
-            (Some(off), Some(lim)) => Some(off + lim),
+            (Some(off), Some(lim)) => Some(off.saturating_add(lim)),
             (None, Some(lim)) => Some(lim),
             _ => None,
         };
@@ -2513,7 +2513,7 @@ fn apply_post_processing(
     } else {
         match (offset_val, limit_val) {
             (Some(off), Some(lim)) => {
-                let total = off + lim;
+                let total = off.saturating_add(lim);
                 let g = ctx.graph(&result_table)?;
                 let table_node = g.const_table(&result_table)?;
                 let head_node = g.head(table_node, total)?;

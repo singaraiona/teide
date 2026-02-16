@@ -178,8 +178,16 @@ void td_table_set_col_name(td_t* tbl, int64_t idx, int64_t name_id) {
     if (!tbl || TD_IS_ERR(tbl)) return;
     if (idx < 0 || idx >= tbl->len) return;
 
+    /* NOTE: This function returns void so it cannot return a new COW'd pointer.
+     * Caller must ensure exclusive ownership (rc==1) before calling, e.g. via
+     * td_cow(tbl) beforehand. Mutating a shared table here is undefined. */
     td_t* schema = *tbl_schema_slot(tbl);
     if (!schema || TD_IS_ERR(schema)) return;
+
+    /* COW the schema vector to avoid mutating shared schema */
+    schema = td_cow(schema);
+    if (!schema || TD_IS_ERR(schema)) return;
+    *tbl_schema_slot(tbl) = schema;
 
     int64_t* ids = (int64_t*)td_data(schema);
     ids[idx] = name_id;

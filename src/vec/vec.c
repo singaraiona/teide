@@ -269,6 +269,7 @@ td_t* td_vec_from_raw(int8_t type, const void* data, int64_t count) {
 
 void td_vec_set_null(td_t* vec, int64_t idx, bool is_null) {
     if (!vec || TD_IS_ERR(vec)) return;
+    if (vec->attrs & TD_ATTR_SLICE) return; /* cannot set null on slice — COW first */
     if (idx < 0 || idx >= vec->len) return;
 
     /* Mark HAS_NULLS if setting a null */

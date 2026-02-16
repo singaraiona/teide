@@ -156,6 +156,7 @@ td_t* td_splay_load(const char* dir) {
             td_release(tbl);
             return new_df ? new_df : TD_ERR_PTR(TD_ERR_OOM);
         }
+        td_release(col); /* table_add_col retains; drop our ref */
         tbl = new_df;
     }
 
@@ -225,6 +226,7 @@ td_t* td_splay_open(const char* dir, const char* sym_path) {
             td_release(tbl);
             return new_df ? new_df : TD_ERR_PTR(TD_ERR_OOM);
         }
+        td_release(col); /* table_add_col retains; drop our ref */
         tbl = new_df;
     }
 

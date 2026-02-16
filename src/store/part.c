@@ -190,6 +190,11 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
             }
         }
 
+        if (!combined) {
+            td_release(result);
+            result = NULL;
+            break;
+        }
         result = td_table_add_col(result, name_id, combined);
         td_release(combined);
     }
@@ -203,7 +208,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
     td_sys_free(all_dfs);
     td_sys_free(part_dirs);
 
-    return result;
+    return result ? result : TD_ERR_PTR(TD_ERR_OOM);
 }
 
 /* --------------------------------------------------------------------------

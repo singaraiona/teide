@@ -213,10 +213,10 @@ int64_t td_sym_intern(const char* str, size_t len) {
         g_sym.str_cap = new_str_cap;
     }
 
-    /* Create string atom and retain it */
+    /* Create string atom — td_str() returns with rc=1 which is the
+     * sym table's owning reference. No additional retain needed. */
     td_t* s = td_str(str, len);
     if (!s || TD_IS_ERR(s)) { sym_unlock(); return -1; }
-    td_retain(s);  /* sym table owns a ref */
     g_sym.strings[new_id] = s;
     g_sym.str_count++;
 
@@ -315,21 +315,21 @@ td_err_t td_sym_save(const char* path) {
     if (!path) return TD_ERR_IO;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return TD_ERR_IO;
 
-    /* Snapshot str_count and strings pointer under lock to avoid reading
-     * stale values if a concurrent td_sym_intern triggers reallocation. */
+    /* Hold the lock for the entire save to prevent concurrent td_sym_intern
+     * from reallocating the strings array or mutating str_count mid-save. */
     sym_lock();
     uint32_t count = g_sym.str_count;
     td_t** strings = g_sym.strings;
-    sym_unlock();
 
     FILE* f = fopen(path, "wb");
-    if (!f) return TD_ERR_IO;
+    if (!f) { sym_unlock(); return TD_ERR_IO; }
 
     uint32_t magic = 0x4D595354;  /* "TSYM" little-endian */
 
     if (fwrite(&magic, 4, 1, f) != 1 ||
         fwrite(&count, 4, 1, f) != 1) {
         fclose(f);
+        sym_unlock();
         return TD_ERR_IO;
     }
 
@@ -341,11 +341,13 @@ td_err_t td_sym_save(const char* path) {
         if (fwrite(&len, 4, 1, f) != 1 ||
             (len > 0 && fwrite(data, 1, len, f) != len)) {
             fclose(f);
+            sym_unlock();
             return TD_ERR_IO;
         }
     }
 
     fclose(f);
+    sym_unlock();
     return TD_OK;
 }
 

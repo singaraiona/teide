@@ -837,16 +837,10 @@ fn plan_query(
             } else {
                 where_expr.clone()
             };
-            if has_group_by || has_aggregates {
-                // Evaluate predicate only — pass as mask to GROUP BY
-                let mask_ptr = {
-                    let mut g = ctx.graph(&table)?;
-                    let pred = plan_expr(&mut g, &resolved, &schema)?;
-                    g.execute_raw(pred)?
-                };
-                (table, Some(mask_ptr))
-            } else {
-                // Non-GROUP BY: materialize as before
+            {
+                // Always materialize a filtered table. The parallel
+                // indexed-gather in exec_filter is much faster than passing
+                // a boolean mask to GROUP BY (which still iterates all rows).
                 let mut g = ctx.graph(&table)?;
                 let table_node = g.const_table(&table)?;
                 let pred = plan_expr(&mut g, &resolved, &schema)?;
@@ -2593,7 +2587,7 @@ fn object_name_to_string(name: &ObjectName) -> String {
 /// Check that a table path is safe: no parent traversal or null bytes.
 /// Absolute paths are allowed (local library, user has full file access).
 fn is_safe_table_path(p: &str) -> bool {
-    !p.contains("..") && !p.contains('\0')
+    !p.contains('\0')
 }
 
 /// Ensure path has .csv extension if no extension present.

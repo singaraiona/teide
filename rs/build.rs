@@ -31,10 +31,7 @@ fn main() {
     let c_files: Vec<PathBuf> = walkdir(&src_dir);
 
     let mut build = cc::Build::new();
-    build
-        .include(&include_dir)
-        .include(&src_dir)
-        .std("c17");
+    build.include(&include_dir).include(&src_dir).std("c17");
 
     let profile = std::env::var("PROFILE").unwrap_or_default();
     if profile == "debug" {

@@ -132,8 +132,7 @@ impl Session {
         use sqlparser::parser::Parser;
 
         let dialect = DuckDbDialect {};
-        let stmts = Parser::parse_sql(&dialect, sql)
-            .map_err(|e| SqlError::Parse(e.to_string()))?;
+        let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
         if stmts.is_empty() {
             return Err(SqlError::Plan("Empty script".into()));
         }

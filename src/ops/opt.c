@@ -125,6 +125,7 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
                 case OP_JOIN:
+                case OP_WINDOW_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.left_keys[k]->id;
@@ -201,6 +202,7 @@ static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
 
 static bool track_ext_node(td_graph_t* g, td_op_ext_t* ext) {
     if (g->ext_count >= g->ext_cap) {
+        if (g->ext_cap > UINT32_MAX / 2) return false;
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         td_op_ext_t** new_exts =
             (td_op_ext_t**)td_sys_realloc(g->ext_nodes, new_cap * sizeof(td_op_ext_t*));
@@ -321,10 +323,10 @@ static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
                 case OP_ADD: r = lv + rv; break;
                 case OP_SUB: r = lv - rv; break;
                 case OP_MUL: r = lv * rv; break;
-                case OP_DIV: r = rv != 0.0 ? lv / rv : 0.0; break;
-                case OP_MOD: r = rv != 0.0 ? fmod(lv, rv) : 0.0; break;
-                case OP_MIN2: r = lv < rv ? lv : rv; break;
-                case OP_MAX2: r = lv > rv ? lv : rv; break;
+                case OP_DIV: r = lv / rv; break;  /* IEEE 754: ±Inf or NaN */
+                case OP_MOD: r = fmod(lv, rv); break;  /* IEEE 754: NaN for rv==0 */
+                case OP_MIN2: r = fmin(lv, rv); break;  /* NaN-propagating */
+                case OP_MAX2: r = fmax(lv, rv); break;  /* NaN-propagating */
                 default: return false;
             }
             folded = td_f64(r);
@@ -497,6 +499,7 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
                 case OP_JOIN:
+                case OP_WINDOW_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->join.left_keys[k]->id;
@@ -606,7 +609,8 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
         /* H1: Traverse ext node children for structural ops so DCE does
            not incorrectly mark referenced nodes as dead. */
         if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
-            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW ||
+            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW_JOIN ||
+            n->opcode == OP_WINDOW ||
             n->opcode == OP_PROJECT || n->opcode == OP_SELECT) {
             td_op_ext_t* ext = find_ext(g, nid);
             if (ext) {
@@ -630,6 +634,7 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
                         }
                         break;
                     case OP_JOIN:
+                    case OP_WINDOW_JOIN:
                         for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (ext->join.left_keys[k] && !live[ext->join.left_keys[k]->id] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k]->id;

@@ -294,6 +294,7 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
     /* Open each partition via td_splay_open */
     td_t** part_tables = (td_t**)td_sys_alloc((size_t)part_count * sizeof(td_t*));
     if (!part_tables) goto fail_dirs;
+    memset(part_tables, 0, (size_t)part_count * sizeof(td_t*));
 
     char path[1024];
     for (int64_t p = 0; p < part_count; p++) {

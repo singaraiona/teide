@@ -102,7 +102,7 @@ static inline bool pool_cancelled(td_pool_t* pool) {
 
 static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
     for (uint32_t i = 0; i < g->ext_count; i++) {
-        if (g->ext_nodes[i]->base.id == node_id)
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
             return g->ext_nodes[i];
     }
     return NULL;
@@ -2673,10 +2673,10 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
     for (int64_t i = 0; i < nrows; i++) indices[i] = i;
 
     /* Resolve sort key vectors */
-    td_t* sort_vecs[n_sort];
-    uint8_t sort_owned[n_sort];
-    memset(sort_vecs, 0, n_sort * sizeof(td_t*));
-    memset(sort_owned, 0, n_sort);
+    td_t* sort_vecs[n_sort > 0 ? n_sort : 1];
+    uint8_t sort_owned[n_sort > 0 ? n_sort : 1];
+    memset(sort_vecs, 0, (n_sort > 0 ? n_sort : 1) * sizeof(td_t*));
+    memset(sort_owned, 0, n_sort > 0 ? n_sort : 1);
 
     for (uint8_t k = 0; k < n_sort; k++) {
         td_op_t* key_op = ext->sort.columns[k];
@@ -3909,7 +3909,7 @@ static inline void da_accum_free(da_accum_t* a) {
 /* Unified agg result emitter — used by both DA and HT paths.
  * Arrays indexed by [gi * n_aggs + a], counts by [gi]. */
 static void emit_agg_columns(td_t** result, td_graph_t* g, const td_op_ext_t* ext,
-                              td_t** agg_vecs, uint32_t grp_count,
+                              td_t* const* agg_vecs, uint32_t grp_count,
                               uint8_t n_aggs,
                               const double*  sum_f64,  const int64_t* sum_i64,
                               const double*  min_f64,  const double*  max_f64,
@@ -6387,6 +6387,9 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
 
     int64_t left_rows = td_table_nrows(left_table);
     int64_t right_rows = td_table_nrows(right_table);
+    /* Guard: uint32_t row indices in HT chains cannot represent >4B rows */
+    if (right_rows > (int64_t)(UINT32_MAX - 1))
+        return TD_ERR_PTR(TD_ERR_NYI);
     uint8_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
@@ -7547,7 +7550,7 @@ static void win_compute_partition(
     uint8_t n_funcs,
     uint8_t frame_start, uint8_t frame_end,
     const int64_t* sorted_idx, int64_t ps, int64_t pe,
-    td_t** result_vecs, const bool* is_f64)
+    td_t* const* result_vecs, const bool* is_f64)
 {
     if (ps >= pe) return; /* empty partition — nothing to compute */
     int64_t part_len = pe - ps;
@@ -7942,6 +7945,9 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     uint8_t n_part  = ext->window.n_part_keys;
     uint8_t n_order = ext->window.n_order_keys;
     uint8_t n_funcs = ext->window.n_funcs;
+    /* Guard against uint8_t overflow on n_part + n_order */
+    if ((uint16_t)n_part + n_order > 255)
+        return TD_ERR_PTR(TD_ERR_NYI);
     uint8_t n_sort  = n_part + n_order;
 
     if (nrows == 0 || n_funcs == 0) {
@@ -8398,6 +8404,7 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
     /* Pass-through original columns */
     for (int64_t c = 0; c < ncols; c++) {
         td_t* col = td_table_get_col_idx(tbl, c);
+        if (!col) continue;
         int64_t name_id = td_table_col_name(tbl, c);
         td_retain(col);
         result = td_table_add_col(result, name_id, col);

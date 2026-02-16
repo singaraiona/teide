@@ -125,6 +125,7 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
+        if (g->node_cap > UINT32_MAX / 2) { td_sys_free(ext); return NULL; }
         td_op_t* old_nodes = g->nodes;
         uint32_t new_cap = g->node_cap * 2;
         td_op_t* new_nodes = (td_op_t*)td_sys_realloc(g->nodes,
@@ -143,6 +144,7 @@ static td_op_ext_t* graph_alloc_ext_node_ex(td_graph_t* g, size_t extra) {
 
     /* Track ext node for cleanup */
     if (g->ext_count >= g->ext_cap) {
+        if (g->ext_cap > UINT32_MAX / 2) { g->node_count--; td_sys_free(ext); return NULL; }
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         td_op_ext_t** new_exts = (td_op_ext_t**)td_sys_realloc(g->ext_nodes,
                                                                new_cap * sizeof(td_op_ext_t*));

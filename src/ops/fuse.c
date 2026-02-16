@@ -107,7 +107,8 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
            SORT/PROJECT/SELECT columns, JOIN keys, WINDOW inputs)
            so fusion ref counts are accurate. */
         if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
-            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW ||
+            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW_JOIN ||
+            n->opcode == OP_WINDOW ||
             n->opcode == OP_PROJECT || n->opcode == OP_SELECT) {
             td_op_ext_t* ext = find_ext(g, nid);
             if (ext) {
@@ -131,6 +132,7 @@ static void count_refs(td_graph_t* g, td_op_t* root, uint32_t* ref_counts) {
                         }
                         break;
                     case OP_JOIN:
+                    case OP_WINDOW_JOIN:
                         for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (ext->join.left_keys[k] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k]->id;

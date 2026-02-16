@@ -229,10 +229,11 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
         uint32_t new_cap = ls->cap * 2;
         uint32_t* new_offsets = (uint32_t*)td_sys_realloc(ls->offsets,
             new_cap * sizeof(uint32_t));
+        if (TD_UNLIKELY(!new_offsets)) return UINT32_MAX;
+        ls->offsets = new_offsets;
         uint32_t* new_lens = (uint32_t*)td_sys_realloc(ls->lens,
             new_cap * sizeof(uint32_t));
-        if (TD_UNLIKELY(!new_offsets || !new_lens)) return UINT32_MAX;
-        ls->offsets = new_offsets;
+        if (TD_UNLIKELY(!new_lens)) return UINT32_MAX;
         ls->lens = new_lens;
         ls->cap = new_cap;
     }
@@ -705,7 +706,7 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
                 offs = (int64_t*)scratch_realloc(&hdr,
                     (size_t)n * sizeof(int64_t),
                     (size_t)est * sizeof(int64_t));
-                if (!offs) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
+                if (!offs) { scratch_free(hdr); *offsets_out = NULL; *hdr_out = NULL; return 0; }
             }
             offs[n++] = (int64_t)(p - buf);
         }
@@ -727,7 +728,7 @@ static int64_t build_row_offsets(const char* buf, size_t buf_size,
                         offs = (int64_t*)scratch_realloc(&hdr,
                             (size_t)n * sizeof(int64_t),
                             (size_t)est * sizeof(int64_t));
-                        if (!offs) { *offsets_out = NULL; *hdr_out = NULL; return 0; }
+                        if (!offs) { scratch_free(hdr); *offsets_out = NULL; *hdr_out = NULL; return 0; }
                     }
                     offs[n++] = (int64_t)(p - buf);
                 }

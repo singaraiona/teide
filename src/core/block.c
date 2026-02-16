@@ -48,7 +48,7 @@ size_t td_block_size(td_t* v) {
 td_t* td_block_copy(td_t* src) {
     size_t sz = td_block_size(src);
     td_t* dst = td_alloc(sz);
-    if (!dst) return (td_t*)0;
+    if (!dst) return TD_ERR_PTR(TD_ERR_OOM);
     /* Save allocator metadata before memcpy overwrites the header */
     uint8_t new_mmod = dst->mmod;
     uint8_t new_order = dst->order;

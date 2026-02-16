@@ -48,6 +48,7 @@ static inline size_t page_round(size_t n) {
 
 void* td_sys_alloc(size_t size) {
     if (size == 0) size = 1;
+    if (size > SIZE_MAX - SYS_HDR_SIZE) return NULL;
     size_t total = page_round(SYS_HDR_SIZE + size);
     void* p = td_vm_alloc(total);
     if (!p) return NULL;

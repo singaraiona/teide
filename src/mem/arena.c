@@ -291,6 +291,7 @@ td_t* td_alloc(size_t data_size) {
 
     /* Direct mmap for blocks > ORDER_MAX */
     if (order > TD_ORDER_MAX) {
+        if (data_size > SIZE_MAX - 32) return NULL;
         size_t total = data_size + 32;
         total = (total + 4095) & ~(size_t)4095;
         void* ptr = td_vm_alloc(total);
@@ -710,18 +711,26 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
         size_t old_data;
         if (td_is_atom(v))
             old_data = 0;
-        else if (v->type == TD_LIST)
-            old_data = (size_t)td_len(v) * sizeof(td_t*);
-        else if (v->type == TD_TABLE)
-            old_data = (size_t)(td_len(v) + 1) * sizeof(td_t*);
-        else if (TD_IS_PARTED(v->type) || v->type == TD_MAPCOMMON) {
+        else if (v->type == TD_LIST) {
+            if (v->len < 0) { old_data = 0; }
+            else old_data = (size_t)td_len(v) * sizeof(td_t*);
+        } else if (v->type == TD_TABLE) {
+            if (v->len < 0) { old_data = 0; }
+            else old_data = (size_t)(td_len(v) + 1) * sizeof(td_t*);
+        } else if (TD_IS_PARTED(v->type) || v->type == TD_MAPCOMMON) {
             int64_t n_ptrs = v->len;
             if (v->type == TD_MAPCOMMON) n_ptrs = 2;
+            if (n_ptrs < 0) n_ptrs = 0;
             old_data = (size_t)n_ptrs * sizeof(td_t*);
         } else {
             int8_t t = td_type(v);
-            old_data = (t > 0 && t < TD_TYPE_COUNT) ?
+            old_data = (t > 0 && t < TD_TYPE_COUNT && v->len >= 0) ?
                        (size_t)td_len(v) * td_elem_size(t) : 0;
+        }
+        /* Clamp old_data to actual allocation size to prevent read overrun */
+        if (v->mmod == 0 && v->order >= TD_ORDER_MIN && v->order <= TD_ORDER_MAX) {
+            size_t alloc_data = ((size_t)1 << v->order) - 32;
+            if (old_data > alloc_data) old_data = alloc_data;
         }
         size_t copy_data = old_data < new_data_size ? old_data : new_data_size;
         /* Save allocator metadata before memcpy overwrites the header */

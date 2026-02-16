@@ -34,7 +34,7 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 
-use super::handler::SessionMeta;
+use super::handler::{SessionMeta, TableMeta};
 use super::types::teide_to_pg_type;
 
 /// Returns true if the SQL is a simple `SELECT <constant>` with no FROM clause.
@@ -184,7 +184,38 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         return Some(handle_information_schema_columns(meta));
     }
 
-    // pg_type — only match direct FROM (not JOINed)
+    // pg_attribute — column introspection (SQLAlchemy PG dialect)
+    // MUST come before pg_type/pg_namespace: complex pg_attribute queries
+    // contain pg_type/pg_namespace in subqueries.
+    if lower.contains("pg_attribute") && lower.contains("attname") {
+        let table_names = extract_catalog_table_names(lower);
+        let matched: Vec<(&String, &TableMeta)> = meta
+            .tables
+            .iter()
+            .filter(|(n, _)| table_names.contains(n))
+            .map(|(n, m)| (n, m))
+            .collect();
+        if !matched.is_empty() {
+            return Some(handle_pg_attribute(&matched));
+        }
+        return Some(empty_result(&[("name", Type::VARCHAR)]));
+    }
+
+    // pg_class — table/view listing (SQLAlchemy PG dialect uses this)
+    if lower.contains("pg_class") && lower.contains("relname") {
+        // Regular tables + partitioned tables in 'public' schema
+        if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
+            let has_tables = lower.contains("'r'") || lower.contains("'p'");
+            if has_tables {
+                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
+                return Some(single_text_result("relname", &names));
+            }
+        }
+        // Views, materialized views, foreign tables, or other schemas → empty
+        return Some(empty_result(&[("relname", Type::VARCHAR)]));
+    }
+
+    // pg_type — only match direct FROM (not in subqueries of other handlers)
     if lower.contains("from pg_type") || lower.contains("from pg_catalog.pg_type") {
         return Some(empty_result(&[
             ("oid", Type::INT4),
@@ -201,20 +232,6 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
             "nspname",
             &["public", "information_schema"],
         ));
-    }
-
-    // pg_class — table/view listing (SQLAlchemy PG dialect uses this)
-    if lower.contains("pg_class") && lower.contains("relname") {
-        // Regular tables + partitioned tables in 'public' schema
-        if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
-            let has_tables = lower.contains("'r'") || lower.contains("'p'");
-            if has_tables {
-                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
-                return Some(single_text_result("relname", &names));
-            }
-        }
-        // Views, materialized views, foreign tables, or other schemas → empty
-        return Some(empty_result(&[("relname", Type::VARCHAR)]));
     }
 
     // pg_tables — only match direct FROM
@@ -460,6 +477,131 @@ fn handle_pg_tables(meta: &SessionMeta) -> PgWireResult<Vec<Response>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract table name(s) from a pg_attribute/pg_class introspection query.
+/// Matches: `attrelid = '<name>'`, `relname in ('<name>')`, `relname = '<name>'`
+fn extract_catalog_table_names(lower: &str) -> Vec<String> {
+    let mut names = Vec::new();
+
+    // Pattern: relname IN ('t', 'u')  or  relname in ('t')
+    if let Some(start) = lower.find("relname in (") {
+        let rest = &lower[start + "relname in (".len()..];
+        if let Some(end) = rest.find(')') {
+            let inside = &rest[..end];
+            for part in inside.split(',') {
+                let t = part.trim().trim_matches('\'').trim();
+                if !t.is_empty() {
+                    names.push(t.to_string());
+                }
+            }
+        }
+    }
+
+    // Pattern: attrelid = '<name>'
+    for marker in ["attrelid = '", "relname = '"] {
+        if let Some(start) = lower.find(marker) {
+            let rest = &lower[start + marker.len()..];
+            if let Some(end) = rest.find('\'') {
+                let t = &rest[..end];
+                if !t.is_empty() && !names.contains(&t.to_string()) {
+                    names.push(t.to_string());
+                }
+            }
+        }
+    }
+
+    names
+}
+
+/// Return column metadata in the format SQLAlchemy 2.x PG dialect expects.
+/// 9 columns: name, format_type, default, not_null, table_name, comment,
+///            generated, identity_options, collation
+fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "format_type".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "default".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "not_null".into(),
+            None,
+            None,
+            Type::BOOL,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "table_name".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "comment".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "generated".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "identity_options".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "collation".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::new();
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    for (table_name, table_meta) in tables {
+        for (col_name, td_type) in &table_meta.columns {
+            let pg_type = teide_to_pg_type(*td_type);
+            let type_name = pg_type_display_name(&pg_type);
+
+            encoder.encode_field(&Some::<String>(col_name.clone()))?; // name
+            encoder.encode_field(&Some(type_name.to_string()))?; // format_type
+            encoder.encode_field(&None::<String>)?; // default
+            encoder.encode_field(&false)?; // not_null
+            encoder.encode_field(&Some((*table_name).clone()))?; // table_name
+            encoder.encode_field(&None::<String>)?; // comment
+            encoder.encode_field(&Some(String::new()))?; // generated
+            encoder.encode_field(&None::<String>)?; // identity_options
+            encoder.encode_field(&None::<String>)?; // collation
+            rows.push(Ok(encoder.take_row()));
+        }
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
 
 fn pg_type_display_name(ty: &Type) -> &'static str {
     match *ty {

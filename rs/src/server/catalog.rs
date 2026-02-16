@@ -203,6 +203,20 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         ));
     }
 
+    // pg_class — table/view listing (SQLAlchemy PG dialect uses this)
+    if lower.contains("pg_class") && lower.contains("relname") {
+        // Regular tables + partitioned tables in 'public' schema
+        if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
+            let has_tables = lower.contains("'r'") || lower.contains("'p'");
+            if has_tables {
+                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
+                return Some(single_text_result("relname", &names));
+            }
+        }
+        // Views, materialized views, foreign tables, or other schemas → empty
+        return Some(empty_result(&[("relname", Type::VARCHAR)]));
+    }
+
     // pg_tables — only match direct FROM
     if lower.contains("from pg_tables") || lower.contains("from pg_catalog.pg_tables") {
         return Some(handle_pg_tables(meta));

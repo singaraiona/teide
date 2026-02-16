@@ -302,8 +302,14 @@ td_t* td_alloc(size_t data_size) {
         v->order = 0;
         atomic_store_explicit(&v->rc, 1, memory_order_relaxed);
 
-        /* Need order 6 (64B) to hold 32B header + 24B td_direct_block_t data */
-        td_t* tracker_block = td_buddy_alloc(&td_tl_arena->buddy, TD_ORDER_MIN + 1);
+        /* Need order 6 (64B) to hold 32B header + 24B td_direct_block_t data.
+         * Iterate ALL arenas — td_tl_arena may be fully consumed by a large
+         * buddy block while smaller arenas further in the chain have free space. */
+        td_t* tracker_block = NULL;
+        for (td_arena_t* a = td_tl_arena; a; a = a->next) {
+            tracker_block = td_buddy_alloc(&a->buddy, TD_ORDER_MIN + 1);
+            if (tracker_block) break;
+        }
         if (!tracker_block) {
             td_vm_free(ptr, total);
             return NULL;

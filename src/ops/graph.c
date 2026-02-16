@@ -182,7 +182,7 @@ td_graph_t* td_graph_new(td_t* tbl) {
     g->ext_nodes = NULL;
     g->ext_count = 0;
     g->ext_cap = 0;
-    g->filter_mask = NULL;
+    g->selection = NULL;
 
     return g;
 }
@@ -205,7 +205,7 @@ void td_graph_free(td_graph_t* g) {
 
     td_sys_free(g->nodes);
     if (g->table) td_release(g->table);
-    if (g->filter_mask) td_release(g->filter_mask);
+    if (g->selection) td_release(g->selection);
     td_sys_free(g);
 }
 

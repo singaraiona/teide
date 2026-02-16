@@ -44,8 +44,9 @@ pub const TD_GUID: i8 = 12;
 pub const TD_TABLE: i8 = 13;
 pub const TD_SYM: i8 = 14;
 pub const TD_ENUM: i8 = 15;
+pub const TD_SEL: i8 = 16;
 
-pub const TD_TYPE_COUNT: usize = 16;
+pub const TD_TYPE_COUNT: usize = 17;
 
 // Parted types
 pub const TD_PARTED_BASE: i8 = 32;
@@ -449,7 +450,7 @@ pub struct td_graph_t {
     pub ext_nodes: *mut *mut td_op_ext_t,
     pub ext_count: u32,
     pub ext_cap: u32,
-    pub filter_mask: *mut td_t,
+    pub selection: *mut td_t,
 }
 
 // ===== Morsel Iterator =====

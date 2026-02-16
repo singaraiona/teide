@@ -88,6 +88,7 @@ extern "C" {
 #define TD_TABLE     13
 #define TD_SYM       14
 #define TD_ENUM      15
+#define TD_SEL       16   /* selection bitmap (lazy filter) */
 
 /* Parted types: composite of TD_PARTED_BASE + base type */
 #define TD_PARTED_BASE   32
@@ -113,7 +114,7 @@ extern "C" {
 #define TD_ATOM_ENUM       (-TD_ENUM)
 
 /* Number of types (positive range) */
-#define TD_TYPE_COUNT 16
+#define TD_TYPE_COUNT 17
 
 /* ===== Attribute Flags ===== */
 
@@ -393,7 +394,7 @@ typedef struct td_graph {
     td_op_ext_t**  ext_nodes;   /* tracked extended nodes for cleanup */
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
-    td_t*          filter_mask; /* boolean mask for group-by: 0=skip */
+    td_t*          selection;   /* TD_SEL bitmap — lazy filter (NULL = all pass) */
 } td_graph_t;
 
 /* ===== Morsel Iterator ===== */
@@ -407,6 +408,53 @@ typedef struct {
     void*    morsel_ptr;   /* pointer to current morsel data */
     uint8_t* null_bits;    /* current morsel null bitmap (or NULL) */
 } td_morsel_t;
+
+/* ===== Selection Bitmap (TD_SEL) ===== */
+
+/* Segment flags — one per morsel (TD_MORSEL_ELEMS rows) */
+#define TD_SEL_NONE  0   /* all bits 0 — skip entire morsel           */
+#define TD_SEL_ALL   1   /* all bits 1 — process without bitmap check */
+#define TD_SEL_MIX   2   /* mixed bits — must check per-row           */
+
+/* Words per morsel segment: 1024 rows / 64 bits = 16 uint64_t */
+#define TD_SEL_WORDS_PER_SEG  (TD_MORSEL_ELEMS / 64)
+
+/* Inline metadata at td_data(sel) */
+typedef struct {
+    int64_t   total_pass;  /* total passing rows                      */
+    uint32_t  n_segs;      /* ceil(nrows / TD_MORSEL_ELEMS)           */
+    uint32_t  _pad;
+} td_sel_meta_t;
+
+/*
+ * TD_SEL block layout (td_data offset 0):
+ *
+ *   td_sel_meta_t  meta        (16 bytes)
+ *   uint8_t        seg_flags[] (n_segs, padded to 8-byte alignment)
+ *   uint16_t       seg_popcnt[](n_segs, padded to 8-byte alignment)
+ *   uint64_t       bits[]      (ceil(nrows/64) words)
+ */
+
+static inline td_sel_meta_t* td_sel_meta(td_t* s) {
+    return (td_sel_meta_t*)td_data(s);
+}
+static inline uint8_t* td_sel_flags(td_t* s) {
+    return (uint8_t*)td_data(s) + sizeof(td_sel_meta_t);
+}
+static inline uint16_t* td_sel_popcnt(td_t* s) {
+    uint32_t n = td_sel_meta(s)->n_segs;
+    return (uint16_t*)(td_sel_flags(s) + ((n + 7u) & ~7u));
+}
+static inline uint64_t* td_sel_bits(td_t* s) {
+    uint32_t n = td_sel_meta(s)->n_segs;
+    uint16_t* pc = td_sel_popcnt(s);
+    return (uint64_t*)(pc + ((n + 3u) & ~3u));
+}
+
+/* Bit ops */
+#define TD_SEL_BIT_TEST(bits, r)  ((bits)[(r) >> 6] & (1ULL << ((r) & 63)))
+#define TD_SEL_BIT_SET(bits, r)   ((bits)[(r) >> 6] |= (1ULL << ((r) & 63)))
+#define TD_SEL_BIT_CLR(bits, r)   ((bits)[(r) >> 6] &= ~(1ULL << ((r) & 63)))
 
 /* ===== Executor Pipeline ===== */
 
@@ -505,6 +553,13 @@ td_t* td_date(int64_t val);
 td_t* td_time(int64_t val);
 td_t* td_timestamp(int64_t val);
 td_t* td_guid(const uint8_t* bytes);
+
+/* ===== Selection API ===== */
+
+td_t* td_sel_new(int64_t nrows);              /* all-zero (no rows pass)       */
+td_t* td_sel_from_pred(td_t* bool_vec);       /* convert TD_BOOL vec → TD_SEL  */
+td_t* td_sel_and(td_t* a, td_t* b);           /* AND two selections            */
+void  td_sel_recompute(td_t* sel);             /* rebuild seg_flags + popcounts */
 
 /* ===== Vector API ===== */
 

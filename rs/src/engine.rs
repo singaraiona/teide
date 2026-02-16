@@ -1396,19 +1396,19 @@ impl Graph<'_> {
     /// Rows where mask[r]==0 are skipped in scan loops.
     ///
     /// # Safety
-    /// `mask` must be a valid boolean vector allocated by the same engine runtime.
+    /// `sel` must be a valid TD_SEL selection allocated by the same engine runtime.
     ///
     /// # Ownership
-    /// The mask is retained here via `td_retain`. When the graph is freed by
-    /// `td_graph_free`, the C engine releases the filter_mask pointer. The
-    /// retain/release sequence is therefore: caller creates mask (rc=1) ->
-    /// set_filter_mask retains (rc=2) -> caller may release their ref (rc=1)
+    /// The selection is retained here via `td_retain`. When the graph is freed by
+    /// `td_graph_free`, the C engine releases the selection pointer. The
+    /// retain/release sequence is therefore: caller creates sel (rc=1) ->
+    /// set_selection retains (rc=2) -> caller may release their ref (rc=1)
     /// -> graph free releases (rc=0, freed). If an error occurs before graph
     /// execution, td_graph_free still handles the release.
-    pub unsafe fn set_filter_mask(&mut self, mask: *mut ffi::td_t) {
+    pub unsafe fn set_selection(&mut self, sel: *mut ffi::td_t) {
         unsafe {
-            ffi::td_retain(mask);
-            (*self.raw).filter_mask = mask;
+            ffi::td_retain(sel);
+            (*self.raw).selection = sel;
         }
     }
 }

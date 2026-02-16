@@ -125,18 +125,22 @@ impl Session {
     /// Execute a multi-statement SQL script (statements separated by `;`).
     /// Returns the result of the last statement.
     ///
-    /// Known limitation: naive semicolon split does not respect string
-    /// literals. Use execute() for single statements containing semicolons.
+    /// Uses sqlparser to split statements correctly, respecting string
+    /// literals and quoted identifiers.
     pub fn execute_script(&mut self, sql: &str) -> Result<ExecResult, SqlError> {
+        use sqlparser::dialect::DuckDbDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = DuckDbDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| SqlError::Parse(e.to_string()))?;
+        if stmts.is_empty() {
+            return Err(SqlError::Plan("Empty script".into()));
+        }
         let mut last = None;
-        // Known limitation: naive semicolon split does not respect string
-        // literals. Use execute() for single statements containing semicolons.
-        for stmt in sql.split(';') {
-            let s = stmt.trim();
-            if s.is_empty() {
-                continue;
-            }
-            last = Some(self.execute(s)?);
+        for stmt in &stmts {
+            let s = stmt.to_string();
+            last = Some(self.execute(&s)?);
         }
         last.ok_or_else(|| SqlError::Plan("Empty script".into()))
     }

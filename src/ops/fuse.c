@@ -37,6 +37,9 @@
  * interpreter over register slots would be added in a production version.
  * -------------------------------------------------------------------------- */
 
+/* Element-wise opcodes: unary [OP_NEG=10..OP_CAST=19] and
+ * binary [OP_ADD=20..OP_MAX2=34].  These ranges are contiguous by
+ * design (see td.h opcode definitions). */
 static bool is_elementwise(uint16_t opcode) {
     return (opcode >= OP_NEG && opcode <= OP_CAST) ||
            (opcode >= OP_ADD && opcode <= OP_MAX2);

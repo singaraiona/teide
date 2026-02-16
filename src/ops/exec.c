@@ -4374,7 +4374,10 @@ static void emit_agg_columns(td_t** result, td_graph_t* g, const td_op_ext_t* ex
             char nbuf[32];
             int np = 0;
             nbuf[np++] = '_'; nbuf[np++] = 'e';
-            nbuf[np++] = (char)('0' + a);
+            /* Multi-digit agg index */
+            { uint8_t v = a; char dig[3]; int nd = 0;
+              do { dig[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+              while (nd--) nbuf[np++] = dig[nd]; }
             const char* nsfx = "";
             size_t nslen = 0;
             switch (agg_op) {
@@ -5530,13 +5533,22 @@ da_path:;
                 else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
             }
 
-            /* Compute strides: stride[k] = product of ranges[k+1..n_keys-1] */
+            /* Compute strides: stride[k] = product of ranges[k+1..n_keys-1]
+             * Guard against overflow: if any product exceeds INT64_MAX,
+             * fall through to HT path. */
+            bool stride_overflow = false;
             for (uint8_t k = 0; k < n_keys; k++) {
                 int64_t s = 1;
-                for (uint8_t j = k + 1; j < n_keys; j++)
+                for (uint8_t j = k + 1; j < n_keys; j++) {
+                    if (da_key_range[j] != 0 && s > INT64_MAX / da_key_range[j]) {
+                        stride_overflow = true; break;
+                    }
                     s *= da_key_range[j];
+                }
+                if (stride_overflow) break;
                 da_key_stride[k] = s;
             }
+            if (stride_overflow) da_fits = false;
 
             uint32_t n_slots = (uint32_t)total_slots;
             size_t total = (size_t)n_slots * n_aggs;
@@ -6089,13 +6101,22 @@ ht_path:;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                 }
                 char buf[256];
-                if (base && blen + slen < sizeof(buf)) {
-                    memcpy(buf, base, blen);
-                    memcpy(buf + blen, sfx, slen);
-                    name_id = td_sym_intern(buf, blen + slen);
+                td_t* name_dyn_hdr = NULL;
+                char* nbp = buf;
+                size_t nbc = sizeof(buf);
+                if (base && blen + slen >= sizeof(buf)) {
+                    nbp = (char*)scratch_alloc(&name_dyn_hdr, blen + slen + 1);
+                    if (nbp) nbc = blen + slen + 1;
+                    else { nbp = buf; nbc = sizeof(buf); }
+                }
+                if (base && blen + slen < nbc) {
+                    memcpy(nbp, base, blen);
+                    memcpy(nbp + blen, sfx, slen);
+                    name_id = td_sym_intern(nbp, blen + slen);
                 } else {
                     name_id = agg_ext->sym;
                 }
+                scratch_free(name_dyn_hdr);
             } else {
                 name_id = (int64_t)(n_keys + a);
             }
@@ -6276,7 +6297,10 @@ sequential_fallback:;
             char nbuf[32];
             int np = 0;
             nbuf[np++] = '_'; nbuf[np++] = 'e';
-            nbuf[np++] = (char)('0' + a);
+            /* Multi-digit agg index */
+            { uint8_t v = a; char dig[3]; int nd = 0;
+              do { dig[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+              while (nd--) nbuf[np++] = dig[nd]; }
             const char* nsfx = "";
             size_t nslen = 0;
             switch (agg_op) {
@@ -6342,10 +6366,15 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
+    /* Guard: fixed-size arrays below cap at 16 agg ops and 8 AVG slots.
+     * n_aggs + n_avg <= 16 must hold (n_avg <= n_aggs), and n_keys <= 8
+     * for avg_idx.  Return NULL to fall through to concat path. */
+    if (n_aggs > 8 || n_keys > 8) return NULL;
+
     /* AVG decomposition: for merge, AVG(x) becomes SUM(x) + COUNT(x).
      * Build the per-partition agg_ops: replace AVG with SUM, then append
      * COUNT for each AVG slot. */
-    uint16_t part_ops[16];   /* per-partition agg ops */
+    uint16_t part_ops[16];   /* per-partition agg ops (n_aggs + n_avg <= 16) */
     uint16_t merge_ops[16];  /* merge agg ops */
     uint8_t  avg_idx[8];     /* which original agg slots are AVG */
     uint8_t  n_avg = 0;
@@ -6653,16 +6682,13 @@ static inline bool join_keys_eq(td_t* const* l_vecs, td_t* const* r_vecs, uint8_
  * CAS contention.
  * ──────────────────────────────────────────────────────────────────── */
 
-/* Note: ht_heads is accessed via GCC/Clang __atomic builtins on plain int64_t.
- * Technically UB per C11 (requires _Atomic), but universally supported by
- * GCC/Clang and generates correct code.  Changing to _Atomic(int64_t) could
- * affect scratch_alloc alignment requirements, so we keep plain type. */
-_Static_assert(_Alignof(int64_t) >= 8, "int64_t must be 8-byte aligned for atomic ops");
+/* ht_heads is accessed atomically from multiple workers during join build.
+ * Using _Atomic(uint32_t)* for C11-compliant atomic access. */
 #define JHT_EMPTY UINT32_MAX  /* sentinel for empty HT slot/chain end */
 
 typedef struct {
-    uint32_t* ht_heads;     /* shared, protected by atomic CAS */
-    uint32_t* ht_next;      /* per-row, no contention */
+    _Atomic(uint32_t)* ht_heads;  /* shared, protected by atomic CAS */
+    uint32_t* ht_next;            /* per-row, no contention */
     uint32_t ht_mask;       /* ht_cap - 1 */
     td_t**   r_key_vecs;
     uint8_t  n_keys;
@@ -6671,7 +6697,7 @@ typedef struct {
 static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     join_build_ctx_t* c = (join_build_ctx_t*)raw;
-    uint32_t* heads = c->ht_heads;
+    _Atomic(uint32_t)* heads = c->ht_heads;
     uint32_t* restrict next  = c->ht_next;
     uint32_t mask  = c->ht_mask;
 
@@ -6683,18 +6709,18 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
         uint64_t h = hash_row_keys(c->r_key_vecs, c->n_keys, r);
         uint32_t slot = (uint32_t)(h & mask);
         uint32_t row32 = (uint32_t)r;
-        uint32_t old = __atomic_load_n(&heads[slot], __ATOMIC_RELAXED);
+        uint32_t old = atomic_load_explicit(&heads[slot], memory_order_relaxed);
         do {
             next[row32] = old;
-        } while (!__atomic_compare_exchange_n(&heads[slot], &old, row32,
-                    1 /* weak */, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+        } while (!atomic_compare_exchange_weak_explicit(&heads[slot], &old, row32,
+                    memory_order_release, memory_order_relaxed));
     }
 }
 
 #define JOIN_MORSEL 8192
 
 typedef struct {
-    uint32_t*    ht_heads;
+    _Atomic(uint32_t)* ht_heads;
     uint32_t*    ht_next;
     uint32_t     ht_cap;
     td_t**       l_key_vecs;
@@ -6709,7 +6735,7 @@ typedef struct {
     int64_t*     l_idx;
     int64_t*     r_idx;
     /* FULL OUTER: track which right rows were matched (NULL if not full) */
-    uint8_t*     matched_right;
+    _Atomic(uint8_t)* matched_right;
 } join_probe_ctx_t;
 
 /* Phase 2a: count matches per morsel */
@@ -6770,9 +6796,8 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
                 ri[off] = (int64_t)r;
                 off++;
                 matched = true;
-                /* Monotonic 0→1 store from multiple workers; benign race on
-                 * non-_Atomic uint8_t (same UB caveat as join_build_fn atomics). */
-                if (c->matched_right) __atomic_store_n(&c->matched_right[r], 1, __ATOMIC_RELAXED);
+                /* Monotonic 0→1 store from multiple workers. */
+                if (c->matched_right) atomic_store_explicit(&c->matched_right[r], 1, memory_order_relaxed);
             }
         }
         if (!matched && c->join_type >= 1) {
@@ -6831,7 +6856,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
-    uint32_t* ht_heads = (uint32_t*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
+    _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
     if (!ht_next || !ht_heads) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
         return TD_ERR_PTR(TD_ERR_OOM);
@@ -6865,10 +6890,10 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     }
 
     /* For FULL OUTER JOIN, allocate matched_right tracker */
-    uint8_t* matched_right = NULL;
+    _Atomic(uint8_t)* matched_right = NULL;
     if (join_type == 2 && right_rows > 0) {
-        matched_right = (uint8_t*)scratch_calloc(&matched_right_hdr,
-                                                  (size_t)right_rows);
+        matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
+                                                           (size_t)right_rows);
         if (!matched_right) goto join_cleanup;
     }
 
@@ -7373,7 +7398,7 @@ static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
         td_t* dyn_hdr = NULL;
         if (sl >= sizeof(sbuf)) {
             buf = (char*)scratch_alloc(&dyn_hdr, sl + 1);
-            if (!buf) { buf = sbuf; sl = sizeof(sbuf) - 1; }
+            if (!buf) { dst[i] = td_sym_intern("", 0); continue; }
         }
         size_t out_len = sl;
         if (opc == OP_UPPER) {
@@ -7524,7 +7549,7 @@ static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
         td_t* dyn_hdr = NULL;
         if (worst > sizeof(sbuf)) {
             buf = (char*)scratch_alloc(&dyn_hdr, worst);
-            if (!buf) { buf = sbuf; worst = sizeof(sbuf); }
+            if (!buf) { dst[i] = td_sym_intern("", 0); continue; }
         }
         size_t buf_cap = dyn_hdr ? worst : sizeof(sbuf);
         size_t bi = 0;
@@ -7549,9 +7574,9 @@ static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
 static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     td_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
-    int n_args = (int)ext->sym;
-    if (n_args < 2) return TD_ERR_PTR(TD_ERR_DOMAIN);
-    if (n_args > 255) n_args = 255; /* cap to prevent excessive trailing reads */
+    int64_t raw_nargs = ext->sym;
+    if (raw_nargs < 2 || raw_nargs > 255) return TD_ERR_PTR(TD_ERR_DOMAIN);
+    int n_args = (int)raw_nargs;
 
     /* Evaluate all inputs */
     td_t* args_stack[16];
@@ -8327,7 +8352,7 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
         } else if (pk->type == TD_I32 || pk->type == TD_DATE || pk->type == TD_TIME) {
             const int32_t* src = (const int32_t*)pkd;
             for (int64_t i = start; i < end; i++)
-                out[i] = (uint64_t)(uint32_t)src[sidx[i]];
+                out[i] = (uint64_t)((uint32_t)(src[sidx[i]] - INT32_MIN));
         } else {
             const uint64_t* src = (const uint64_t*)pkd;
             for (int64_t i = start; i < end; i++)
@@ -8343,9 +8368,12 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
                 if (col->type == TD_ENUM)
                     key = (key << 32) | ((const uint32_t*)d)[r];
                 else if (col->type == TD_I32 || col->type == TD_DATE || col->type == TD_TIME)
-                    key = (key << 32) | (uint32_t)((const int32_t*)d)[r];
-                else
+                    key = (key << 32) | (uint32_t)(((const int32_t*)d)[r] - INT32_MIN);
+                else {
+                    /* Unreachable: has_64bit_key guard above forces can_pack=false
+                     * for multi-key with any 64-bit type, so this never truncates. */
                     key = (key << 32) | (uint32_t)((const uint64_t*)d)[r];
+                }
             }
             out[i] = key;
         }

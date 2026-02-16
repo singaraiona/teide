@@ -34,10 +34,17 @@ fn main() {
     build
         .include(&include_dir)
         .include(&src_dir)
-        .flag("-O3")
-        .flag("-mtune=generic")
-        .define("NDEBUG", None)
         .std("c17");
+
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    if profile == "debug" {
+        build.flag("-O0").flag("-g");
+    } else {
+        build
+            .flag("-O3")
+            .flag("-mtune=generic")
+            .define("NDEBUG", None);
+    }
 
     for f in &c_files {
         build.file(f);

@@ -445,7 +445,8 @@ td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_va
     ext->base.inputs[1] = then_val;
     ext->base.out_type = out_type;
     ext->base.est_rows = est;
-    /* Store else_val pointer via the literal field */
+    /* Store else_val as a node ID (not a pointer) in the literal field.
+     * Recovered via (uint32_t)(uintptr_t)ext->literal in fuse.c/exec.c. */
     ext->literal = (td_t*)(uintptr_t)else_id;
 
     g->nodes[ext->base.id] = ext->base;

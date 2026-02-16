@@ -211,8 +211,11 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
                       int64_t total_elems) {
     if (total_elems <= 0) return;
 
-    /* Calculate number of tasks */
+    /* Calculate number of tasks.
+     * Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
     int64_t grain = TASK_GRAIN;
+    if (TD_UNLIKELY(total_elems > INT64_MAX - grain + 1))
+        total_elems = INT64_MAX - grain + 1;
     uint32_t n_tasks = (uint32_t)((total_elems + grain - 1) / grain);
 
     /* conc-L6: Ring growth is safe without synchronization because dispatch is

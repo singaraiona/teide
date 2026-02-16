@@ -246,6 +246,9 @@ impl FrameBound {
 // ---------------------------------------------------------------------------
 
 fn check_ptr(ptr: *mut ffi::td_t) -> Result<*mut ffi::td_t> {
+    if ptr.is_null() {
+        return Err(Error::Oom);
+    }
     if ffi::td_is_err(ptr) {
         Err(Error::from_code(ffi::td_err_code(ptr)))
     } else {
@@ -462,9 +465,9 @@ impl Context {
     /// Create a new operation graph bound to a table.
     pub fn graph<'a>(&self, table: &'a Table) -> Result<Graph<'a>> {
         let raw = unsafe { ffi::td_graph_new(table.raw) };
-        // Defensive check; td_graph_new only returns null on failure.
-        // The td_is_err check is retained as a safeguard.
-        if raw.is_null() || ffi::td_is_err(raw as *const ffi::td_t) {
+        // td_graph_new returns null on failure (OOM). It returns a
+        // td_graph_t*, not a td_t*, so td_is_err is not applicable.
+        if raw.is_null() {
             return Err(Error::Oom);
         }
         Ok(Graph {
@@ -602,7 +605,14 @@ impl Table {
         if col.is_null() {
             return Err(Error::NullPointer);
         }
-        self.raw = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
+        let next = unsafe { ffi::td_table_add_col(self.raw, name_id, col) };
+        if next.is_null() {
+            return Err(Error::Oom);
+        }
+        if ffi::td_is_err(next) {
+            return Err(Error::from_code(ffi::td_err_code(next)));
+        }
+        self.raw = next;
         Ok(())
     }
 

@@ -30,6 +30,7 @@ td_t* td_alloc(size_t size) {
     if (size < 32) size = 32;
     size = (size + 4095) & ~(size_t)4095;
     void* p = td_vm_alloc(size);
+    if (!p) return TD_ERR_PTR(TD_ERR_OOM);
     return (td_t*)p;
 }
 
@@ -39,6 +40,18 @@ size_t td_block_size(td_t* v) {
     if (v->type == TD_LIST) return 32 + (size_t)td_len(v) * sizeof(td_t*);
     /* TABLE stores schema slot + ncols column pointers */
     if (v->type == TD_TABLE) return 32 + (size_t)(td_len(v) + 1) * sizeof(td_t*);
+    /* TD_SEL: variable layout — meta + seg_flags + seg_popcnt + bits */
+    if (v->type == TD_SEL) {
+        int64_t nrows = td_len(v);
+        if (nrows < 0) return 32;
+        uint32_t n_segs = (uint32_t)((nrows + TD_MORSEL_ELEMS - 1) / TD_MORSEL_ELEMS);
+        uint32_t n_words = (uint32_t)((nrows + 63) / 64);
+        size_t dsz = sizeof(td_sel_meta_t);
+        dsz += (n_segs + 7u) & ~(size_t)7;           /* seg_flags, 8-aligned */
+        dsz += ((size_t)n_segs * 2 + 7u) & ~(size_t)7; /* seg_popcnt, 8-aligned */
+        dsz += (size_t)n_words * 8;                   /* bits */
+        return 32 + dsz;
+    }
     /* Vectors: header (32 bytes) + len * elem_size */
     int8_t t = td_type(v);
     if (t <= 0 || t >= TD_TYPE_COUNT) return 32;

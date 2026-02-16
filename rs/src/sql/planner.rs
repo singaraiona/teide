@@ -2287,16 +2287,27 @@ fn concat_tables(ctx: &Context, left: &Table, right: &Table) -> Result<Table, Sq
 
 /// Execute a CROSS JOIN (Cartesian product) of two tables.
 ///
-/// **Known limitation**: cross join memcpy does not preserve null bitmaps.
-/// Columns with nulls will have null information silently dropped.
-/// This is acceptable because cross join is currently only used for small
-/// literal tables that never contain nulls in practice. If cross join is
-/// later exposed for general use, a null bitmap check should be added to
-/// return an error when input columns carry null bitmaps.
+/// Rejects columns with null bitmaps because the memcpy expansion does not
+/// preserve them. This is fine in practice: cross join is only used for
+/// small literal tables that never contain nulls.
 fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, SqlError> {
     let _ = ctx;
     let left = ensure_vector_columns(left, "CROSS JOIN")?;
     let right = ensure_vector_columns(right, "CROSS JOIN")?;
+
+    // Reject columns that carry null bitmaps — memcpy cannot preserve them.
+    for tbl in [&left, &right] {
+        for c in 0..tbl.ncols() {
+            if let Some(col) = tbl.get_col_idx(c) {
+                let attrs = unsafe { (*col).attrs };
+                if attrs & crate::ffi::TD_ATTR_HAS_NULLS != 0 {
+                    return Err(SqlError::Plan(
+                        "CROSS JOIN does not support columns with NULL values".into(),
+                    ));
+                }
+            }
+        }
+    }
 
     let l_nrows = left.nrows() as usize;
     let r_nrows = right.nrows() as usize;
@@ -2392,6 +2403,10 @@ fn exec_set_operation(
     let right_cols = collect_setop_columns(&right, ncols)?;
 
     // Hash all right-side rows into buckets; exact row equality is checked on probe.
+    // NOTE: DefaultHasher is non-deterministic across Rust versions (SipHash with
+    // random seed). This is acceptable here because the hash is only used as a
+    // partition key for the probe phase — correctness relies on setop_rows_equal,
+    // not on hash stability across runs.
     let mut right_buckets: StdMap<u64, Vec<usize>> = StdMap::new();
     for r in 0..r_nrows {
         let h = hash_setop_row(&right_cols, r);
@@ -2655,7 +2670,7 @@ fn object_name_to_string(name: &ObjectName) -> String {
 /// Check that a table path is safe: no parent traversal or null bytes.
 /// Absolute paths are allowed (local library, user has full file access).
 fn is_safe_table_path(p: &str) -> bool {
-    !p.contains('\0')
+    !p.contains('\0') && !p.contains("..")
 }
 
 /// Ensure path has .csv extension if no extension present.

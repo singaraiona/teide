@@ -27,7 +27,28 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdatomic.h>
+/* MSVC < 17.4 (cl 19.34) does not ship <stdatomic.h>; use Interlocked intrinsics
+ * instead. _MSC_VER 1934 corresponds to VS 2022 17.4. */
+#if !defined(_MSC_VER) || _MSC_VER >= 1934
+  #include <stdatomic.h>
+#else
+  #include <windows.h>
+  #define _Atomic(T)                          volatile T
+  #define atomic_store_explicit(p, v, mo)     (*(p) = (v))
+  #define atomic_load_explicit(p, mo)         (*(p))
+  #define atomic_fetch_add_explicit(p, v, mo) _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
+  #define atomic_fetch_sub_explicit(p, v, mo) _InterlockedExchangeAdd((volatile long*)(p), -(long)(v))
+  #define atomic_exchange_explicit(p, v, mo)  _InterlockedExchange((volatile long*)(p), (long)(v))
+  #define atomic_compare_exchange_weak_explicit(p, exp, des, s, f) \
+      (_InterlockedCompareExchange((volatile long*)(p), (long)(des), *(long*)(exp)) == *(long*)(exp))
+  #define atomic_store(p, v)                  (*(p) = (v))
+  #define atomic_thread_fence(mo)             MemoryBarrier()
+  #define memory_order_relaxed 0
+  #define memory_order_acquire 0
+  #define memory_order_release 0
+  #define memory_order_acq_rel 0
+  #define memory_order_seq_cst 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +56,7 @@ extern "C" {
 
 /* ===== Platform Macros ===== */
 
+#ifndef TD_LIKELY
 #if defined(__GNUC__) || defined(__clang__)
   #define TD_LIKELY(x)   __builtin_expect(!!(x), 1)
   #define TD_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -51,6 +73,7 @@ extern "C" {
   #define TD_ALIGN(n)
   #define TD_INLINE      static inline
 #endif
+#endif /* TD_LIKELY */
 
 #if defined(_MSC_VER)
   #define TD_TLS __declspec(thread)
@@ -521,6 +544,10 @@ void td_parallel_end(void);
 /* ===== Memory Allocator API ===== */
 
 td_t*    td_alloc(size_t data_size);
+/* NOTE: td_free only works correctly when called from the allocating thread.
+ * Arena-backed blocks (mmod==0) support cross-thread free via the return queue.
+ * Direct-mmap blocks (mmod==2) silently leak if freed from a non-owning thread
+ * because the tracker list is per-thread and cannot be traversed cross-thread. */
 void     td_free(td_t* v);
 td_t*    td_alloc_copy(td_t* v);
 td_t*    td_scratch_alloc(size_t data_size);

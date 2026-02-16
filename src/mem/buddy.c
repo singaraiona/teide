@@ -23,6 +23,7 @@
 
 #include "buddy.h"
 #include <string.h>
+#include <assert.h>
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -153,6 +154,7 @@ size_t td_buddy_bitmap_size(size_t region_size) {
 void td_buddy_init(td_buddy_t* b, uint8_t* base, size_t size,
                    uint8_t* split_bits, size_t split_sz,
                    uint8_t* buddy_bits, size_t buddy_sz) {
+    assert(size > 0 && (size & (size - 1)) == 0 && "size must be a power of 2");
     b->base = base;
     b->size = size;
     b->top_order = ceil_log2(size);

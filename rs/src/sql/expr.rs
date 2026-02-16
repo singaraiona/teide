@@ -1386,6 +1386,17 @@ fn parse_i64_literal(expr: &Expr) -> Result<i64, SqlError> {
     }
 }
 
+/// Numeric ordering for frame bounds (lower = earlier in the window).
+fn frame_bound_order(b: &FrameBound) -> i64 {
+    match b {
+        FrameBound::UnboundedPreceding => i64::MIN,
+        FrameBound::Preceding(n) => -n,
+        FrameBound::CurrentRow => 0,
+        FrameBound::Following(n) => *n,
+        FrameBound::UnboundedFollowing => i64::MAX,
+    }
+}
+
 /// Convert sqlparser WindowSpec to Teide FrameType + FrameBound pair.
 pub fn parse_window_frame(
     spec: &WindowSpec,
@@ -1401,6 +1412,11 @@ pub fn parse_window_frame(
                 Some(b) => convert_frame_bound(b)?,
                 None => FrameBound::CurrentRow,
             };
+            if frame_bound_order(&start) > frame_bound_order(&end) {
+                return Err(SqlError::Plan(
+                    "Window frame start must not be after frame end".into(),
+                ));
+            }
             Ok((ft, start, end))
         }
         None => {

@@ -629,6 +629,9 @@ void td_free(td_t* v) {
     }
 
     uint8_t order = v->order;
+    /* Bounds check: order must be within [ORDER_MIN, ORDER_MAX] for the
+     * shift and buddy free to be valid. Corrupt or zero order → bail. */
+    if (order < TD_ORDER_MIN || order > TD_ORDER_MAX) return;
     size_t block_size = (size_t)1 << order;
 
     td_arena_t* a = td_arena_find(v);
@@ -748,6 +751,10 @@ td_t* td_scratch_realloc(td_t* v, size_t new_data_size) {
         new_v->mmod = new_mmod;
         new_v->order = new_order;
         atomic_store_explicit(&new_v->rc, 1, memory_order_relaxed);
+        /* H7: Retain child refs on new_v BEFORE detaching the old block,
+         * so that STR/LIST/TABLE child refcounts are bumped before the old
+         * block releases them via detach + free. */
+        td_retain_owned_refs(new_v);
         td_detach_owned_refs(v);
         td_free(v);
     }

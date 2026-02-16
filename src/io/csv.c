@@ -288,6 +288,17 @@ typedef enum {
 static csv_type_t detect_type(const char* f, size_t len) {
     if (len == 0) return CSV_TYPE_UNKNOWN;
 
+    /* NaN/Inf literals → float */
+    if (len == 3) {
+        if ((f[0]=='n'||f[0]=='N') && (f[1]=='a'||f[1]=='A') && (f[2]=='n'||f[2]=='N'))
+            return CSV_TYPE_F64;
+        if ((f[0]=='i'||f[0]=='I') && (f[1]=='n'||f[1]=='N') && (f[2]=='f'||f[2]=='F'))
+            return CSV_TYPE_F64;
+    }
+    if ((len == 4 && (f[0]=='+' || f[0]=='-')) &&
+        (f[1]=='i'||f[1]=='I') && (f[2]=='n'||f[2]=='N') && (f[3]=='f'||f[3]=='F'))
+        return CSV_TYPE_F64;
+
     /* Boolean */
     if ((len == 4 && memcmp(f, "true", 4) == 0) ||
         (len == 5 && memcmp(f, "false", 5) == 0) ||
@@ -495,6 +506,18 @@ TD_INLINE int64_t fast_i64(const char* p, size_t len) {
         val = val * 10 + d;
         p++;
     }
+    /* 18-digit values may exceed int64 range; fall back to strtoll for safety */
+    if (TD_UNLIKELY(digit_len == 18)) {
+        uint64_t limit = neg ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+        if (val > limit) {
+            char tmp[32];
+            size_t slen = (size_t)(end - start);
+            if (slen > sizeof(tmp) - 1) slen = sizeof(tmp) - 1;
+            memcpy(tmp, start, slen);
+            tmp[slen] = '\0';
+            return strtoll(tmp, NULL, 10);
+        }
+    }
     /* Negate in unsigned to avoid signed overflow UB */
     return neg ? (int64_t)(~val + 1u) : (int64_t)val;
 }
@@ -515,6 +538,22 @@ static const double g_pow10[] = {
 TD_INLINE double fast_f64(const char* p, size_t len) {
     if (TD_UNLIKELY(len == 0)) return 0.0;
 
+    /* NaN/Inf string literals — check before numeric parse */
+    if (TD_UNLIKELY(len <= 4)) {
+        if (len == 3 &&
+            (p[0]=='n'||p[0]=='N') && (p[1]=='a'||p[1]=='A') && (p[2]=='n'||p[2]=='N'))
+            return __builtin_nan("");
+        if (len == 3 &&
+            (p[0]=='i'||p[0]=='I') && (p[1]=='n'||p[1]=='N') && (p[2]=='f'||p[2]=='F'))
+            return __builtin_inf();
+        if (len == 4 && p[0] == '+' &&
+            (p[1]=='i'||p[1]=='I') && (p[2]=='n'||p[2]=='N') && (p[3]=='f'||p[3]=='F'))
+            return __builtin_inf();
+        if (len == 4 && p[0] == '-' &&
+            (p[1]=='i'||p[1]=='I') && (p[2]=='n'||p[2]=='N') && (p[3]=='f'||p[3]=='F'))
+            return -__builtin_inf();
+    }
+
     const char* start = p;
     const char* end = p + len;
     int negative = 0;
@@ -530,6 +569,10 @@ TD_INLINE double fast_f64(const char* p, size_t len) {
         p++;
         if (idigits > 18) goto strtod_fallback;
     }
+    /* 18-digit integer parts risk uint64 overflow in subsequent mul;
+     * fall back to strtod for exact conversion. */
+    if (TD_UNLIKELY(idigits == 18 && int_part > (uint64_t)999999999999999999ULL))
+        goto strtod_fallback;
     double val = (double)int_part;
 
     /* Fractional part */
@@ -629,6 +672,7 @@ TD_INLINE int32_t fast_date(const char* p, size_t len) {
     int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
     int m = (p[5]-'0')*10 + (p[6]-'0');
     int d = (p[8]-'0')*10 + (p[9]-'0');
+    if (TD_UNLIKELY(m < 1 || m > 12 || d < 1 || d > 31)) return 0;
     return civil_to_days(y, m, d);
 }
 
@@ -637,6 +681,7 @@ TD_INLINE int64_t fast_time(const char* p, size_t len) {
     int h  = (p[0]-'0')*10 + (p[1]-'0');
     int mi = (p[3]-'0')*10 + (p[4]-'0');
     int s  = (p[6]-'0')*10 + (p[7]-'0');
+    if (TD_UNLIKELY(h > 23 || mi > 59 || s > 59)) return 0;
     int64_t us = (int64_t)h * 3600000000LL + (int64_t)mi * 60000000LL +
                  (int64_t)s * 1000000LL;
     /* Fractional seconds → microseconds */
@@ -1050,8 +1095,10 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
     td_t* result = NULL;
 
     /* ---- 3. Detect delimiter ---- */
-    /* Delimiter auto-detected from header row only. Explicit delimiter
-     * recommended when header differs from data. */
+    /* Delimiter auto-detected from header row only. Files where the header
+     * has a different delimiter distribution than data rows may be misdetected;
+     * pass an explicit delimiter for such files.  Scanning additional data rows
+     * was considered but adds complexity for a rare edge case. */
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
         for (const char* p = buf; p < buf_end && *p != '\n'; p++) {
@@ -1124,9 +1171,15 @@ td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
     /* ---- 7. Resolve column types ---- */
     int8_t resolved_types[CSV_MAX_COLS];
     if (col_types_in && n_types >= ncols) {
-        /* Explicit types provided by caller */
-        for (int c = 0; c < ncols; c++)
-            resolved_types[c] = col_types_in[c];
+        /* Explicit types provided by caller — validate against known types */
+        for (int c = 0; c < ncols; c++) {
+            int8_t t = col_types_in[c];
+            if (t < TD_BOOL || t >= TD_TYPE_COUNT || t == TD_TABLE) {
+                /* Invalid type constant — fall through to error */
+                goto fail_offsets;
+            }
+            resolved_types[c] = t;
+        }
     } else if (!col_types_in) {
         /* Auto-infer from sample rows */
         csv_type_t col_types[CSV_MAX_COLS];

@@ -163,8 +163,22 @@ fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>, timer: bool) {
         eprintln!("Error reading {}: {e}", path.display());
         std::process::exit(1);
     });
-    for stmt in contents.split(';') {
-        let sql = stmt.trim();
+    let dialect = sqlparser::dialect::DuckDbDialect {};
+    let stmts = match sqlparser::parser::Parser::parse_sql(&dialect, &contents) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "{}Error parsing {}: {e}{}",
+                theme::ERROR,
+                path.display(),
+                theme::R
+            );
+            std::process::exit(1);
+        }
+    };
+    for stmt in &stmts {
+        let sql = stmt.to_string();
+        let sql = sql.trim();
         if sql.is_empty() {
             continue;
         }

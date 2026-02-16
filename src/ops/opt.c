@@ -289,7 +289,7 @@ static bool replace_with_const(td_graph_t* g, td_op_t* node, td_t* literal) {
     ext->base.inputs[0] = NULL;
     ext->base.inputs[1] = NULL;
     ext->base.flags &= (uint8_t)~OP_FLAG_FUSED;
-    ext->base.out_type = literal->type < 0 ? (int8_t)-literal->type : literal->type;
+    ext->base.out_type = literal->type < 0 ? (int8_t)(-(int)literal->type) : literal->type;
     ext->literal = literal;
 
     *node = ext->base;

@@ -54,9 +54,18 @@ pub fn is_catalog_query(sql: &str) -> bool {
         || lower.starts_with("select current_schema")
         || lower.starts_with("select current_database")
         || lower.starts_with("select version()")
-        || lower == "show transaction isolation level"
-        || lower == "show standard_conforming_strings"
+        || lower.starts_with("show ")
         || lower.starts_with("set ")
+        || lower == "begin"
+        || lower == "commit"
+        || lower == "rollback"
+        || lower == "end"
+        || lower.starts_with("begin;")
+        || lower.starts_with("commit;")
+        || lower.starts_with("rollback;")
+        || lower.starts_with("deallocate ")
+        || lower.starts_with("close ")
+        || lower.starts_with("discard ")
 }
 
 /// Handle a catalog query, returning a pgwire Response.
@@ -78,6 +87,35 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         return Some(Ok(vec![Response::Execution(Tag::new("SET").with_rows(0))]));
     }
 
+    // Transaction control: acknowledge silently
+    if lower == "begin"
+        || lower == "commit"
+        || lower == "rollback"
+        || lower == "end"
+        || lower.starts_with("begin;")
+        || lower.starts_with("commit;")
+        || lower.starts_with("rollback;")
+    {
+        let tag = if lower.starts_with("begin") {
+            "BEGIN"
+        } else if lower.starts_with("commit") || lower.starts_with("end") {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        return Some(Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]));
+    }
+
+    // DEALLOCATE / CLOSE / DISCARD: acknowledge silently
+    if lower.starts_with("deallocate ")
+        || lower.starts_with("close ")
+        || lower.starts_with("discard ")
+    {
+        return Some(Ok(vec![Response::Execution(
+            Tag::new("OK").with_rows(0),
+        )]));
+    }
+
     // SHOW commands
     if lower == "show transaction isolation level" {
         return Some(single_text_result(
@@ -87,6 +125,14 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
     }
     if lower == "show standard_conforming_strings" {
         return Some(single_text_result("standard_conforming_strings", &["on"]));
+    }
+    if lower.starts_with("show server_version") {
+        return Some(single_text_result("server_version", &["16.6"]));
+    }
+    if lower.starts_with("show ") {
+        // Generic SHOW fallback — return empty string
+        let param = lower.trim_start_matches("show ").trim_end_matches(';').trim();
+        return Some(single_text_result(param, &[""]));
     }
 
     // current_schema / current_database / version

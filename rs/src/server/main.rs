@@ -89,7 +89,15 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let sql = format!("CREATE TABLE {name} AS SELECT * FROM '{path}'");
+        let abs_path = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: cannot resolve path '{path}': {e}");
+                std::process::exit(1);
+            }
+        };
+        let abs_str = abs_path.display();
+        let sql = format!("CREATE TABLE {name} AS SELECT * FROM '{abs_str}'");
         if args.verbose {
             eprintln!("[init] {sql}");
         }

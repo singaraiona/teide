@@ -233,6 +233,8 @@ impl SimpleQueryHandler for TeideHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        eprintln!("[query] {query}");
+
         // Check for catalog queries (handled locally, no engine needed)
         if catalog::is_catalog_query(query) {
             if let Some(result) = catalog::handle_catalog_query(query, &self.meta) {

@@ -142,10 +142,10 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
     if lower.starts_with("select current_database") {
         return Some(single_text_result("current_database", &["teide"]));
     }
-    if lower.starts_with("select version()") {
+    if lower.starts_with("select version()") || lower.contains("pg_catalog.version()") {
         return Some(single_text_result(
             "version",
-            &["Teide 0.2.0 (PostgreSQL compatible)"],
+            &["PostgreSQL 16.6 (Teide 0.2.0)"],
         ));
     }
 

@@ -184,8 +184,8 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         return Some(handle_information_schema_columns(meta));
     }
 
-    // pg_type — return an empty result with correct schema
-    if lower.contains("pg_type") {
+    // pg_type — only match direct FROM (not JOINed)
+    if lower.contains("from pg_type") || lower.contains("from pg_catalog.pg_type") {
         return Some(empty_result(&[
             ("oid", Type::INT4),
             ("typname", Type::VARCHAR),
@@ -195,16 +195,16 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         ]));
     }
 
-    // pg_namespace — return public + information_schema
-    if lower.contains("pg_namespace") {
+    // pg_namespace — only match direct FROM (schema listing), not JOINs
+    if lower.contains("from pg_namespace") || lower.contains("from pg_catalog.pg_namespace") {
         return Some(single_text_result(
             "nspname",
             &["public", "information_schema"],
         ));
     }
 
-    // pg_tables — list session tables
-    if lower.contains("pg_tables") {
+    // pg_tables — only match direct FROM
+    if lower.contains("from pg_tables") || lower.contains("from pg_catalog.pg_tables") {
         return Some(handle_pg_tables(meta));
     }
 

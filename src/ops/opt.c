@@ -562,6 +562,7 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
     if (!root) return;
 
     uint32_t nc = g->node_count;
+    if (nc > UINT32_MAX / 2) return;
     /* Worst case: each node can contribute up to ~N children (CONCAT trailing),
        but nc*2 is a safe upper bound for the stack. */
     uint32_t stack_cap = nc * 2;

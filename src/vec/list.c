@@ -40,6 +40,8 @@ static int64_t list_capacity(td_t* list) {
 
 td_t* td_list_new(int64_t capacity) {
     if (capacity < 0) return TD_ERR_PTR(TD_ERR_RANGE);
+    if ((uint64_t)capacity > SIZE_MAX / sizeof(td_t*))
+        return TD_ERR_PTR(TD_ERR_OOM);
     size_t data_size = (size_t)capacity * sizeof(td_t*);
 
     td_t* list = td_alloc(data_size);
@@ -72,7 +74,10 @@ td_t* td_list_append(td_t* list, td_t* item) {
         if (new_data_size < 32) new_data_size = 32;
         else {
             size_t s = 32;
-            while (s < new_data_size) s *= 2;
+            while (s < new_data_size) {
+                if (s > SIZE_MAX / 2) return TD_ERR_PTR(TD_ERR_OOM);
+                s *= 2;
+            }
             new_data_size = s;
         }
         td_t* new_list = td_scratch_realloc(list, new_data_size);

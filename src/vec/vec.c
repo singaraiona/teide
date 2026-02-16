@@ -88,7 +88,10 @@ td_t* td_vec_append(td_t* vec, const void* elem) {
         if (new_data_size < 32) new_data_size = 32;
         else {
             size_t s = 32;
-            while (s < new_data_size) s *= 2;
+            while (s < new_data_size) {
+                if (s > SIZE_MAX / 2) return TD_ERR_PTR(TD_ERR_OOM);
+                s *= 2;
+            }
             new_data_size = s;
         }
         td_t* new_vec = td_scratch_realloc(vec, new_data_size);

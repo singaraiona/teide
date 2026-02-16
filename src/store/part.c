@@ -197,6 +197,7 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
         }
         result = td_table_add_col(result, name_id, combined);
         td_release(combined);
+        if (!result || TD_IS_ERR(result)) break;
     }
 
     /* Cleanup */
@@ -352,6 +353,7 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
 
         result = td_table_add_col(result, name_id, parted);
         td_release(parted); /* table_add_col retains it */
+        if (!result || TD_IS_ERR(result)) goto fail_tables;
     }
 
     /* Build MAPCOMMON column: [key_values (SYM), row_counts (I64)] */
@@ -393,6 +395,12 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
 
     int64_t part_name_id = td_sym_intern("__part", 6);
     result = td_table_add_col(result, part_name_id, mapcommon);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(mapcommon);
+        td_release(key_values);
+        td_release(row_counts);
+        goto fail_tables;
+    }
 
     /* Release our local refs */
     td_release(mapcommon);

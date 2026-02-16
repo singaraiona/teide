@@ -50,6 +50,9 @@ static td_t** tbl_col_slots(td_t* tbl) {
  * -------------------------------------------------------------------------- */
 
 td_t* td_table_new(int64_t ncols) {
+    if (ncols < 0) return TD_ERR_PTR(TD_ERR_RANGE);
+    if ((uint64_t)ncols > SIZE_MAX / sizeof(td_t*) - 1)
+        return TD_ERR_PTR(TD_ERR_OOM);
     /* Allocate: 1 schema pointer + ncols column pointers */
     size_t data_size = (size_t)(1 + ncols) * sizeof(td_t*);
 

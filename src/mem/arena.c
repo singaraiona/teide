@@ -663,10 +663,12 @@ td_t* td_alloc_copy(td_t* v) {
     if (td_is_atom(v)) {
         data_size = 0;
     } else if (v->type == TD_TABLE) {
+        if (v->len < 0) return TD_ERR_PTR(TD_ERR_OOM);
         data_size = (size_t)(td_len(v) + 1) * sizeof(td_t*);
     } else if (TD_IS_PARTED(v->type) || v->type == TD_MAPCOMMON) {
         int64_t n_ptrs = v->len;
         if (v->type == TD_MAPCOMMON) n_ptrs = 2;
+        if (n_ptrs < 0) return TD_ERR_PTR(TD_ERR_OOM);
         data_size = (size_t)n_ptrs * sizeof(td_t*);
     } else {
         int8_t t = td_type(v);

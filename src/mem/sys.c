@@ -85,6 +85,7 @@ void td_sys_free(void* ptr) {
 void* td_sys_realloc(void* ptr, size_t new_size) {
     if (!ptr) return td_sys_alloc(new_size);
     if (new_size == 0) { td_sys_free(ptr); return NULL; }
+    if (new_size > SIZE_MAX - SYS_HDR_SIZE) return NULL;
 
     sys_hdr_t* old_hdr = (sys_hdr_t*)((char*)ptr - SYS_HDR_SIZE);
     size_t old_usr = old_hdr->usr_size;

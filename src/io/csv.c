@@ -226,6 +226,7 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
     uint32_t new_id = ls->count;
 
     if (new_id >= ls->cap) {
+        if (ls->cap > UINT32_MAX / 2) return UINT32_MAX;
         uint32_t new_cap = ls->cap * 2;
         uint32_t* new_offsets = (uint32_t*)td_sys_realloc(ls->offsets,
             new_cap * sizeof(uint32_t));
@@ -242,8 +243,12 @@ static uint32_t local_sym_intern(local_sym_t* ls, const char* str, size_t len) {
     if (ls->arena_used > UINT32_MAX - len - 1) return UINT32_MAX;
 
     if (ls->arena_used + len > ls->arena_cap) {
+        if (ls->arena_cap > SIZE_MAX / 2) return UINT32_MAX;
         size_t new_acap = ls->arena_cap * 2;
-        while (new_acap < ls->arena_used + len) new_acap *= 2;
+        while (new_acap < ls->arena_used + len) {
+            if (new_acap > SIZE_MAX / 2) return UINT32_MAX;
+            new_acap *= 2;
+        }
         char* new_arena = (char*)td_sys_realloc(ls->arena, new_acap);
         if (TD_UNLIKELY(!new_arena)) return UINT32_MAX;
         ls->arena = new_arena;

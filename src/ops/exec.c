@@ -3054,7 +3054,14 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
 
     td_t* result = td_table_new(ncols);
     if (!result || TD_IS_ERR(result)) {
-        scratch_free(indices_hdr); return result;
+        for (uint8_t k = 0; k < n_sort; k++) {
+            if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
+                td_release(sort_vecs[k]);
+            scratch_free(enum_rank_hdrs[k]);
+        }
+        scratch_free(radix_itmp_hdr);
+        scratch_free(indices_hdr);
+        return result;
     }
 
     /* Pre-allocate all output columns, then do a single fused gather pass */
@@ -6146,9 +6153,11 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                 td_t* sum_col = td_table_get_col_idx(result, sum_ci);
                 td_t* cnt_col = (cnt_ci < rncols) ? td_table_get_col_idx(result, cnt_ci) : NULL;
                 if (!sum_col || !cnt_col) {
-                    td_retain(sum_col);
-                    trimmed = td_table_add_col(trimmed, nm, sum_col);
-                    td_release(sum_col);
+                    if (sum_col) {
+                        td_retain(sum_col);
+                        trimmed = td_table_add_col(trimmed, nm, sum_col);
+                        td_release(sum_col);
+                    }
                     continue;
                 }
 
@@ -7103,10 +7112,17 @@ static td_t* exec_replace(td_graph_t* g, td_op_t* op) {
         const char* sp; size_t sl;
         sym_elem(input, i, &sp, &sl);
         /* Simple find-and-replace-all */
-        /* Worst case: every char is a match, each replaced by to_len bytes */
-        size_t worst = (from_len > 0)
-            ? sl / from_len * to_len + (sl % from_len) + 1
-            : sl + 1;
+        /* Worst case: every char is a match, each replaced by to_len bytes.
+         * Guard against size_t overflow when to_len >> from_len. */
+        size_t n_matches = (from_len > 0) ? sl / from_len : 0;
+        size_t worst;
+        if (from_len > 0 && to_len > 0 && n_matches > SIZE_MAX / to_len) {
+            worst = SIZE_MAX; /* overflow → cap at max; scratch_alloc will OOM */
+        } else {
+            worst = (from_len > 0)
+                ? n_matches * to_len + (sl % from_len) + 1
+                : sl + 1;
+        }
         char sbuf[8192];
         char* buf = sbuf;
         td_t* dyn_hdr = NULL;
@@ -7168,7 +7184,13 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
         }
     }
 
-    int64_t nrows = args[0]->len;
+    /* Derive nrows from first vector arg (scalar args have byte-length in len) */
+    int64_t nrows = 1;
+    for (int a = 0; a < n_args; a++) {
+        int8_t at = args[a]->type;
+        if (at == TD_SYM || at == TD_ENUM) { nrows = args[a]->len; break; }
+        if (!td_is_atom(args[a]) && at != TD_STR) { nrows = args[a]->len; break; }
+    }
     td_t* result = td_vec_new(TD_SYM, nrows);
     if (!result || TD_IS_ERR(result)) {
         for (int i = 0; i < n_args; i++) td_release(args[i]);

@@ -232,9 +232,7 @@ pub fn plan_expr(
             let input = plan_expr(g, inner, schema)?;
             let input_ci = g.lower(input)?;
             let pat_ci = match pattern.as_ref() {
-                Expr::Value(Value::SingleQuotedString(s)) => {
-                    g.const_str(&s.to_lowercase())?
-                }
+                Expr::Value(Value::SingleQuotedString(s)) => g.const_str(&s.to_lowercase())?,
                 _ => {
                     let pat = plan_expr(g, pattern, schema)?;
                     g.lower(pat)?
@@ -262,22 +260,20 @@ pub fn plan_expr(
                 }
                 return Err(SqlError::Plan(format!("Column '{}' not found", col_name)));
             }
-            Err(SqlError::Plan(format!("Unsupported compound identifier: {expr}")))
+            Err(SqlError::Plan(format!(
+                "Unsupported compound identifier: {expr}"
+            )))
         }
 
         // Subquery: these should be resolved by resolve_subqueries() before plan_expr
-        Expr::Subquery(_query) => {
-            Err(SqlError::Plan(
-                "Scalar subquery must be pre-resolved; this is a planner bug".into(),
-            ))
-        }
+        Expr::Subquery(_query) => Err(SqlError::Plan(
+            "Scalar subquery must be pre-resolved; this is a planner bug".into(),
+        )),
 
         // IN (subquery): should be rewritten to IN (list) by resolve_subqueries()
-        Expr::InSubquery { .. } => {
-            Err(SqlError::Plan(
-                "IN (subquery) must be pre-resolved; this is a planner bug".into(),
-            ))
-        }
+        Expr::InSubquery { .. } => Err(SqlError::Plan(
+            "IN (subquery) must be pre-resolved; this is a planner bug".into(),
+        )),
 
         // Scalar functions, aggregate detection, and window function detection
         Expr::Function(f) => {
@@ -320,7 +316,9 @@ pub fn plan_expr(
             Ok(g.substr(s, start, len)?)
         }
 
-        Expr::Extract { field, expr: inner, .. } => {
+        Expr::Extract {
+            field, expr: inner, ..
+        } => {
             let col = plan_expr(g, inner, schema)?;
             let field_id = map_datetime_field(field)?;
             Ok(g.extract(col, field_id)?)
@@ -411,22 +409,23 @@ fn plan_scalar_function(
             let a = plan_expr(g, &args[0], schema)?;
             // Helper: round_val = IF(val >= 0, FLOOR(val + 0.5), CEIL(val - 0.5))
             // This handles negative numbers correctly (banker's-style half-away-from-zero)
-            let build_round = |g: &mut crate::Graph, val: crate::Column| -> Result<crate::Column, SqlError> {
-                let zero = g.const_f64(0.0)?;
-                let half = g.const_f64(0.5)?;
-                let cond = g.ge(val, zero)?;
-                let pos = g.floor(g.add(val, half)?)?;
-                let neg = g.ceil(g.sub(val, half)?)?;
-                Ok(g.if_then_else(cond, pos, neg)?)
-            };
+            let build_round =
+                |g: &mut crate::Graph, val: crate::Column| -> Result<crate::Column, SqlError> {
+                    let zero = g.const_f64(0.0)?;
+                    let half = g.const_f64(0.5)?;
+                    let cond = g.ge(val, zero)?;
+                    let pos = g.floor(g.add(val, half)?)?;
+                    let neg = g.ceil(g.sub(val, half)?)?;
+                    Ok(g.if_then_else(cond, pos, neg)?)
+                };
             if args.len() == 1 {
                 build_round(g, a)
             } else {
                 // ROUND(x, n): extract n as integer constant
                 let n = match &args[1] {
-                    Expr::Value(Value::Number(s, _)) => s.parse::<i32>().map_err(|_| {
-                        SqlError::Plan("ROUND precision must be an integer".into())
-                    })?,
+                    Expr::Value(Value::Number(s, _)) => s
+                        .parse::<i32>()
+                        .map_err(|_| SqlError::Plan("ROUND precision must be an integer".into()))?,
                     Expr::UnaryOp {
                         op: UnaryOperator::Minus,
                         expr,
@@ -484,7 +483,9 @@ fn plan_scalar_function(
         // COALESCE(a, b, ...) → nested IF(NOT ISNULL(a), a, IF(NOT ISNULL(b), b, c))
         "coalesce" => {
             if args.is_empty() {
-                return Err(SqlError::Plan("COALESCE requires at least 1 argument".into()));
+                return Err(SqlError::Plan(
+                    "COALESCE requires at least 1 argument".into(),
+                ));
             }
             if args.len() == 1 {
                 return plan_expr(g, &args[0], schema);
@@ -557,7 +558,9 @@ fn plan_scalar_function(
         }
         "concat" => {
             if args.len() < 2 {
-                return Err(SqlError::Plan("CONCAT requires at least 2 arguments".into()));
+                return Err(SqlError::Plan(
+                    "CONCAT requires at least 2 arguments".into(),
+                ));
             }
             let cols: Vec<_> = args
                 .iter()
@@ -741,9 +744,7 @@ fn check_arg_count(name: &str, args: &[Expr], expected: usize) -> Result<(), Sql
 fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
     match dt {
         DataType::Boolean | DataType::Bool => Ok(crate::types::BOOL),
-        DataType::Int(None) | DataType::Integer(None) | DataType::Int4(_) => {
-            Ok(crate::types::I32)
-        }
+        DataType::Int(None) | DataType::Integer(None) | DataType::Int4(_) => Ok(crate::types::I32),
         DataType::BigInt(None) | DataType::Int8(_) | DataType::Int64 => Ok(crate::types::I64),
         DataType::Float(None)
         | DataType::Float64
@@ -754,7 +755,9 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
         DataType::Date => Ok(crate::types::DATE),
         DataType::Time(_, _) => Ok(crate::types::TIME),
         DataType::Timestamp(_, _) => Ok(crate::types::TIMESTAMP),
-        _ => Err(SqlError::Plan(format!("Unsupported CAST target type: {dt}"))),
+        _ => Err(SqlError::Plan(format!(
+            "Unsupported CAST target type: {dt}"
+        ))),
     }
 }
 
@@ -764,9 +767,20 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
 
 /// Check if a function name is a known aggregate.
 pub fn is_aggregate_name(name: &str) -> bool {
-    matches!(name, "sum" | "avg" | "min" | "max" | "count"
-        | "stddev" | "stddev_samp" | "stddev_pop"
-        | "variance" | "var_samp" | "var_pop")
+    matches!(
+        name,
+        "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "count"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+    )
 }
 
 /// Check if a function is COUNT(DISTINCT ...).
@@ -885,10 +899,9 @@ fn collect_aggregates_inner<'a>(expr: &'a Expr, aggs: &mut Vec<(&'a Expr, String
             collect_aggregates_inner(low, aggs);
             collect_aggregates_inner(high, aggs);
         }
-        Expr::IsFalse(e)
-        | Expr::IsTrue(e)
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e) => collect_aggregates_inner(e, aggs),
+        Expr::IsFalse(e) | Expr::IsTrue(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            collect_aggregates_inner(e, aggs)
+        }
         _ => {}
     }
 }
@@ -1069,10 +1082,7 @@ pub fn plan_having_expr(
 
 /// Predict the C engine's naming convention for an aggregate output column.
 /// SUM(v1) → "v1_sum", COUNT(v1) → "v1_count", AVG(v1) → "v1_mean", etc.
-fn predict_c_agg_name(
-    func: &Function,
-    original_schema: &HashMap<String, usize>,
-) -> Option<String> {
+fn predict_c_agg_name(func: &Function, original_schema: &HashMap<String, usize>) -> Option<String> {
     let op = func.name.to_string().to_lowercase();
     let suffix = match op.as_str() {
         "sum" => "_sum",
@@ -1205,12 +1215,10 @@ pub fn plan_agg_input(
                 Ok((op, g.if_then_else(pred, input_f64, nan)?))
             }
             AggOp::Avg => unreachable!(), // handled above
-            _ => {
-                Err(SqlError::Plan(format!(
-                    "FILTER clause not supported for {}()",
-                    func.name
-                )))
-            }
+            _ => Err(SqlError::Plan(format!(
+                "FILTER clause not supported for {}()",
+                func.name
+            ))),
         }
     } else {
         Ok((op, input))
@@ -1266,7 +1274,10 @@ pub fn expr_default_name(expr: &Expr) -> String {
         Expr::Identifier(ident) => ident.value.to_lowercase(),
         Expr::CompoundIdentifier(parts) => {
             // Return just the column name, not the full qualified name
-            parts.last().map(|p| p.value.to_lowercase()).unwrap_or_default()
+            parts
+                .last()
+                .map(|p| p.value.to_lowercase())
+                .unwrap_or_default()
         }
         // Parenthesized identifiers should keep the underlying column name.
         Expr::Nested(inner) => expr_default_name(inner),
@@ -1353,7 +1364,9 @@ pub fn window_func_from_name(name: &str, args: &[Expr]) -> Result<WindowFunc, Sq
         "last_value" => Ok(WindowFunc::LastValue),
         "nth_value" => {
             if args.len() != 2 {
-                return Err(SqlError::Plan("NTH_VALUE requires exactly 2 arguments".into()));
+                return Err(SqlError::Plan(
+                    "NTH_VALUE requires exactly 2 arguments".into(),
+                ));
             }
             let n = parse_i64_literal(&args[1])?;
             Ok(WindowFunc::NthValue(n))
@@ -1367,12 +1380,16 @@ fn parse_i64_literal(expr: &Expr) -> Result<i64, SqlError> {
         Expr::Value(Value::Number(n, _)) => n
             .parse::<i64>()
             .map_err(|_| SqlError::Plan(format!("Expected integer literal, got: {n}"))),
-        _ => Err(SqlError::Plan(format!("Expected integer literal, got: {expr}"))),
+        _ => Err(SqlError::Plan(format!(
+            "Expected integer literal, got: {expr}"
+        ))),
     }
 }
 
 /// Convert sqlparser WindowSpec to Teide FrameType + FrameBound pair.
-pub fn parse_window_frame(spec: &WindowSpec) -> Result<(FrameType, FrameBound, FrameBound), SqlError> {
+pub fn parse_window_frame(
+    spec: &WindowSpec,
+) -> Result<(FrameType, FrameBound, FrameBound), SqlError> {
     match &spec.window_frame {
         Some(frame) => {
             let ft = match frame.units {
@@ -1444,7 +1461,9 @@ pub fn format_window_name(func: &Function) -> String {
 
 /// Collect all window function calls from SELECT items.
 /// Returns (select_item_index, WindowFuncInfo) pairs.
-pub fn collect_window_functions(items: &[SelectItem]) -> Result<Vec<(usize, WindowFuncInfo)>, SqlError> {
+pub fn collect_window_functions(
+    items: &[SelectItem],
+) -> Result<Vec<(usize, WindowFuncInfo)>, SqlError> {
     let mut result = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let expr = match item {

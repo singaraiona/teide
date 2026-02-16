@@ -181,35 +181,19 @@ fn bench_sort(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(1));
 
     group.bench_function("s1", |b| {
-        b.iter(|| {
-            session
-                .execute("SELECT * FROM t ORDER BY id1")
-                .unwrap()
-        })
+        b.iter(|| session.execute("SELECT * FROM t ORDER BY id1").unwrap())
     });
 
     group.bench_function("s2", |b| {
-        b.iter(|| {
-            session
-                .execute("SELECT * FROM t ORDER BY id3")
-                .unwrap()
-        })
+        b.iter(|| session.execute("SELECT * FROM t ORDER BY id3").unwrap())
     });
 
     group.bench_function("s3", |b| {
-        b.iter(|| {
-            session
-                .execute("SELECT * FROM t ORDER BY id4")
-                .unwrap()
-        })
+        b.iter(|| session.execute("SELECT * FROM t ORDER BY id4").unwrap())
     });
 
     group.bench_function("s4", |b| {
-        b.iter(|| {
-            session
-                .execute("SELECT * FROM t ORDER BY v3 DESC")
-                .unwrap()
-        })
+        b.iter(|| session.execute("SELECT * FROM t ORDER BY v3 DESC").unwrap())
     });
 
     group.bench_function("s5", |b| {
@@ -336,9 +320,7 @@ fn bench_window(c: &mut Criterion) {
     group.bench_function("w5", |b| {
         b.iter(|| {
             session
-                .execute(
-                    "SELECT id1, v1, AVG(v1) OVER (PARTITION BY id1) as avg_v1 FROM t",
-                )
+                .execute("SELECT id1, v1, AVG(v1) OVER (PARTITION BY id1) as avg_v1 FROM t")
                 .unwrap()
         })
     });

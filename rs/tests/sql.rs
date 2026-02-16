@@ -61,10 +61,7 @@ const CSV_ROWS: &[&str] = &[
 ];
 
 fn create_test_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "{CSV_HEADER}").unwrap();
     for row in CSV_ROWS {
         writeln!(f, "{row}").unwrap();
@@ -75,10 +72,7 @@ fn create_test_csv() -> (tempfile::NamedTempFile, String) {
 }
 
 fn create_join_right_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "id1,x1").unwrap();
     writeln!(f, "id001,100").unwrap();
     writeln!(f, "id002,200").unwrap();
@@ -193,9 +187,7 @@ fn group_by_multi() {
     let (mut session, _f) = setup_session();
     let r = unwrap_query(
         session
-            .execute(
-                "SELECT id1, id4, SUM(v1) as s, COUNT(*) as cnt FROM csv GROUP BY id1, id4",
-            )
+            .execute("SELECT id1, id4, SUM(v1) as s, COUNT(*) as cnt FROM csv GROUP BY id1, id4")
             .unwrap(),
     );
     assert_eq!(r.table.nrows(), 15);
@@ -237,7 +229,11 @@ fn order_by_asc() {
 fn order_by_desc() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let (mut session, _f) = setup_session();
-    let r = unwrap_query(session.execute("SELECT * FROM csv ORDER BY v3 DESC").unwrap());
+    let r = unwrap_query(
+        session
+            .execute("SELECT * FROM csv ORDER BY v3 DESC")
+            .unwrap(),
+    );
     assert_eq!(r.table.nrows(), 20);
 
     let v3_idx = r.columns.iter().position(|c| c == "v3").unwrap();
@@ -330,7 +326,9 @@ fn select_unknown_projection_column_errors() {
 fn projection_reorder_is_respected() {
     let _guard = ENGINE_LOCK.lock().unwrap();
     let mut session = Session::new().unwrap();
-    session.execute("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+    session
+        .execute("CREATE TABLE t (a INTEGER, b INTEGER)")
+        .unwrap();
     session.execute("INSERT INTO t VALUES (1, 2)").unwrap();
 
     let r = unwrap_query(session.execute("SELECT b, a FROM t").unwrap());
@@ -680,7 +678,10 @@ fn scalar_subexpr_broadcast() {
     assert_eq!(r.table.nrows(), 20);
     assert_eq!(r.columns.len(), 2);
     for i in 0..r.table.nrows() as usize {
-        assert_eq!(r.table.get_i64(0, i).unwrap(), r.table.get_i64(1, i).unwrap());
+        assert_eq!(
+            r.table.get_i64(0, i).unwrap(),
+            r.table.get_i64(1, i).unwrap()
+        );
     }
 
     let agg = unwrap_query(
@@ -689,8 +690,14 @@ fn scalar_subexpr_broadcast() {
             .unwrap(),
     );
     assert_eq!(agg.table.nrows(), 1);
-    assert_eq!(agg.table.get_i64(0, 0).unwrap(), agg.table.get_i64(1, 0).unwrap());
-    assert_eq!(agg.table.get_i64(2, 0).unwrap(), agg.table.get_i64(3, 0).unwrap());
+    assert_eq!(
+        agg.table.get_i64(0, 0).unwrap(),
+        agg.table.get_i64(1, 0).unwrap()
+    );
+    assert_eq!(
+        agg.table.get_i64(2, 0).unwrap(),
+        agg.table.get_i64(3, 0).unwrap()
+    );
     assert_eq!(agg.table.get_i64(4, 0).unwrap(), 40);
 
     let linear = unwrap_query(
@@ -699,10 +706,16 @@ fn scalar_subexpr_broadcast() {
             .unwrap(),
     );
     assert_eq!(linear.table.nrows(), 1);
-    assert_eq!(linear.table.get_i64(0, 0).unwrap(), linear.table.get_i64(1, 0).unwrap());
+    assert_eq!(
+        linear.table.get_i64(0, 0).unwrap(),
+        linear.table.get_i64(1, 0).unwrap()
+    );
     let c = linear.table.get_f64(2, 0).unwrap();
     let d = linear.table.get_f64(3, 0).unwrap();
-    assert!((c - d).abs() < 1e-10, "expected AVG linear forms to match: {c} vs {d}");
+    assert!(
+        (c - d).abs() < 1e-10,
+        "expected AVG linear forms to match: {c} vs {d}"
+    );
 }
 
 #[test]
@@ -758,7 +771,9 @@ fn window_row_number_sql() {
     let (mut session, _f) = setup_session();
     let r = unwrap_query(
         session
-            .execute("SELECT id1, v1, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1) as rn FROM csv")
+            .execute(
+                "SELECT id1, v1, ROW_NUMBER() OVER (PARTITION BY id1 ORDER BY v1) as rn FROM csv",
+            )
             .unwrap(),
     );
     assert_eq!(r.table.nrows(), 20);
@@ -795,7 +810,9 @@ fn window_dense_rank_sql() {
     let (mut session, _f) = setup_session();
     let r = unwrap_query(
         session
-            .execute("SELECT id1, id4, DENSE_RANK() OVER (PARTITION BY id1 ORDER BY id4) as dr FROM csv")
+            .execute(
+                "SELECT id1, id4, DENSE_RANK() OVER (PARTITION BY id1 ORDER BY id4) as dr FROM csv",
+            )
             .unwrap(),
     );
     assert_eq!(r.table.nrows(), 20);
@@ -875,14 +892,19 @@ fn window_mixed_specs_sql() {
     assert_eq!(r.table.nrows(), 20);
     assert_eq!(r.columns.len(), 4);
 
-    let mut per_id1_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut per_id1_counts: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for row in 0..r.table.nrows() as usize {
         let id1 = r.table.get_str(0, row).unwrap().to_string();
         let rn_part = r.table.get_i64(2, row).unwrap();
         let rn_all = r.table.get_i64(3, row).unwrap();
 
         // ORDER BY id3 over full table: row_number must be strictly 1..20.
-        assert_eq!(rn_all, row as i64 + 1, "global row number mismatch at row {row}");
+        assert_eq!(
+            rn_all,
+            row as i64 + 1,
+            "global row number mismatch at row {row}"
+        );
 
         // PARTITION BY id1: row_number must increment per id1 partition.
         let next = per_id1_counts.entry(id1).or_insert(0);
@@ -910,7 +932,10 @@ fn window_full_partition_avg_sql() {
         let id1 = r.table.get_str(0, row).unwrap().to_string();
         let avg = r.table.get_f64(2, row).unwrap();
         if id1 == "id001" {
-            assert!((avg - 2.5).abs() < 1e-10, "id001 avg should be 2.5, got {avg}");
+            assert!(
+                (avg - 2.5).abs() < 1e-10,
+                "id001 avg should be 2.5, got {avg}"
+            );
         }
     }
 }
@@ -946,7 +971,10 @@ fn window_ntile_sql() {
     // NTILE(4) over 20 rows → 5 per tile, tiles 1-4
     for row in 0..r.table.nrows() as usize {
         let tile = r.table.get_i64(1, row).unwrap();
-        assert!((1..=4).contains(&tile), "NTILE(4) should be 1..4, got {tile}");
+        assert!(
+            (1..=4).contains(&tile),
+            "NTILE(4) should be 1..4, got {tile}"
+        );
     }
 }
 
@@ -987,7 +1015,12 @@ fn window_expr_with_wildcard_sql() {
     );
     assert_eq!(r.table.nrows(), 20);
     // 9 original columns + 1 bool expression column = 10
-    assert_eq!(r.columns.len(), 10, "expected 10 columns, got {:?}", r.columns);
+    assert_eq!(
+        r.columns.len(),
+        10,
+        "expected 10 columns, got {:?}",
+        r.columns
+    );
     // Last column should be bool type (type code 1)
     let last_col = r.columns.len() - 1;
     assert_eq!(r.table.col_type(last_col), 1, "last column should be bool");
@@ -1000,7 +1033,10 @@ fn window_expr_with_wildcard_sql() {
             true_count += 1;
         }
     }
-    assert_eq!(true_count, 2, "id001 should have exactly 2 rows with <= 2 = true");
+    assert_eq!(
+        true_count, 2,
+        "id001 should have exactly 2 rows with <= 2 = true"
+    );
 }
 
 #[test]
@@ -1037,7 +1073,11 @@ fn cte_column_alias_sql() {
     assert_eq!(r2.columns.len(), 2);
     assert_eq!(r2.columns[1], "rn");
     // 5 partitions (id001..id005) × 2 rows each = 10 rows
-    assert_eq!(r2.table.nrows(), 10, "expected 10 rows from 5 partitions × top-2");
+    assert_eq!(
+        r2.table.nrows(),
+        10,
+        "expected 10 rows from 5 partitions × top-2"
+    );
     for row in 0..r2.table.nrows() as usize {
         let rn = r2.table.get_i64(1, row).unwrap();
         assert!(rn <= 2, "rn should be <= 2, got {}", rn);
@@ -1052,9 +1092,7 @@ fn subquery_predicate_pushdown_sql() {
     // Subquery without alias should work (aliasless derived table)
     let r = unwrap_query(
         session
-            .execute(
-                "SELECT * FROM (SELECT id1, v1 FROM csv) sub WHERE id1 = 'id001'",
-            )
+            .execute("SELECT * FROM (SELECT id1, v1 FROM csv) sub WHERE id1 = 'id001'")
             .unwrap(),
     );
     assert_eq!(r.columns.len(), 2);
@@ -1140,7 +1178,10 @@ fn agg_filter_sum() {
     );
     assert_eq!(r.table.nrows(), 1);
     let filtered_sum = r.table.get_f64(0, 0).unwrap();
-    assert!((filtered_sum - 10.0).abs() < 1e-9, "expected 10, got {filtered_sum}");
+    assert!(
+        (filtered_sum - 10.0).abs() < 1e-9,
+        "expected 10, got {filtered_sum}"
+    );
 }
 
 #[test]
@@ -1180,10 +1221,16 @@ fn agg_filter_with_group_by() {
     let sum0 = r.table.get_f64(1, 0).unwrap();
     let sum1 = r.table.get_f64(1, 1).unwrap();
     // Verify both groups sum to expected totals (order may vary)
-    let pair = if sum0 < sum1 { (sum0, sum1) } else { (sum1, sum0) };
+    let pair = if sum0 < sum1 {
+        (sum0, sum1)
+    } else {
+        (sum1, sum0)
+    };
     assert!(
         (pair.0 - 14.0).abs() < 1e-9 && (pair.1 - 26.0).abs() < 1e-9,
-        "expected (14, 26), got ({}, {})", pair.0, pair.1
+        "expected (14, 26), got ({}, {})",
+        pair.0,
+        pair.1
     );
 }
 
@@ -1195,22 +1242,28 @@ fn agg_filter_mixed_filtered_and_unfiltered() {
     // Mix filtered and unfiltered aggs in the same query
     let r = unwrap_query(
         session
-            .execute(
-                "SELECT SUM(v1), SUM(v1) FILTER (WHERE id1 = 'id001') FROM csv",
-            )
+            .execute("SELECT SUM(v1), SUM(v1) FILTER (WHERE id1 = 'id001') FROM csv")
             .unwrap(),
     );
     assert_eq!(r.table.nrows(), 1);
     // Total SUM(v1) = 1+2+3+4+5+6+7+8+9+10+1+2+3+4+5+6+7+8+9+10 = 110
     // SUM(v1) is I64 (no filter → raw column sum)
-    let total = r.table.get_i64(0, 0)
+    let total = r
+        .table
+        .get_i64(0, 0)
         .map(|v| v as f64)
         .or_else(|| r.table.get_f64(0, 0))
         .unwrap();
     // Filtered SUM is always F64 (because of CAST in the filter rewrite)
     let filtered = r.table.get_f64(1, 0).unwrap();
-    assert!((total - 110.0).abs() < 1e-9, "total SUM expected 110, got {total}");
-    assert!((filtered - 10.0).abs() < 1e-9, "filtered SUM expected 10, got {filtered}");
+    assert!(
+        (total - 110.0).abs() < 1e-9,
+        "total SUM expected 110, got {total}"
+    );
+    assert!(
+        (filtered - 10.0).abs() < 1e-9,
+        "filtered SUM expected 10, got {filtered}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,10 +1272,7 @@ fn agg_filter_mixed_filtered_and_unfiltered() {
 
 /// Create a CSV with 100 rows: columns "id" (i64) and "val" (f64), val = id * 1.0.
 fn create_nulls_sort_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "id,val").unwrap();
     for i in 1..=100 {
         writeln!(f, "{},{}.0", i, i).unwrap();
@@ -1444,11 +1494,7 @@ fn scalar_stddev() {
     // sum_sq = 2*(1+4+9+16+25+36+49+64+81+100) = 770
     // var_pop = 770/20 - 30.25 = 8.25
     // var_samp = 8.25 * 20/19 = 165/19
-    let r = unwrap_query(
-        session
-            .execute("SELECT STDDEV(v1) as sd FROM csv")
-            .unwrap(),
-    );
+    let r = unwrap_query(session.execute("SELECT STDDEV(v1) as sd FROM csv").unwrap());
     assert_eq!(r.table.nrows(), 1);
     let sd = r.table.get_f64(0, 0).unwrap();
     let expected = (165.0_f64 / 19.0).sqrt();
@@ -1548,7 +1594,10 @@ fn stddev_single_element_group_returns_nan() {
     );
     assert_eq!(r.table.nrows(), 20);
     let sd = r.table.get_f64(1, 0).unwrap();
-    assert!(sd.is_nan(), "STDDEV of single-element group should be NaN, got {sd}");
+    assert!(
+        sd.is_nan(),
+        "STDDEV of single-element group should be NaN, got {sd}"
+    );
 }
 
 #[test]
@@ -1563,7 +1612,10 @@ fn variance_single_element_group_returns_nan() {
     );
     assert_eq!(r.table.nrows(), 20);
     let vr = r.table.get_f64(1, 0).unwrap();
-    assert!(vr.is_nan(), "VARIANCE of single-element group should be NaN, got {vr}");
+    assert!(
+        vr.is_nan(),
+        "VARIANCE of single-element group should be NaN, got {vr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,7 +1665,11 @@ fn create_parted_db() -> (tempfile::TempDir, String) {
             let sym_path = format!("{db_root}/sym");
             let c_sym = CString::new(sym_path.as_str()).unwrap();
             let err = teide::ffi::td_splay_save(sub_tbl, c_dir.as_ptr(), c_sym.as_ptr());
-            assert_eq!(err, teide::ffi::td_err_t::TD_OK, "splay_save failed for partition {part}");
+            assert_eq!(
+                err,
+                teide::ffi::td_err_t::TD_OK,
+                "splay_save failed for partition {part}"
+            );
             teide::ffi::td_release(sub_tbl);
         }
     }
@@ -1642,7 +1698,9 @@ fn parted_sql_groupby() {
     // Query the parted table via path syntax: 'db_root/table_name'
     let r = unwrap_query(
         session
-            .execute(&format!("SELECT id1, SUM(v1) as s FROM '{db_root}/data' GROUP BY id1 ORDER BY id1"))
+            .execute(&format!(
+                "SELECT id1, SUM(v1) as s FROM '{db_root}/data' GROUP BY id1 ORDER BY id1"
+            ))
             .unwrap(),
     );
 
@@ -1650,7 +1708,10 @@ fn parted_sql_groupby() {
     assert_eq!(r.table.nrows(), 5, "expected 5 groups");
 
     // Verify first group: id001 has v1 = 1+2+3+4 = 10
-    let sum0 = r.table.get_i64(1, 0).or_else(|| r.table.get_f64(1, 0).map(|f| f as i64));
+    let sum0 = r
+        .table
+        .get_i64(1, 0)
+        .or_else(|| r.table.get_f64(1, 0).map(|f| f as i64));
     assert_eq!(sum0, Some(10), "SUM(v1) for id001 should be 10");
 }
 
@@ -1693,7 +1754,11 @@ fn parted_sql_create_table_as_groupby() {
             .unwrap(),
     );
 
-    assert_eq!(r.table.nrows(), 5, "expected 5 groups from registered agg table");
+    assert_eq!(
+        r.table.nrows(),
+        5,
+        "expected 5 groups from registered agg table"
+    );
 }
 
 #[test]
@@ -1757,7 +1822,9 @@ fn parted_sql_create_table_select_star() {
 
     // CREATE TABLE AS SELECT * from parted table
     session
-        .execute(&format!("CREATE TABLE flat AS SELECT * FROM '{db_root}/data'"))
+        .execute(&format!(
+            "CREATE TABLE flat AS SELECT * FROM '{db_root}/data'"
+        ))
         .unwrap();
 
     // Query the registered table — should work with GROUP BY
@@ -1767,5 +1834,9 @@ fn parted_sql_create_table_select_star() {
             .unwrap(),
     );
 
-    assert_eq!(r.table.nrows(), 5, "expected 5 groups from registered flat table");
+    assert_eq!(
+        r.table.nrows(),
+        5,
+        "expected 5 groups from registered flat table"
+    );
 }

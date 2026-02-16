@@ -92,7 +92,11 @@ fn make_session() -> teide::sql::Session {
     match teide::sql::Session::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            eprintln!(
+                "{}Error: failed to init Teide engine: {e}{}",
+                theme::ERROR,
+                theme::R
+            );
             std::process::exit(1);
         }
     }
@@ -100,7 +104,12 @@ fn make_session() -> teide::sql::Session {
 
 fn run_init_script(session: &mut teide::sql::Session, path: &PathBuf) {
     if let Err(e) = session.execute_script_file(path.as_path()) {
-        eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, path.display(), theme::R);
+        eprintln!(
+            "{}Error in init script {}: {e}{}",
+            theme::ERROR,
+            path.display(),
+            theme::R
+        );
         std::process::exit(1);
     }
 }
@@ -109,7 +118,11 @@ fn run_single_query(sql: &str) {
     let ctx = match teide::Context::new() {
         Ok(ctx) => ctx,
         Err(e) => {
-            eprintln!("{}Error: failed to init Teide engine: {e}{}", theme::ERROR, theme::R);
+            eprintln!(
+                "{}Error: failed to init Teide engine: {e}{}",
+                theme::ERROR,
+                theme::R
+            );
             std::process::exit(1);
         }
     };
@@ -137,7 +150,12 @@ fn run_sql_file(path: &PathBuf, init: Option<&std::path::Path>, timer: bool) {
     let mut session = make_session();
     if let Some(init_path) = init {
         if let Err(e) = session.execute_script_file(init_path) {
-            eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, init_path.display(), theme::R);
+            eprintln!(
+                "{}Error in init script {}: {e}{}",
+                theme::ERROR,
+                init_path.display(),
+                theme::R
+            );
             std::process::exit(1);
         }
     }
@@ -178,7 +196,12 @@ fn run_repl(preload_csv: Option<&str>, init: Option<&std::path::Path>) {
 
     if let Some(init_path) = init {
         if let Err(e) = session.execute_script_file(init_path) {
-            eprintln!("{}Error in init script {}: {e}{}", theme::ERROR, init_path.display(), theme::R);
+            eprintln!(
+                "{}Error in init script {}: {e}{}",
+                theme::ERROR,
+                init_path.display(),
+                theme::R
+            );
             return;
         }
     }
@@ -569,12 +592,7 @@ fn print_table(result: &teide::sql::SqlResult) {
         buf.push_str(BORDER);
         buf.push('\u{2502}');
         buf.push_str(R);
-        let _ = write!(
-            buf,
-            " {TYPE_DIM}{:^width$}{R} ",
-            col_types[c],
-            width = w[c]
-        );
+        let _ = write!(buf, " {TYPE_DIM}{:^width$}{R} ", col_types[c], width = w[c]);
     }
     buf.push_str(BORDER);
     buf.push('\u{2502}');
@@ -687,13 +705,7 @@ fn print_json(result: &teide::sql::SqlResult) {
         let pairs: Vec<String> = col_indices
             .iter()
             .enumerate()
-            .map(|(i, &col)| {
-                format!(
-                    "\"{}\": {}",
-                    headers[i],
-                    format_json_value(table, col, row)
-                )
-            })
+            .map(|(i, &col)| format!("\"{}\": {}", headers[i], format_json_value(table, col, row)))
             .collect();
         let comma = if row + 1 < nrows { "," } else { "" };
         println!("  {{{}}}{comma}", pairs.join(", "));
@@ -828,9 +840,7 @@ fn handle_dot_command(
                 sorted.sort();
                 for name in sorted {
                     if let Some((nrows, ncols)) = session.table_info(name) {
-                        println!(
-                            "  {HEADER}{name:20}{R} {FOOTER}{nrows} rows, {ncols} cols{R}"
-                        );
+                        println!("  {HEADER}{name:20}{R} {FOOTER}{nrows} rows, {ncols} cols{R}");
                     }
                 }
             }
@@ -843,11 +853,20 @@ fn handle_dot_command(
             println!("  {NORD7}Arena{R}    {FOOTER}{:>10}{R}  (peak {})  [{} allocs, {} frees, {} slab hits]",
                 fmt_bytes(arena_cur), fmt_bytes(s.peak_bytes),
                 s.alloc_count, s.free_count, s.slab_hits);
-            println!("  {NORD7}Direct{R}   {FOOTER}{:>10}{R}  [{} active mmaps]",
-                fmt_bytes(s.direct_bytes), s.direct_count);
-            println!("  {NORD7}System{R}   {FOOTER}{:>10}{R}  (peak {})",
-                fmt_bytes(s.sys_current), fmt_bytes(s.sys_peak));
-            println!("  {NORD7}Total{R}    {FOOTER}{:>10}{R}", fmt_bytes(total_cur));
+            println!(
+                "  {NORD7}Direct{R}   {FOOTER}{:>10}{R}  [{} active mmaps]",
+                fmt_bytes(s.direct_bytes),
+                s.direct_count
+            );
+            println!(
+                "  {NORD7}System{R}   {FOOTER}{:>10}{R}  (peak {})",
+                fmt_bytes(s.sys_current),
+                fmt_bytes(s.sys_peak)
+            );
+            println!(
+                "  {NORD7}Total{R}    {FOOTER}{:>10}{R}",
+                fmt_bytes(total_cur)
+            );
         }
         ".help" => print_help(),
         // process::exit skips destructors; acceptable since OS reclaims all resources.

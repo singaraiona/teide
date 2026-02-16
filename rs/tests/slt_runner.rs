@@ -52,10 +52,7 @@ impl sqllogictest::DB for TeideDb {
     type Error = TeideError;
     type ColumnType = sqllogictest::DefaultColumnType;
 
-    fn run(
-        &mut self,
-        sql: &str,
-    ) -> Result<sqllogictest::DBOutput<Self::ColumnType>, Self::Error> {
+    fn run(&mut self, sql: &str) -> Result<sqllogictest::DBOutput<Self::ColumnType>, Self::Error> {
         match self.session.execute(sql) {
             Ok(ExecResult::Ddl(_)) => Ok(sqllogictest::DBOutput::StatementComplete(0)),
             Ok(ExecResult::Query(r)) => {

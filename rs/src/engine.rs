@@ -187,7 +187,10 @@ impl WindowFunc {
     /// Returns the parameter value (offset, ntile count, etc.), or 0 if none.
     pub fn param(&self) -> i64 {
         match self {
-            WindowFunc::Ntile(n) | WindowFunc::Lag(n) | WindowFunc::Lead(n) | WindowFunc::NthValue(n) => *n,
+            WindowFunc::Ntile(n)
+            | WindowFunc::Lag(n)
+            | WindowFunc::Lead(n)
+            | WindowFunc::NthValue(n) => *n,
             _ => 0,
         }
     }
@@ -334,7 +337,9 @@ fn acquire_existing_engine_guard() -> Result<Arc<EngineGuard>> {
 /// from any thread without holding the guard. Acquiring the guard here
 /// would risk triggering EngineGuard drop from the wrong thread.
 pub fn cancel() {
-    unsafe { ffi::td_cancel(); }
+    unsafe {
+        ffi::td_cancel();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,8 +350,7 @@ pub fn cancel() {
 ///
 /// Returns `Error::EngineNotInitialized` if no `Context` exists.
 pub fn sym_intern(s: &str) -> Result<i64> {
-    let _guard = acquire_existing_engine_guard()
-        .map_err(|_| Error::EngineNotInitialized)?;
+    let _guard = acquire_existing_engine_guard().map_err(|_| Error::EngineNotInitialized)?;
     // SAFETY: td_sym_intern takes (const char*, size_t len) and uses the length
     // parameter, not NUL termination. Rust &str bytes are valid for the duration
     // of this call.
@@ -394,16 +398,26 @@ impl Context {
     ///
     /// Pass `col_types: None` to auto-infer types from a sample.
     /// Pass `col_types: Some(&[TD_I64, TD_F64, TD_ENUM, ...])` to specify exact types.
-    pub fn read_csv_opts(&self, path: &str, delimiter: char, header: bool,
-                         col_types: Option<&[i8]>) -> Result<Table> {
+    pub fn read_csv_opts(
+        &self,
+        path: &str,
+        delimiter: char,
+        header: bool,
+        col_types: Option<&[i8]>,
+    ) -> Result<Table> {
         let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
         let (types_ptr, n_types) = match col_types {
             Some(t) => (t.as_ptr(), t.len() as i32),
             None => (std::ptr::null(), 0),
         };
         let ptr = unsafe {
-            ffi::td_csv_read_opts(c_path.as_ptr(), delimiter as std::os::raw::c_char,
-                                  header, types_ptr, n_types)
+            ffi::td_csv_read_opts(
+                c_path.as_ptr(),
+                delimiter as std::os::raw::c_char,
+                header,
+                types_ptr,
+                n_types,
+            )
         };
         let ptr = check_ptr(ptr)?;
         Ok(Table {
@@ -439,7 +453,9 @@ impl Context {
         };
 
         // Cache for future queries
-        self.parted_cache.borrow_mut().insert(cache_key, table.clone_ref());
+        self.parted_cache
+            .borrow_mut()
+            .insert(cache_key, table.clone_ref());
         Ok(table)
     }
 
@@ -530,7 +546,9 @@ impl Table {
     /// Create a shared reference to this table by incrementing the C ref count.
     /// Both the original and the clone will call `td_release` on drop.
     pub fn clone_ref(&self) -> Self {
-        unsafe { ffi::td_retain(self.raw); }
+        unsafe {
+            ffi::td_retain(self.raw);
+        }
         Table {
             raw: self.raw,
             engine: self.engine.clone(),
@@ -667,13 +685,18 @@ impl Table {
 
     /// Resolve a logical row in a TD_PARTED column to (segment_data_ptr, local_row).
     /// Returns None if the row is out of range.
-    unsafe fn resolve_parted_row(vec: *mut ffi::td_t, row: usize) -> Option<(*mut ffi::td_t, usize)> {
+    unsafe fn resolve_parted_row(
+        vec: *mut ffi::td_t,
+        row: usize,
+    ) -> Option<(*mut ffi::td_t, usize)> {
         let n_segs = unsafe { ffi::td_len(vec) } as usize;
         let segs = unsafe { ffi::td_data(vec) as *const *mut ffi::td_t };
         let mut offset = 0usize;
         for s in 0..n_segs {
             let seg = unsafe { *segs.add(s) };
-            if seg.is_null() { continue; }
+            if seg.is_null() {
+                continue;
+            }
             let seg_len = unsafe { ffi::td_len(seg) } as usize;
             if row < offset + seg_len {
                 return Some((seg, row - offset));
@@ -780,11 +803,11 @@ impl Table {
             ffi::TD_SYM => {
                 let data = unsafe { ffi::td_data(vec) as *const i64 };
                 unsafe { *data.add(row) }
-            },
+            }
             ffi::TD_ENUM => {
                 let data = unsafe { ffi::td_data(vec) as *const u32 };
                 (unsafe { *data.add(row) }) as i64
-            },
+            }
             _ => return None,
         };
         let atom = unsafe { ffi::td_sym_str(sym_id) };
@@ -872,7 +895,7 @@ impl Graph<'_> {
 
     fn check_op(raw: *mut ffi::td_op_t) -> Result<Column> {
         if raw.is_null() {
-            return Err(Error::NullPointer);  // graph operation failed (null result)
+            return Err(Error::NullPointer); // graph operation failed (null result)
         }
         Ok(Column { raw })
     }
@@ -1016,7 +1039,9 @@ impl Graph<'_> {
 
     pub fn concat(&self, args: &[Column]) -> Result<Column> {
         let mut ptrs: Vec<*mut ffi::td_op_t> = args.iter().map(|c| c.raw).collect();
-        Self::check_op(unsafe { ffi::td_concat(self.raw, ptrs.as_mut_ptr(), args.len() as std::ffi::c_int) })
+        Self::check_op(unsafe {
+            ffi::td_concat(self.raw, ptrs.as_mut_ptr(), args.len() as std::ffi::c_int)
+        })
     }
 
     // ---- Unary ops --------------------------------------------------------
@@ -1275,7 +1300,12 @@ impl Graph<'_> {
     pub fn project(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
         Self::check_op(unsafe {
-            ffi::td_project(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
+            ffi::td_project(
+                self.raw,
+                input.raw,
+                col_ptrs.as_mut_ptr(),
+                to_u8(cols.len())?,
+            )
         })
     }
 
@@ -1283,7 +1313,12 @@ impl Graph<'_> {
     pub fn select(&self, input: Column, cols: &[Column]) -> Result<Column> {
         let mut col_ptrs: Vec<*mut ffi::td_op_t> = cols.iter().map(|c| c.raw).collect();
         Self::check_op(unsafe {
-            ffi::td_select(self.raw, input.raw, col_ptrs.as_mut_ptr(), to_u8(cols.len())?)
+            ffi::td_select(
+                self.raw,
+                input.raw,
+                col_ptrs.as_mut_ptr(),
+                to_u8(cols.len())?,
+            )
         })
     }
 
@@ -1392,9 +1427,9 @@ impl Drop for Graph<'_> {
 // Re-exports for downstream crates
 // ---------------------------------------------------------------------------
 
-pub use ffi::td_t;
-pub use ffi::td_op_t;
 pub use ffi::td_graph_t;
+pub use ffi::td_op_t;
+pub use ffi::td_t;
 
 /// Low-level FFI access for downstream crates (e.g., teide-db).
 pub mod raw {
@@ -1434,7 +1469,9 @@ pub mod raw {
     /// the allocated element capacity for that vector.
     #[inline]
     pub unsafe fn td_set_len(v: *mut td_t, len: i64) {
-        unsafe { (*v).val.len = len; }
+        unsafe {
+            (*v).val.len = len;
+        }
     }
 }
 
@@ -1459,7 +1496,11 @@ pub unsafe fn ffi_table_new(ncols: i64) -> *mut ffi::td_t {
 ///
 /// # Safety
 /// `tbl` and `col` must be valid pointers from the same engine runtime.
-pub unsafe fn ffi_table_add_col(tbl: *mut ffi::td_t, name_id: i64, col: *mut ffi::td_t) -> *mut ffi::td_t {
+pub unsafe fn ffi_table_add_col(
+    tbl: *mut ffi::td_t,
+    name_id: i64,
+    col: *mut ffi::td_t,
+) -> *mut ffi::td_t {
     unsafe { ffi::td_table_add_col(tbl, name_id, col) }
 }
 

@@ -27,8 +27,8 @@
 pub mod expr;
 pub mod planner;
 
-use std::collections::HashMap;
 use crate::{Context, Table};
+use std::collections::HashMap;
 
 /// Errors produced by the SQL layer.
 #[derive(Debug)]
@@ -155,9 +155,9 @@ impl Session {
 
     /// Get (nrows, ncols) for a stored table, or None if not found.
     pub fn table_info(&self, name: &str) -> Option<(i64, usize)> {
-        self.tables.get(name).map(|st| {
-            (st.table.nrows(), st.columns.len())
-        })
+        self.tables
+            .get(name)
+            .map(|st| (st.table.nrows(), st.columns.len()))
     }
 }
 

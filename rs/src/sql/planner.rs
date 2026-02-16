@@ -36,8 +36,7 @@ use crate::{Column, Context, Graph, Table};
 use super::expr::{
     agg_op_from_name, collect_aggregates, collect_window_functions, expr_default_name,
     format_agg_name, has_window_functions, is_aggregate, is_count_distinct, is_pure_aggregate,
-    parse_window_frame, plan_agg_input, plan_expr, plan_having_expr,
-    plan_post_agg_expr,
+    parse_window_frame, plan_agg_input, plan_expr, plan_having_expr, plan_post_agg_expr,
 };
 use super::{ExecResult, Session, SqlError, SqlResult, StoredTable};
 
@@ -99,10 +98,9 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
                 // CREATE TABLE t (col1 TYPE, col2 TYPE, ...)
                 let (table, columns) = create_empty_table(&create.columns)?;
                 let ncols = columns.len();
-                session.tables.insert(
-                    table_name.clone(),
-                    StoredTable { table, columns },
-                );
+                session
+                    .tables
+                    .insert(table_name.clone(), StoredTable { table, columns });
 
                 Ok(ExecResult::Ddl(format!(
                     "Created table '{table_name}' (0 rows, {ncols} cols)"
@@ -150,13 +148,24 @@ pub fn session_execute(session: &mut Session, sql: &str) -> Result<ExecResult, S
 fn sql_type_to_td(dt: &DataType) -> Result<i8, SqlError> {
     use crate::ffi;
     match dt {
-        DataType::Int(_) | DataType::Integer(_) | DataType::BigInt(_)
-        | DataType::SmallInt(_) | DataType::TinyInt(_) => Ok(ffi::TD_I64),
-        DataType::Real | DataType::Float(_) | DataType::Double | DataType::DoublePrecision
-        | DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => Ok(ffi::TD_F64),
+        DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::SmallInt(_)
+        | DataType::TinyInt(_) => Ok(ffi::TD_I64),
+        DataType::Real
+        | DataType::Float(_)
+        | DataType::Double
+        | DataType::DoublePrecision
+        | DataType::Numeric(_)
+        | DataType::Decimal(_)
+        | DataType::Dec(_) => Ok(ffi::TD_F64),
         DataType::Boolean => Ok(ffi::TD_BOOL),
-        DataType::Varchar(_) | DataType::Text | DataType::Char(_)
-        | DataType::CharVarying(_) | DataType::String(_) => Ok(ffi::TD_SYM),
+        DataType::Varchar(_)
+        | DataType::Text
+        | DataType::Char(_)
+        | DataType::CharVarying(_)
+        | DataType::String(_) => Ok(ffi::TD_SYM),
         _ => Err(SqlError::Plan(format!(
             "CREATE TABLE: unsupported column type {dt}"
         ))),
@@ -205,18 +214,20 @@ fn create_empty_table(columns: &[ColumnDef]) -> Result<(Table, Vec<String>), Sql
 fn plan_insert(session: &mut Session, insert: &Insert) -> Result<ExecResult, SqlError> {
     let table_name = object_name_to_string(&insert.table_name).to_lowercase();
 
-    let stored = session.tables.get(&table_name).ok_or_else(|| {
-        SqlError::Plan(format!("Table '{table_name}' not found"))
-    })?;
+    let stored = session
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| SqlError::Plan(format!("Table '{table_name}' not found")))?;
 
     let target_types: Vec<i8> = (0..stored.table.ncols())
         .map(|c| stored.table.col_type(c as usize))
         .collect();
     let target_cols = stored.columns.clone();
 
-    let source_query = insert.source.as_ref().ok_or_else(|| {
-        SqlError::Plan("INSERT INTO requires VALUES or SELECT".into())
-    })?;
+    let source_query = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| SqlError::Plan("INSERT INTO requires VALUES or SELECT".into()))?;
 
     // Build source table from VALUES or SELECT
     let (source_table, source_cols) = match source_query.body.as_ref() {
@@ -234,12 +245,20 @@ fn plan_insert(session: &mut Session, insert: &Insert) -> Result<ExecResult, Sql
 
     // Handle optional column list reordering
     let source_table = if !insert.columns.is_empty() {
-        reorder_insert_columns(&insert.columns, &target_cols, &target_types, &source_table, &source_cols)?
+        reorder_insert_columns(
+            &insert.columns,
+            &target_cols,
+            &target_types,
+            &source_table,
+            &source_cols,
+        )?
     } else {
         if source_table.ncols() != stored.table.ncols() {
             return Err(SqlError::Plan(format!(
                 "INSERT INTO: source has {} columns but target '{}' has {}",
-                source_table.ncols(), table_name, stored.table.ncols()
+                source_table.ncols(),
+                table_name,
+                stored.table.ncols()
             )));
         }
         source_table
@@ -285,7 +304,9 @@ fn build_table_from_values(
         if row.len() != ncols {
             return Err(SqlError::Plan(format!(
                 "INSERT INTO: row {} has {} values but expected {}",
-                i, row.len(), ncols
+                i,
+                row.len(),
+                ncols
             )));
         }
     }
@@ -352,17 +373,18 @@ fn append_value_to_vec(
     match typ {
         // Integer types (I32, I64, SYM-as-integer, BOOL)
         ffi::TD_I32 | ffi::TD_I64 | ffi::TD_BOOL => {
-            let val = eval_i64_literal(expr).map_err(|e| {
-                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
-            })?;
+            let val = eval_i64_literal(expr)
+                .map_err(|e| SqlError::Plan(format!("column '{}': {e}", col_names[col_idx])))?;
             match typ {
                 ffi::TD_I64 => {
-                    let next = unsafe { ffi::td_vec_append(vec, &val as *const i64 as *const c_void) };
+                    let next =
+                        unsafe { ffi::td_vec_append(vec, &val as *const i64 as *const c_void) };
                     check_vec_append(next)
                 }
                 ffi::TD_I32 => {
                     let v32 = val as i32;
-                    let next = unsafe { ffi::td_vec_append(vec, &v32 as *const i32 as *const c_void) };
+                    let next =
+                        unsafe { ffi::td_vec_append(vec, &v32 as *const i32 as *const c_void) };
                     check_vec_append(next)
                 }
                 ffi::TD_BOOL => {
@@ -375,20 +397,19 @@ fn append_value_to_vec(
         }
 
         ffi::TD_F64 => {
-            let val = eval_f64_literal(expr).map_err(|e| {
-                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
-            })?;
+            let val = eval_f64_literal(expr)
+                .map_err(|e| SqlError::Plan(format!("column '{}': {e}", col_names[col_idx])))?;
             let next = unsafe { ffi::td_vec_append(vec, &val as *const f64 as *const c_void) };
             check_vec_append(next)
         }
 
         ffi::TD_SYM | ffi::TD_ENUM => {
-            let s = eval_str_literal(expr).map_err(|e| {
-                SqlError::Plan(format!("column '{}': {e}", col_names[col_idx]))
-            })?;
+            let s = eval_str_literal(expr)
+                .map_err(|e| SqlError::Plan(format!("column '{}': {e}", col_names[col_idx])))?;
             let sym_id = crate::sym_intern(&s)?;
             if typ == ffi::TD_SYM {
-                let next = unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
+                let next =
+                    unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
                 check_vec_append(next)
             } else {
                 // ENUM uses u32 indices
@@ -418,16 +439,22 @@ fn check_vec_append(next: *mut crate::td_t) -> Result<*mut crate::td_t, SqlError
 /// Evaluate a literal expression to an i64 value.
 fn eval_i64_literal(expr: &Expr) -> Result<i64, String> {
     match expr {
-        Expr::Value(Value::Number(s, _)) => {
-            s.parse::<i64>().map_err(|e| format!("invalid integer '{s}': {e}"))
-        }
+        Expr::Value(Value::Number(s, _)) => s
+            .parse::<i64>()
+            .map_err(|e| format!("invalid integer '{s}': {e}")),
         Expr::Value(Value::Boolean(b)) => Ok(if *b { 1 } else { 0 }),
         Expr::Value(Value::Null) => Ok(0), // null sentinel for integer
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
             let val = eval_i64_literal(expr)?;
             Ok(-val)
         }
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => eval_i64_literal(expr),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => eval_i64_literal(expr),
         _ => Err(format!("expected integer literal, got {expr}")),
     }
 }
@@ -435,15 +462,21 @@ fn eval_i64_literal(expr: &Expr) -> Result<i64, String> {
 /// Evaluate a literal expression to an f64 value.
 fn eval_f64_literal(expr: &Expr) -> Result<f64, String> {
     match expr {
-        Expr::Value(Value::Number(s, _)) => {
-            s.parse::<f64>().map_err(|e| format!("invalid float '{s}': {e}"))
-        }
+        Expr::Value(Value::Number(s, _)) => s
+            .parse::<f64>()
+            .map_err(|e| format!("invalid float '{s}': {e}")),
         Expr::Value(Value::Null) => Ok(f64::NAN), // null sentinel for float
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
             let val = eval_f64_literal(expr)?;
             Ok(-val)
         }
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => eval_f64_literal(expr),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => eval_f64_literal(expr),
         _ => Err(format!("expected numeric literal, got {expr}")),
     }
 }
@@ -473,7 +506,8 @@ fn reorder_insert_columns(
     if insert_cols.len() != source.ncols() as usize {
         return Err(SqlError::Plan(format!(
             "INSERT INTO: column list has {} entries but source has {} columns",
-            insert_cols.len(), source.ncols()
+            insert_cols.len(),
+            source.ncols()
         )));
     }
 
@@ -481,10 +515,15 @@ fn reorder_insert_columns(
     let mut col_map: Vec<Option<usize>> = vec![None; ncols]; // target_idx -> source_idx
     for (src_idx, ident) in insert_cols.iter().enumerate() {
         let name = ident.value.to_lowercase();
-        let tgt_idx = target_cols.iter().position(|c| c.to_lowercase() == name)
-            .ok_or_else(|| SqlError::Plan(format!(
-                "INSERT INTO: column '{}' not found in target table", name
-            )))?;
+        let tgt_idx = target_cols
+            .iter()
+            .position(|c| c.to_lowercase() == name)
+            .ok_or_else(|| {
+                SqlError::Plan(format!(
+                    "INSERT INTO: column '{}' not found in target table",
+                    name
+                ))
+            })?;
         if col_map[tgt_idx].is_some() {
             return Err(SqlError::Plan(format!(
                 "INSERT INTO: duplicate column '{name}' in column list"
@@ -501,9 +540,9 @@ fn reorder_insert_columns(
 
         let col = if let Some(src_idx) = col_map[tgt_idx] {
             // Copy column from source
-            source.get_col_idx(src_idx as i64).ok_or_else(|| {
-                SqlError::Plan("INSERT INTO: source column missing".into())
-            })?
+            source
+                .get_col_idx(src_idx as i64)
+                .ok_or_else(|| SqlError::Plan("INSERT INTO: source column missing".into()))?
         } else {
             // Create a default-filled column (zeros/empty)
             let new_col = unsafe { crate::raw::td_vec_new(typ, nrows as i64) };
@@ -654,7 +693,13 @@ fn plan_query(
             };
 
             // Apply ORDER BY and LIMIT from the outer query
-            return apply_post_processing(ctx, query, result, left_result.columns, effective_tables);
+            return apply_post_processing(
+                ctx,
+                query,
+                result,
+                left_result.columns,
+                effective_tables,
+            );
         }
         SetExpr::SetOperation {
             op,
@@ -662,10 +707,7 @@ fn plan_query(
             left,
             right,
         } => {
-            let is_all = matches!(
-                set_quantifier,
-                sqlparser::ast::SetQuantifier::All
-            );
+            let is_all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
 
             let left_query = Query {
                 with: None,
@@ -707,12 +749,8 @@ fn plan_query(
 
             let keep_matches = matches!(op, sqlparser::ast::SetOperator::Intersect);
 
-            let result = exec_set_operation(
-                ctx,
-                &left_result.table,
-                &right_result.table,
-                keep_matches,
-            )?;
+            let result =
+                exec_set_operation(ctx, &left_result.table, &right_result.table, keep_matches)?;
 
             // Without ALL: apply DISTINCT
             let result = if !is_all {
@@ -748,39 +786,37 @@ fn plan_query(
     // When FROM is a single subquery with window functions or GROUP BY,
     // equality predicates on PARTITION BY / GROUP BY keys are injected into the
     // subquery's WHERE before materialization — avoids processing all rows.
-    let (table, schema, effective_where): (Table, HashMap<String, usize>, Option<Expr>) =
-        if select.from.len() == 1
-            && select.from[0].joins.is_empty()
-            && select.selection.is_some()
+    let (table, schema, effective_where): (Table, HashMap<String, usize>, Option<Expr>) = if select
+        .from
+        .len()
+        == 1
+        && select.from[0].joins.is_empty()
+        && select.selection.is_some()
+    {
+        if let (TableFactor::Derived { subquery, .. }, Some(where_expr)) =
+            (&select.from[0].relation, select.selection.as_ref())
         {
-            if let (TableFactor::Derived { subquery, .. }, Some(where_expr)) =
-                (&select.from[0].relation, select.selection.as_ref())
-            {
-                let pushable_cols = get_pushable_columns_from_query(subquery);
-                if !pushable_cols.is_empty() {
-                    let terms = split_conjunction(where_expr);
-                    let mut push = Vec::new();
-                    let mut keep = Vec::new();
-                    for term in &terms {
-                        if extract_equality_column(term)
-                            .map(|c| pushable_cols.contains(&c))
-                            .unwrap_or(false)
-                        {
-                            push.push((*term).clone());
-                        } else {
-                            keep.push((*term).clone());
-                        }
-                    }
-                    if !push.is_empty() {
-                        let modified = inject_predicates_into_query(subquery, &push);
-                        let result = plan_query(ctx, &modified, effective_tables)?;
-                        let tbl = result.table.with_column_names(&result.columns)?;
-                        let sch = build_result_schema(&tbl, &result.columns);
-                        (tbl, sch, join_conjunction(keep))
+            let pushable_cols = get_pushable_columns_from_query(subquery);
+            if !pushable_cols.is_empty() {
+                let terms = split_conjunction(where_expr);
+                let mut push = Vec::new();
+                let mut keep = Vec::new();
+                for term in &terms {
+                    if extract_equality_column(term)
+                        .map(|c| pushable_cols.contains(&c))
+                        .unwrap_or(false)
+                    {
+                        push.push((*term).clone());
                     } else {
-                        let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
-                        (tbl, sch, select.selection.clone())
+                        keep.push((*term).clone());
                     }
+                }
+                if !push.is_empty() {
+                    let modified = inject_predicates_into_query(subquery, &push);
+                    let result = plan_query(ctx, &modified, effective_tables)?;
+                    let tbl = result.table.with_column_names(&result.columns)?;
+                    let sch = build_result_schema(&tbl, &result.columns);
+                    (tbl, sch, join_conjunction(keep))
                 } else {
                     let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
                     (tbl, sch, select.selection.clone())
@@ -792,7 +828,11 @@ fn plan_query(
         } else {
             let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
             (tbl, sch, select.selection.clone())
-        };
+        }
+    } else {
+        let (tbl, sch) = resolve_from(ctx, &select.from, effective_tables)?;
+        (tbl, sch, select.selection.clone())
+    };
 
     // Build SELECT alias → expression map (for GROUP BY on aliases)
     let select_items = &select.projection;
@@ -854,11 +894,14 @@ fn plan_query(
     // Stage 1.5: Window functions (before GROUP BY)
     let has_windows = has_window_functions(select_items);
     let (working_table, schema, select_items) = if has_windows {
-        let (wt, ws, wi) =
-            plan_window_stage(ctx, &working_table, select_items, &schema)?;
+        let (wt, ws, wi) = plan_window_stage(ctx, &working_table, select_items, &schema)?;
         (wt, ws, std::borrow::Cow::Owned(wi))
     } else {
-        (working_table, schema, std::borrow::Cow::Borrowed(select_items))
+        (
+            working_table,
+            schema,
+            std::borrow::Cow::Borrowed(select_items),
+        )
     };
     let select_items: &[SelectItem] = &select_items;
 
@@ -869,7 +912,15 @@ fn plan_query(
 
     // Stage 2: GROUP BY / aggregation / DISTINCT
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
-        plan_group_select(ctx, &working_table, select_items, &group_by_cols, &schema, &alias_exprs, filter_mask)?
+        plan_group_select(
+            ctx,
+            &working_table,
+            select_items,
+            &group_by_cols,
+            &schema,
+            &alias_exprs,
+            filter_mask,
+        )?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
         let aliases = extract_projection_aliases(select_items, &schema)?;
@@ -886,7 +937,13 @@ fn plan_query(
         if can_passthrough {
             (working_table, aliases)
         } else {
-            plan_expr_select(ctx, &working_table, select_items, &schema, &hidden_order_cols)?
+            plan_expr_select(
+                ctx,
+                &working_table,
+                select_items,
+                &schema,
+                &hidden_order_cols,
+            )?
         }
     };
 
@@ -906,9 +963,7 @@ fn plan_query(
             .collect();
         let mut g = ctx.graph(&result_table)?;
         let table_node = g.const_table(&result_table)?;
-        let pred = plan_having_expr(
-            &mut g, having_expr, &having_schema, &schema, &native_names,
-        )?;
+        let pred = plan_having_expr(&mut g, having_expr, &having_schema, &schema, &native_names)?;
         let filtered = g.filter(table_node, pred)?;
         g.execute(filtered)?
     } else {
@@ -921,7 +976,13 @@ fn plan_query(
             .collect();
         let mut g = ctx.graph(&result_table)?;
         let table_node = g.const_table(&result_table)?;
-        let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+        let sort_node = plan_order_by(
+            &mut g,
+            table_node,
+            &order_by_exprs,
+            &result_aliases,
+            &table_col_names,
+        )?;
 
         // Fuse LIMIT into HEAD(SORT) so the engine only gathers N rows
         let total_limit = match (offset_val, limit_val) {
@@ -1025,7 +1086,8 @@ fn resolve_table(
                 Err(SqlError::Plan(format!("Table '{}' not found", name)))
             } else {
                 Err(SqlError::Plan(format!(
-                    "Could not open '{}' as CSV or partitioned table", stripped
+                    "Could not open '{}' as CSV or partitioned table",
+                    stripped
                 )))
             }
         }
@@ -1186,15 +1248,27 @@ fn resolve_from(
         // For RIGHT JOIN, determine which is actual_left/right
         // We clone_ref to avoid borrow conflicts with the graph
         let (al_table, al_schema, ar_table, ar_schema) = if is_right_join {
-            (right_table.clone_ref(), right_schema.clone(), left_table.clone_ref(), left_schema.clone())
+            (
+                right_table.clone_ref(),
+                right_schema.clone(),
+                left_table.clone_ref(),
+                left_schema.clone(),
+            )
         } else {
-            (left_table.clone_ref(), left_schema.clone(), right_table.clone_ref(), right_schema.clone())
+            (
+                left_table.clone_ref(),
+                left_schema.clone(),
+                right_table.clone_ref(),
+                right_schema.clone(),
+            )
         };
 
         // Extract equi-join keys
         let join_keys = extract_join_keys(&on_expr, &al_schema, &ar_schema)?;
         if join_keys.is_empty() {
-            return Err(SqlError::Plan("JOIN ON must have at least one equi-join key".into()));
+            return Err(SqlError::Plan(
+                "JOIN ON must have at least one equi-join key".into(),
+            ));
         }
 
         // Build join graph (scoped to avoid borrow conflict)
@@ -1312,7 +1386,9 @@ fn plan_group_select(
     struct MaskGuard(*mut crate::td_t);
     impl Drop for MaskGuard {
         fn drop(&mut self) {
-            unsafe { crate::ffi_release(self.0); }
+            unsafe {
+                crate::ffi_release(self.0);
+            }
         }
     }
     let _mask_guard = filter_mask.map(MaskGuard);
@@ -1328,9 +1404,7 @@ fn plan_group_select(
     for item in select_items {
         let (expr, explicit_alias) = match item {
             SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => {
-                (expr, Some(alias.value.to_lowercase()))
-            }
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.to_lowercase())),
             SelectItem::Wildcard(_) => {
                 return Err(SqlError::Plan(
                     "SELECT * not supported with GROUP BY".into(),
@@ -1384,7 +1458,10 @@ fn plan_group_select(
                 }
             }
             let display = explicit_alias.unwrap_or_else(|| expr_default_name(expr));
-            select_plan.push(SelectPlan::PostAggExpr(Box::new(expr.clone()), display.clone()));
+            select_plan.push(SelectPlan::PostAggExpr(
+                Box::new(expr.clone()),
+                display.clone(),
+            ));
             final_aliases.push(display);
         } else {
             // Check if this expression matches a GROUP BY expression key
@@ -1462,7 +1539,9 @@ fn plan_group_select(
     // top of this function) releases our reference on any exit path (rc=1).
     // Graph::drop releases the graph's reference (rc=0).
     if let Some(mask) = filter_mask {
-        unsafe { g.set_filter_mask(mask); }
+        unsafe {
+            g.set_filter_mask(mask);
+        }
     }
     let group_result = g.execute(group_node)?;
 
@@ -1689,7 +1768,8 @@ fn plan_count_distinct_group(
     // SUM→SUM, MIN→MIN, MAX→MAX, COUNT→SUM (sum of partial counts), AVG→not directly supported
     let phase1_schema = build_schema(&phase1_result);
     for agg in &regular_aggs {
-        let native = predict_phase1_col(&phase1_result, &agg.alias, phase1_keys.len(), all_aggs, agg);
+        let native =
+            predict_phase1_col(&phase1_result, &agg.alias, phase1_keys.len(), all_aggs, agg);
         if phase1_schema.contains_key(&native) {
             let phase2_op = match agg.func_name.as_str() {
                 "sum" => crate::AggOp::Sum,
@@ -1877,10 +1957,7 @@ fn plan_window_stage(
     // are present in the same SELECT list.
     let mut spec_groups: Vec<(sqlparser::ast::WindowSpec, Vec<usize>)> = Vec::new();
     for (func_idx, (_item_idx, info)) in win_funcs.iter().enumerate() {
-        if let Some((_, idxs)) = spec_groups
-            .iter_mut()
-            .find(|(spec, _)| *spec == info.spec)
-        {
+        if let Some((_, idxs)) = spec_groups.iter_mut().find(|(spec, _)| *spec == info.spec) {
             idxs.push(func_idx);
         } else {
             spec_groups.push((info.spec.clone(), vec![func_idx]));
@@ -2005,9 +2082,9 @@ fn plan_window_stage(
                 let mut cols: Vec<_> = schema.iter().collect();
                 cols.sort_by_key(|(_, idx)| **idx);
                 for (name, _) in cols {
-                    new_items.push(SelectItem::UnnamedExpr(
-                        Expr::Identifier(Ident::new(name.clone())),
-                    ));
+                    new_items.push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                        name.clone(),
+                    ))));
                 }
             }
             other => new_items.push(other.clone()),
@@ -2026,9 +2103,10 @@ fn rewrite_window_refs(
 ) -> Result<Expr, SqlError> {
     match expr {
         Expr::Function(f) if f.over.is_some() => {
-            let col_name = col_names.get(*idx).cloned().ok_or_else(|| {
-                SqlError::Plan("Window function rewrite mismatch".into())
-            })?;
+            let col_name = col_names
+                .get(*idx)
+                .cloned()
+                .ok_or_else(|| SqlError::Plan("Window function rewrite mismatch".into()))?;
             *idx += 1;
             Ok(Expr::Identifier(Ident::new(col_name)))
         }
@@ -2117,7 +2195,7 @@ impl RawTableBuilder {
     fn finish(mut self) -> Result<Table, SqlError> {
         let raw = self.raw;
         self.raw = std::ptr::null_mut(); // prevent Drop from releasing
-        // No retain: transfer existing rc=1 ownership to Table
+                                         // No retain: transfer existing rc=1 ownership to Table
         match unsafe { Table::from_raw(raw) } {
             Ok(t) => Ok(t),
             Err(e) => {
@@ -2143,9 +2221,9 @@ fn is_vector_column(col: *mut crate::td_t) -> bool {
 
 fn ensure_vector_columns(table: &Table, op: &str) -> Result<Table, SqlError> {
     for c in 0..table.ncols() {
-        let col = table.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("table column missing".into())
-        })?;
+        let col = table
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("table column missing".into()))?;
         if !is_vector_column(col) {
             let col_type = unsafe { crate::raw::td_type(col) };
             return Err(SqlError::Plan(format!(
@@ -2167,9 +2245,7 @@ fn vec_elem_size(col_type: i8, op: &str) -> Result<usize, SqlError> {
         .get(col_type as usize)
         .copied()
         .map(|v| v as usize)
-        .ok_or_else(|| {
-            SqlError::Plan(format!("{op}: unsupported column type {col_type}"))
-        })
+        .ok_or_else(|| SqlError::Plan(format!("{op}: unsupported column type {col_type}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2188,12 +2264,12 @@ fn concat_tables(ctx: &Context, left: &Table, right: &Table) -> Result<Table, Sq
 
     let mut result = RawTableBuilder::new(ncols)?;
     for c in 0..ncols {
-        let l_col = left.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("UNION ALL: left column missing".into())
-        })?;
-        let r_col = right.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("UNION ALL: right column missing".into())
-        })?;
+        let l_col = left
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("UNION ALL: left column missing".into()))?;
+        let r_col = right
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("UNION ALL: right column missing".into()))?;
         let merged = unsafe { crate::ffi_vec_concat(l_col, r_col) };
         if merged.is_null() {
             return Err(SqlError::Engine(crate::Error::Oom));
@@ -2224,9 +2300,9 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
 
     let l_nrows = left.nrows() as usize;
     let r_nrows = right.nrows() as usize;
-    let out_nrows = l_nrows.checked_mul(r_nrows).ok_or_else(|| {
-        SqlError::Plan("CROSS JOIN result too large".into())
-    })?;
+    let out_nrows = l_nrows
+        .checked_mul(r_nrows)
+        .ok_or_else(|| SqlError::Plan("CROSS JOIN result too large".into()))?;
     let l_ncols = left.ncols();
     let r_ncols = right.ncols();
 
@@ -2234,9 +2310,9 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
 
     // Left columns: repeat each row r_nrows times
     for c in 0..l_ncols {
-        let col = left.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("CROSS JOIN: left column missing".into())
-        })?;
+        let col = left
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("CROSS JOIN: left column missing".into()))?;
         let name_id = left.col_name(c);
         let col_type = unsafe { crate::raw::td_type(col) };
         let esz = vec_elem_size(col_type, "CROSS JOIN")?;
@@ -2254,11 +2330,7 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
             for rr in 0..r_nrows {
                 let out_row = lr * r_nrows + rr;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(lr * esz),
-                        dst.add(out_row * esz),
-                        esz,
-                    );
+                    std::ptr::copy_nonoverlapping(src.add(lr * esz), dst.add(out_row * esz), esz);
                 }
             }
         }
@@ -2269,9 +2341,9 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
 
     // Right columns: tile the entire column l_nrows times
     for c in 0..r_ncols {
-        let col = right.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("CROSS JOIN: right column missing".into())
-        })?;
+        let col = right
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("CROSS JOIN: right column missing".into()))?;
         let name_id = right.col_name(c);
         let col_type = unsafe { crate::raw::td_type(col) };
         let esz = vec_elem_size(col_type, "CROSS JOIN")?;
@@ -2287,11 +2359,7 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
         let dst = unsafe { crate::raw::td_data(new_col) };
         for lr in 0..l_nrows {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src,
-                    dst.add(lr * r_nrows * esz),
-                    r_nrows * esz,
-                );
+                std::ptr::copy_nonoverlapping(src, dst.add(lr * r_nrows * esz), r_nrows * esz);
             }
         }
         let add_res = result.add_col(name_id, new_col);
@@ -2335,14 +2403,12 @@ fn exec_set_operation(
     let mut remaining = vec![1usize; r_nrows];
     for r in 0..l_nrows {
         let h = hash_setop_row(&left_cols, r);
-        let matched_right_row = right_buckets
-            .get(&h)
-            .and_then(|candidates| {
-                candidates.iter().copied().find(|&rr| {
-                    remaining[rr] > 0
-                        && setop_rows_equal(&left_cols, r, &right_cols, rr)
-                })
-            });
+        let matched_right_row = right_buckets.get(&h).and_then(|candidates| {
+            candidates
+                .iter()
+                .copied()
+                .find(|&rr| remaining[rr] > 0 && setop_rows_equal(&left_cols, r, &right_cols, rr))
+        });
 
         if keep_matches {
             // INTERSECT: keep if in right
@@ -2364,9 +2430,9 @@ fn exec_set_operation(
     let out_nrows = keep_indices.len();
 
     for c in 0..ncols {
-        let col = left.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("SET operation: column missing".into())
-        })?;
+        let col = left
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("SET operation: column missing".into()))?;
         let name_id = left.col_name(c);
         let col_type = unsafe { crate::raw::td_type(col) };
         let esz = vec_elem_size(col_type, "SET operation")?;
@@ -2382,11 +2448,7 @@ fn exec_set_operation(
         let dst = unsafe { crate::raw::td_data(new_col) };
         for (out_row, &in_row) in keep_indices.iter().enumerate() {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src.add(in_row * esz),
-                    dst.add(out_row * esz),
-                    esz,
-                );
+                std::ptr::copy_nonoverlapping(src.add(in_row * esz), dst.add(out_row * esz), esz);
             }
         }
         let add_res = result.add_col(name_id, new_col);
@@ -2409,9 +2471,9 @@ struct SetOpCol {
 fn collect_setop_columns(table: &Table, ncols: i64) -> Result<Vec<SetOpCol>, SqlError> {
     let mut cols = Vec::with_capacity(ncols as usize);
     for c in 0..ncols {
-        let col = table.get_col_idx(c).ok_or_else(|| {
-            SqlError::Plan("SET operation: column missing".into())
-        })?;
+        let col = table
+            .get_col_idx(c)
+            .ok_or_else(|| SqlError::Plan("SET operation: column missing".into()))?;
         let col_type = unsafe { crate::raw::td_type(col) };
         let elem_size = vec_elem_size(col_type, "SET operation")?;
         let len = unsafe { crate::ffi::td_len(col as *const crate::td_t) } as usize;
@@ -2488,7 +2550,13 @@ fn apply_post_processing(
             .collect();
         let mut g = ctx.graph(&result_table)?;
         let table_node = g.const_table(&result_table)?;
-        let sort_node = plan_order_by(&mut g, table_node, &order_by_exprs, &result_aliases, &table_col_names)?;
+        let sort_node = plan_order_by(
+            &mut g,
+            table_node,
+            &order_by_exprs,
+            &result_aliases,
+            &table_col_names,
+        )?;
 
         let total_limit = match (offset_val, limit_val) {
             (Some(off), Some(lim)) => Some(off.saturating_add(lim)),
@@ -2687,9 +2755,9 @@ fn resolve_subqueries(
             op: *op,
             expr: Box::new(resolve_subqueries(ctx, inner, tables)?),
         }),
-        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
-            resolve_subqueries(ctx, inner, tables)?,
-        ))),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(resolve_subqueries(
+            ctx, inner, tables,
+        )?))),
         Expr::Between {
             expr: inner,
             negated,
@@ -2701,12 +2769,12 @@ fn resolve_subqueries(
             low: Box::new(resolve_subqueries(ctx, low, tables)?),
             high: Box::new(resolve_subqueries(ctx, high, tables)?),
         }),
-        Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
-            resolve_subqueries(ctx, inner, tables)?,
-        ))),
-        Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
-            resolve_subqueries(ctx, inner, tables)?,
-        ))),
+        Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(resolve_subqueries(
+            ctx, inner, tables,
+        )?))),
+        Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(resolve_subqueries(
+            ctx, inner, tables,
+        )?))),
 
         // Leaf nodes: no subqueries to resolve
         _ => Ok(expr.clone()),
@@ -2725,12 +2793,10 @@ fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr
                 Ok(Expr::Value(Value::Number(format!("{v}"), false)))
             }
         }
-        crate::types::I64 | crate::types::I32 => {
-            match table.get_i64(col, row) {
-                Some(v) => Ok(Expr::Value(Value::Number(v.to_string(), false))),
-                None => Ok(Expr::Value(Value::Null)),
-            }
-        }
+        crate::types::I64 | crate::types::I32 => match table.get_i64(col, row) {
+            Some(v) => Ok(Expr::Value(Value::Number(v.to_string(), false))),
+            None => Ok(Expr::Value(Value::Null)),
+        },
         crate::types::SYM | crate::types::ENUM => {
             let v = table.get_str(col, row).unwrap_or_default();
             Ok(Expr::Value(Value::SingleQuotedString(v)))
@@ -2974,9 +3040,7 @@ fn extract_projection_aliases(
 fn projection_source_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => {
-            parts.last().map(|p| p.value.to_lowercase())
-        }
+        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.to_lowercase()),
         Expr::Nested(inner) => projection_source_name(inner),
         _ => None,
     }
@@ -2984,10 +3048,7 @@ fn projection_source_name(expr: &Expr) -> Option<String> {
 
 /// True when SELECT items are an identity projection over the current schema.
 /// Allows `SELECT *` and selecting all base columns in table order.
-fn is_identity_projection(
-    select_items: &[SelectItem],
-    schema: &HashMap<String, usize>,
-) -> bool {
+fn is_identity_projection(select_items: &[SelectItem], schema: &HashMap<String, usize>) -> bool {
     if select_items.len() == 1 && matches!(select_items[0], SelectItem::Wildcard(_)) {
         return true;
     }
@@ -3136,10 +3197,7 @@ fn plan_order_by(
                     .position(|a| a == name)
                     .or_else(|| table_col_names.iter().position(|c| c == name))
                     .ok_or_else(|| {
-                        SqlError::Plan(format!(
-                            "ORDER BY column '{}' not found",
-                            name
-                        ))
+                        SqlError::Plan(format!("ORDER BY column '{}' not found", name))
                     })?;
                 // Use actual table column name, not the SQL alias
                 g.scan(&table_col_names[idx])?

@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
 
-use teide::{AggOp, Context, FrameBound, FrameType, Table, WindowFunc, types};
+use teide::{types, AggOp, Context, FrameBound, FrameType, Table, WindowFunc};
 
 // The C engine uses global state — serialize all tests.
 static ENGINE_LOCK: Mutex<()> = Mutex::new(());
@@ -63,10 +63,7 @@ const CSV_ROWS: &[&str] = &[
 ];
 
 fn create_test_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "{CSV_HEADER}").unwrap();
     for row in CSV_ROWS {
         writeln!(f, "{row}").unwrap();
@@ -77,10 +74,7 @@ fn create_test_csv() -> (tempfile::NamedTempFile, String) {
 }
 
 fn create_join_right_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "id1,x1").unwrap();
     writeln!(f, "id001,100").unwrap();
     writeln!(f, "id002,200").unwrap();
@@ -101,7 +95,6 @@ fn collect_str_i64(table: &Table) -> HashMap<String, i64> {
     }
     map
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -215,11 +208,13 @@ fn group_by_multi_agg() {
     let v1a = g.scan("v1").unwrap();
     let v3a = g.scan("v3").unwrap();
     let v1b = g.scan("v1").unwrap();
-    let grp = g.group_by(
-        &[id1],
-        &[AggOp::Sum, AggOp::Avg, AggOp::Count],
-        &[v1a, v3a, v1b],
-    ).unwrap();
+    let grp = g
+        .group_by(
+            &[id1],
+            &[AggOp::Sum, AggOp::Avg, AggOp::Count],
+            &[v1a, v3a, v1b],
+        )
+        .unwrap();
     let result = g.execute(grp).unwrap();
 
     // 5 groups, 4 columns (id1 + 3 aggs)
@@ -388,7 +383,9 @@ fn join_inner() {
     let right_id1_vec = right.get_col_idx(0).unwrap();
     let right_id1 = unsafe { g.const_vec(right_id1_vec).unwrap() };
 
-    let joined = g.join(left_table, &[left_id1], right_table, &[right_id1], 0).unwrap();
+    let joined = g
+        .join(left_table, &[left_id1], right_table, &[right_id1], 0)
+        .unwrap();
     let result = g.execute(joined).unwrap();
 
     // id001(4) + id002(4) + id003(4) = 12 matched rows
@@ -413,7 +410,9 @@ fn join_left() {
     let right_id1_vec = right.get_col_idx(0).unwrap();
     let right_id1 = unsafe { g.const_vec(right_id1_vec).unwrap() };
 
-    let joined = g.join(left_table, &[left_id1], right_table, &[right_id1], 1).unwrap();
+    let joined = g
+        .join(left_table, &[left_id1], right_table, &[right_id1], 1)
+        .unwrap();
     let result = g.execute(joined).unwrap();
 
     // All 20 left rows preserved
@@ -510,7 +509,9 @@ fn string_ops() {
     let lower_col = g.lower(id1c).unwrap();
     let lower_aliased = g.alias(lower_col, "lower_id1").unwrap();
 
-    let projected = g.select(tbl, &[upper_aliased, len_aliased, lower_aliased]).unwrap();
+    let projected = g
+        .select(tbl, &[upper_aliased, len_aliased, lower_aliased])
+        .unwrap();
     let result = g.execute(projected).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -601,17 +602,19 @@ fn window_row_number() {
     let order_key = g.scan("v1").unwrap();
     let dummy_input = g.scan("v1").unwrap();
 
-    let win = g.window_op(
-        tbl,
-        &[part_key],
-        &[order_key],
-        &[false], // ASC
-        &[WindowFunc::RowNumber],
-        &[dummy_input],
-        FrameType::Rows,
-        FrameBound::UnboundedPreceding,
-        FrameBound::UnboundedFollowing,
-    ).unwrap();
+    let win = g
+        .window_op(
+            tbl,
+            &[part_key],
+            &[order_key],
+            &[false], // ASC
+            &[WindowFunc::RowNumber],
+            &[dummy_input],
+            FrameType::Rows,
+            FrameBound::UnboundedPreceding,
+            FrameBound::UnboundedFollowing,
+        )
+        .unwrap();
     let result = g.execute(win).unwrap();
 
     // 20 rows, original 9 cols + 1 window col = 10
@@ -629,7 +632,11 @@ fn window_row_number() {
     for vals in parts.values() {
         let mut sorted = vals.clone();
         sorted.sort();
-        assert_eq!(sorted, vec![1, 2, 3, 4], "ROW_NUMBER should be 1..4 per partition");
+        assert_eq!(
+            sorted,
+            vec![1, 2, 3, 4],
+            "ROW_NUMBER should be 1..4 per partition"
+        );
     }
 }
 
@@ -648,17 +655,19 @@ fn window_rank_with_ties() {
     let order_key = g.scan("id4").unwrap();
     let dummy = g.scan("id4").unwrap();
 
-    let win = g.window_op(
-        tbl,
-        &[part_key],
-        &[order_key],
-        &[false], // ASC
-        &[WindowFunc::Rank, WindowFunc::DenseRank],
-        &[dummy, dummy],
-        FrameType::Rows,
-        FrameBound::UnboundedPreceding,
-        FrameBound::UnboundedFollowing,
-    ).unwrap();
+    let win = g
+        .window_op(
+            tbl,
+            &[part_key],
+            &[order_key],
+            &[false], // ASC
+            &[WindowFunc::Rank, WindowFunc::DenseRank],
+            &[dummy, dummy],
+            FrameType::Rows,
+            FrameBound::UnboundedPreceding,
+            FrameBound::UnboundedFollowing,
+        )
+        .unwrap();
     let result = g.execute(win).unwrap();
 
     // 20 rows, 9 + 2 window cols = 11
@@ -670,7 +679,10 @@ fn window_rank_with_ties() {
         let rank = result.get_i64(9, r).unwrap();
         let dense_rank = result.get_i64(10, r).unwrap();
         assert!(rank >= 1, "RANK should be >= 1, got {rank}");
-        assert!(dense_rank >= 1, "DENSE_RANK should be >= 1, got {dense_rank}");
+        assert!(
+            dense_rank >= 1,
+            "DENSE_RANK should be >= 1, got {dense_rank}"
+        );
         assert!(dense_rank <= rank, "DENSE_RANK <= RANK");
     }
 }
@@ -689,17 +701,19 @@ fn window_running_sum() {
     let order_key = g.scan("v1").unwrap();
     let sum_input = g.scan("v1").unwrap();
 
-    let win = g.window_op(
-        tbl,
-        &[],     // no partition
-        &[order_key],
-        &[false], // ASC
-        &[WindowFunc::Sum],
-        &[sum_input],
-        FrameType::Rows,
-        FrameBound::UnboundedPreceding,
-        FrameBound::CurrentRow,
-    ).unwrap();
+    let win = g
+        .window_op(
+            tbl,
+            &[], // no partition
+            &[order_key],
+            &[false], // ASC
+            &[WindowFunc::Sum],
+            &[sum_input],
+            FrameType::Rows,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        )
+        .unwrap();
     let result = g.execute(win).unwrap();
 
     assert_eq!(result.nrows(), 20);
@@ -723,7 +737,10 @@ fn window_running_sum() {
     // Total sum of v1 = 1+2+3+4+5+6+7+8+9+10 + 1+2+3+4+5+6+7+8+9+10 = 110
     // The maximum running sum should equal the total
     let max_sum = *sums.last().unwrap();
-    assert_eq!(max_sum, 110, "total running sum should be 110, got {max_sum}");
+    assert_eq!(
+        max_sum, 110,
+        "total running sum should be 110, got {max_sum}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -731,13 +748,14 @@ fn window_running_sum() {
 // ---------------------------------------------------------------------------
 
 fn create_datetime_csv() -> (tempfile::NamedTempFile, String) {
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(f, "date,time,timestamp,value").unwrap();
     writeln!(f, "2024-01-15,09:30:00,2024-01-15T09:30:00,100").unwrap();
-    writeln!(f, "2024-06-30,14:15:30.500000,2024-06-30 14:15:30.500000,200").unwrap();
+    writeln!(
+        f,
+        "2024-06-30,14:15:30.500000,2024-06-30 14:15:30.500000,200"
+    )
+    .unwrap();
     writeln!(f, "1970-01-01,00:00:00,1970-01-01T00:00:00,300").unwrap();
     writeln!(f, "2000-03-01,23:59:59,2000-03-01T23:59:59,400").unwrap();
     f.flush().unwrap();
@@ -766,7 +784,10 @@ fn csv_date_time_auto_infer() {
     // DATE: 2024-01-15 → 19737 days since epoch
     // (53 years * 365 + 13 leap days + 14 days = 19372 + 365 = 19737)
     let d0 = table.get_i64(0, 0).unwrap();
-    assert!(d0 > 19700 && d0 < 19800, "2024-01-15 should be ~19737 days, got {d0}");
+    assert!(
+        d0 > 19700 && d0 < 19800,
+        "2024-01-15 should be ~19737 days, got {d0}"
+    );
 
     // TIME: 00:00:00 → 0 microseconds
     assert_eq!(table.get_i64(1, 2).unwrap(), 0);
@@ -780,7 +801,10 @@ fn csv_date_time_auto_infer() {
     // TIMESTAMP: 2024-01-15T09:30:00 → d0 * 86400000000 + 34200000000
     let ts0 = table.get_i64(2, 0).unwrap();
     let expected_ts = d0 * 86_400_000_000 + 34_200_000_000;
-    assert_eq!(ts0, expected_ts, "timestamp should be days*86400M + time_us");
+    assert_eq!(
+        ts0, expected_ts,
+        "timestamp should be days*86400M + time_us"
+    );
 }
 
 #[test]
@@ -791,7 +815,9 @@ fn csv_explicit_date_types() {
 
     // Force explicit types: DATE, TIME, TIMESTAMP, I64
     let col_types = [types::DATE, types::TIME, types::TIMESTAMP, types::I64];
-    let table = ctx.read_csv_opts(&path, ',', true, Some(&col_types)).unwrap();
+    let table = ctx
+        .read_csv_opts(&path, ',', true, Some(&col_types))
+        .unwrap();
 
     assert_eq!(table.col_type(0), types::DATE);
     assert_eq!(table.col_type(1), types::TIME);

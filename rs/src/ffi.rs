@@ -554,11 +554,7 @@ extern "C" {
     pub fn td_vm_release(ptr: *mut c_void, size: usize);
 
     // --- Threading API ---
-    pub fn td_thread_create(
-        t: *mut td_thread_t,
-        f: td_thread_fn,
-        arg: *mut c_void,
-    ) -> td_err_t;
+    pub fn td_thread_create(t: *mut td_thread_t, f: td_thread_fn, arg: *mut c_void) -> td_err_t;
     pub fn td_thread_join(t: td_thread_t) -> td_err_t;
     pub fn td_thread_count() -> u32;
     pub fn td_parallel_begin();
@@ -801,11 +797,7 @@ extern "C" {
 
     pub fn td_head(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
     pub fn td_tail(g: *mut td_graph_t, input: *mut td_op_t, n: i64) -> *mut td_op_t;
-    pub fn td_alias(
-        g: *mut td_graph_t,
-        input: *mut td_op_t,
-        name: *const c_char,
-    ) -> *mut td_op_t;
+    pub fn td_alias(g: *mut td_graph_t, input: *mut td_op_t, name: *const c_char) -> *mut td_op_t;
     pub fn td_materialize(g: *mut td_graph_t, input: *mut td_op_t) -> *mut td_op_t;
 
     // --- Optimizer API ---
@@ -832,8 +824,13 @@ extern "C" {
 
     // --- CSV API ---
     pub fn td_csv_read(path: *const c_char) -> *mut td_t;
-    pub fn td_csv_read_opts(path: *const c_char, delimiter: c_char, header: bool,
-                                col_types: *const i8, n_types: i32) -> *mut td_t;
+    pub fn td_csv_read_opts(
+        path: *const c_char,
+        delimiter: c_char,
+        header: bool,
+        col_types: *const i8,
+        n_types: i32,
+    ) -> *mut td_t;
 
     // --- Pool / Parallel API ---
     pub fn td_pool_init(n_workers: u32) -> td_err_t;

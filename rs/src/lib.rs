@@ -23,11 +23,11 @@
 //!
 //! Provides safe Rust wrappers around the C engine, plus a SQL parser/planner.
 
-pub mod ffi;
 pub mod engine;
+pub mod ffi;
 pub mod sql;
 
 // Re-export everything from engine at crate root
 pub use engine::*;
 // Re-export sql module types
-pub use sql::{Session, SqlResult, ExecResult, SqlError, execute_sql};
+pub use sql::{execute_sql, ExecResult, Session, SqlError, SqlResult};

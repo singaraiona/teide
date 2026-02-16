@@ -242,8 +242,11 @@ impl SimpleQueryHandler for TeideHandler {
             }
         }
 
-        // Send query to engine thread
-        let sql = query.to_string();
+        // Strip schema prefix: Teide is single-schema, but clients (Superset,
+        // SQLAlchemy) generate schema-qualified names like `public.t` or `"public".t`.
+        let sql = query
+            .replace("public.", "")
+            .replace("\"public\".", "");
         let result = self.bridge.query(sql).await.map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),

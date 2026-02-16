@@ -84,6 +84,7 @@ pub fn is_catalog_query(sql: &str) -> bool {
         || lower.starts_with("deallocate ")
         || lower.starts_with("close ")
         || lower.starts_with("discard ")
+        || lower.contains("pg_backend_pid()")
         || is_select_constant(lower)
 }
 
@@ -168,6 +169,11 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         ));
     }
 
+    // pg_backend_pid() — connection backend PID (used by SA for query cancellation)
+    if lower.contains("pg_backend_pid()") {
+        return Some(single_text_result("pg_backend_pid", &["1"]));
+    }
+
     // SELECT <constant> — health-check ping (e.g. SELECT 1)
     if is_select_constant(lower) {
         if let Some(rest) = lower.strip_prefix("select ") {
@@ -189,18 +195,10 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
     // pg_constraint — PK, FK, unique, check constraints
     // MUST come before pg_attribute: constraint queries contain pg_attribute
     // in subqueries but expect constraint-shaped results, not column metadata.
+    // Teide has no constraints: always return empty results (0 rows).
+    // Returning rows with NULLs would break SQLAlchemy 1.4 which expects
+    // a different column count than 2.x (3 vs 5 for FK queries).
     if lower.contains("pg_constraint") {
-        // FK and check constraint queries use LEFT OUTER JOIN from pg_class,
-        // so SQLAlchemy expects at least 1 row per table (with NULL constraint
-        // fields) to confirm the table exists.
-        let table_names = extract_catalog_table_names(lower);
-        if lower.contains("contype = 'f'") {
-            return Some(handle_fk_constraints(&table_names, meta));
-        }
-        if lower.contains("contype = 'c'") {
-            return Some(handle_check_constraints(&table_names, meta));
-        }
-        // PK (contype='p') and unique (contype='u') use subqueries — empty is correct
         return Some(empty_result(&[("conname", Type::VARCHAR)]));
     }
 
@@ -213,34 +211,87 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
     // MUST come before pg_type/pg_namespace: complex pg_attribute queries
     // contain pg_type/pg_namespace in subqueries.
     if lower.contains("pg_attribute") && lower.contains("attname") {
+        // Try name-based matching first (SA 2.x: relname IN ('t'))
         let table_names = extract_catalog_table_names(lower);
-        let matched: Vec<(&String, &TableMeta)> = meta
+        let mut matched: Vec<(&String, &TableMeta)> = meta
             .tables
             .iter()
             .filter(|(n, _)| table_names.contains(n))
             .map(|(n, m)| (n, m))
             .collect();
+
+        // Fallback: OID-based matching (SA 1.4: attrelid = 16384)
+        if matched.is_empty() {
+            if let Some(oid) = extract_attrelid_oid(lower) {
+                matched = meta
+                    .tables
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (16384 + *i as i32) == oid)
+                    .map(|(_, (n, m))| (n, m))
+                    .collect();
+            }
+        }
+
         if !matched.is_empty() {
-            return Some(handle_pg_attribute(&matched));
+            // SA 2.x queries include collation in SELECT; SA 1.4 does not.
+            // SA 1.4 also uses attrelid (OID) as column 5 instead of table_name.
+            let is_sa2 = lower.contains("collation");
+            let queried_oid = extract_attrelid_oid(lower);
+            return Some(handle_pg_attribute(&matched, is_sa2, queried_oid));
         }
         return Some(empty_result(&[("name", Type::VARCHAR)]));
     }
 
-    // pg_class — table/view listing (SQLAlchemy PG dialect uses this)
+    // pg_class — table/view listing and OID lookups
     if lower.contains("pg_class") && lower.contains("relname") {
-        // Regular tables + partitioned tables in 'public' schema
-        if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
-            let has_tables = lower.contains("'r'") || lower.contains("'p'");
-            if has_tables {
-                // If query selects OID (e.g. for constraint lookups), return oid + relname
-                if lower.contains("pg_class.oid") || lower.contains("c.oid") {
-                    return Some(handle_pg_class(meta));
-                }
-                // Table listing: return just relname
-                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
-                return Some(single_text_result("relname", &names));
+        // OID lookup for a specific table (SA 1.4 get_table_oid):
+        //   SELECT c.oid FROM pg_class c ... WHERE c.relname = 'xxx' AND n.nspname = 'public'
+        // Must come before the general relkind handler.
+        let selects_oid = lower.contains("c.oid") || lower.contains("pg_class.oid");
+        if selects_oid && !lower.contains("relkind") {
+            let table_names = extract_catalog_table_names(lower);
+            if !table_names.is_empty() {
+                return Some(handle_pg_class_oid_lookup(&table_names, meta));
             }
         }
+
+        // Table listing with relkind filter (SA 2.x and psql)
+        let has_relkind = lower.contains("relkind");
+        let in_public = lower.contains("'public'")
+            || (lower.contains("nspname") && !lower.contains("= 'pg_catalog'"));
+        let has_tables = lower.contains("'r'") || lower.contains("'p'");
+
+        if has_relkind && in_public && has_tables {
+            // If query selects OID (e.g. for constraint lookups), return oid + relname
+            if selects_oid {
+                return Some(handle_pg_class(meta));
+            }
+            // Table listing: return just relname
+            let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
+            return Some(single_text_result("relname", &names));
+        }
+
+        // has_table() check (SA 1.4): SELECT relname FROM pg_class ... WHERE relname='t'
+        // No relkind, no c.oid — just checking if the table exists.
+        // Only match when there's no relkind filter (pure existence check).
+        // If relkind is present but didn't match 'r'/'p' above, it's asking
+        // for views/materialized views — return empty.
+        if !has_relkind {
+            let table_names = extract_catalog_table_names(lower);
+            if !table_names.is_empty() {
+                let matched: Vec<&str> = meta
+                    .tables
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .filter(|n| table_names.iter().any(|t| t == n))
+                    .collect();
+                if !matched.is_empty() {
+                    return Some(single_text_result("relname", &matched));
+                }
+            }
+        }
+
         // Views, materialized views, foreign tables, or other schemas → empty
         return Some(empty_result(&[("relname", Type::VARCHAR)]));
     }
@@ -527,14 +578,19 @@ fn extract_catalog_table_names(lower: &str) -> Vec<String> {
         }
     }
 
-    // Pattern: attrelid = '<name>'
-    for marker in ["attrelid = '", "relname = '"] {
-        if let Some(start) = lower.find(marker) {
-            let rest = &lower[start + marker.len()..];
-            if let Some(end) = rest.find('\'') {
-                let t = &rest[..end];
-                if !t.is_empty() && !names.contains(&t.to_string()) {
-                    names.push(t.to_string());
+    // Pattern: attrelid = '<name>' or relname='<name>' (with or without spaces around =)
+    for base in ["attrelid", "relname"] {
+        for marker in [
+            &format!("{base} = '"),   // with spaces
+            &format!("{base}='"),     // no spaces (psycopg2 client-side binding)
+        ] {
+            if let Some(start) = lower.find(marker.as_str()) {
+                let rest = &lower[start + marker.len()..];
+                if let Some(end) = rest.find('\'') {
+                    let t = &rest[..end];
+                    if !t.is_empty() && !names.contains(&t.to_string()) {
+                        names.push(t.to_string());
+                    }
                 }
             }
         }
@@ -543,11 +599,30 @@ fn extract_catalog_table_names(lower: &str) -> Vec<String> {
     names
 }
 
-/// Return column metadata in the format SQLAlchemy 2.x PG dialect expects.
-/// 9 columns: name, format_type, default, not_null, table_name, comment,
-///            generated, identity_options, collation
-fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![
+/// Extract an integer OID from `attrelid = <number>` pattern.
+/// SA 1.4 sends `WHERE a.attrelid = 16384` (no quotes around the OID).
+fn extract_attrelid_oid(lower: &str) -> Option<i32> {
+    let marker = "attrelid = ";
+    let start = lower.find(marker)?;
+    let rest = &lower[start + marker.len()..];
+    // Take contiguous digits
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse::<i32>().ok()
+}
+
+/// Return column metadata for pg_attribute queries.
+///
+/// SA 2.x (is_sa2=true): 9 columns — name, format_type, default, not_null,
+///   table_name, comment, generated, identity_options, collation
+///
+/// SA 1.4 (is_sa2=false): 8 columns — name, format_type, default, not_null,
+///   table_oid, comment, generated, identity_options
+fn handle_pg_attribute(
+    tables: &[(&String, &TableMeta)],
+    is_sa2: bool,
+    queried_oid: Option<i32>,
+) -> PgWireResult<Vec<Response>> {
+    let mut fields = vec![
         FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
         FieldInfo::new(
             "format_type".into(),
@@ -570,13 +645,27 @@ fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Res
             Type::BOOL,
             FieldFormat::Text,
         ),
-        FieldInfo::new(
+    ];
+
+    if is_sa2 {
+        fields.push(FieldInfo::new(
             "table_name".into(),
             None,
             None,
             Type::VARCHAR,
             FieldFormat::Text,
-        ),
+        ));
+    } else {
+        fields.push(FieldInfo::new(
+            "table_oid".into(),
+            None,
+            None,
+            Type::INT4,
+            FieldFormat::Text,
+        ));
+    }
+
+    fields.extend([
         FieldInfo::new(
             "comment".into(),
             None,
@@ -598,14 +687,19 @@ fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Res
             Type::VARCHAR,
             FieldFormat::Text,
         ),
-        FieldInfo::new(
+    ]);
+
+    if is_sa2 {
+        fields.push(FieldInfo::new(
             "collation".into(),
             None,
             None,
             Type::VARCHAR,
             FieldFormat::Text,
-        ),
-    ]);
+        ));
+    }
+
+    let schema = Arc::new(fields);
 
     let mut rows = Vec::new();
     let mut encoder = DataRowEncoder::new(schema.clone());
@@ -618,11 +712,23 @@ fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Res
             encoder.encode_field(&Some(type_name.to_string()))?; // format_type
             encoder.encode_field(&None::<String>)?; // default
             encoder.encode_field(&false)?; // not_null
-            encoder.encode_field(&Some((*table_name).clone()))?; // table_name
+
+            if is_sa2 {
+                encoder.encode_field(&Some((*table_name).clone()))?; // table_name
+            } else {
+                // Return the OID from the query (SA 1.4 sends attrelid = <oid>)
+                let oid = queried_oid.unwrap_or(16384);
+                encoder.encode_field(&Some(oid.to_string()))?; // table_oid
+            }
+
             encoder.encode_field(&None::<String>)?; // comment
             encoder.encode_field(&Some(String::new()))?; // generated
             encoder.encode_field(&None::<String>)?; // identity_options
-            encoder.encode_field(&None::<String>)?; // collation
+
+            if is_sa2 {
+                encoder.encode_field(&None::<String>)?; // collation
+            }
+
             rows.push(Ok(encoder.take_row()));
         }
     }
@@ -633,88 +739,32 @@ fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Res
     ))])
 }
 
-/// FK constraint query result: one row per table with NULL constraint fields.
-/// Columns: relname, conname, anon_1 (constraintdef), nspname, description
-fn handle_fk_constraints(
+// Note: handle_fk_constraints and handle_check_constraints removed.
+// Teide has no constraints; pg_constraint always returns empty results.
+// This avoids column-count mismatches between SA 1.4 (3 cols) and SA 2.x (5 cols).
+
+/// OID lookup for specific table(s). SA 1.4's `get_table_oid()` sends:
+///   SELECT c.oid FROM pg_class c ... WHERE c.relname = 'xxx'
+/// Returns a single-column (oid) result with one row per matched table.
+fn handle_pg_class_oid_lookup(
     table_names: &[String],
     meta: &SessionMeta,
 ) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![
-        FieldInfo::new("relname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new("conname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new("anon_1".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new("nspname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new(
-            "description".into(),
-            None,
-            None,
-            Type::VARCHAR,
-            FieldFormat::Text,
-        ),
-    ]);
+    let schema = Arc::new(vec![FieldInfo::new(
+        "oid".into(),
+        None,
+        None,
+        Type::INT4,
+        FieldFormat::Text,
+    )]);
 
     let mut rows = Vec::new();
     let mut encoder = DataRowEncoder::new(schema.clone());
-    let names: Vec<&str> = if table_names.is_empty() {
-        meta.tables.iter().map(|(n, _)| n.as_str()).collect()
-    } else {
-        meta.tables
-            .iter()
-            .filter(|(n, _)| table_names.contains(n))
-            .map(|(n, _)| n.as_str())
-            .collect()
-    };
-    for name in names {
-        encoder.encode_field(&Some(name.to_string()))?; // relname
-        encoder.encode_field(&None::<String>)?; // conname
-        encoder.encode_field(&None::<String>)?; // anon_1
-        encoder.encode_field(&None::<String>)?; // nspname
-        encoder.encode_field(&None::<String>)?; // description
-        rows.push(Ok(encoder.take_row()));
-    }
-
-    let row_stream = stream::iter(rows);
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema, row_stream,
-    ))])
-}
-
-/// Check constraint query result: one row per table with NULL constraint fields.
-/// Columns: relname, conname, anon_1 (constraintdef), description
-fn handle_check_constraints(
-    table_names: &[String],
-    meta: &SessionMeta,
-) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![
-        FieldInfo::new("relname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new("conname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new("anon_1".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-        FieldInfo::new(
-            "description".into(),
-            None,
-            None,
-            Type::VARCHAR,
-            FieldFormat::Text,
-        ),
-    ]);
-
-    let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let names: Vec<&str> = if table_names.is_empty() {
-        meta.tables.iter().map(|(n, _)| n.as_str()).collect()
-    } else {
-        meta.tables
-            .iter()
-            .filter(|(n, _)| table_names.contains(n))
-            .map(|(n, _)| n.as_str())
-            .collect()
-    };
-    for name in names {
-        encoder.encode_field(&Some(name.to_string()))?; // relname
-        encoder.encode_field(&None::<String>)?; // conname
-        encoder.encode_field(&None::<String>)?; // anon_1
-        encoder.encode_field(&None::<String>)?; // description
-        rows.push(Ok(encoder.take_row()));
+    for (i, (name, _)) in meta.tables.iter().enumerate() {
+        if table_names.iter().any(|t| t == name) {
+            encoder.encode_field(&Some((16384 + i as i32).to_string()))?;
+            rows.push(Ok(encoder.take_row()));
+        }
     }
 
     let row_stream = stream::iter(rows);

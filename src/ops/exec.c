@@ -516,11 +516,14 @@ typedef struct {
     uint8_t n_scratch;      /* scratch registers needed */
     uint8_t out_reg;
     int8_t  out_type;       /* TD_F64, TD_I64, or TD_BOOL */
+    bool    has_parted;     /* true if any REG_SCAN refs a parted column */
     struct {
         uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
         int8_t      type;       /* computational type: TD_F64 / TD_I64 / TD_BOOL */
         int8_t      col_type;   /* original column type (REG_SCAN only) */
+        bool        is_parted;  /* true if this SCAN refs a parted column */
         const void* data;       /* column data pointer (REG_SCAN only) */
+        td_t*       parted_col; /* parted wrapper (is_parted only) */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
     } regs[EXPR_MAX_REGS];
@@ -593,9 +596,21 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
                 td_t* col = td_table_get_col(tbl, ext->sym);
                 if (!col) return false;
                 out->regs[r].kind = REG_SCAN;
-                out->regs[r].col_type = col->type;
-                out->regs[r].data = td_data(col);
-                out->regs[r].type = (col->type == TD_F64) ? TD_F64 : TD_I64;
+                if (TD_IS_PARTED(col->type)) {
+                    int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
+                    out->regs[r].col_type = base;
+                    out->regs[r].data = NULL; /* resolved per-segment */
+                    out->regs[r].is_parted = true;
+                    out->regs[r].parted_col = col;
+                    out->regs[r].type = (base == TD_F64) ? TD_F64 : TD_I64;
+                    out->has_parted = true;
+                } else {
+                    out->regs[r].col_type = col->type;
+                    out->regs[r].data = td_data(col);
+                    out->regs[r].is_parted = false;
+                    out->regs[r].parted_col = NULL;
+                    out->regs[r].type = (col->type == TD_F64) ? TD_F64 : TD_I64;
+                }
             } else if (node->opcode == OP_CONST) {
                 td_op_ext_t* ext = find_ext(g, node->id);
                 if (!ext || !ext->literal) return false;
@@ -969,9 +984,66 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     scratch_free(scratch_hdr);
 }
 
+/* Evaluate compiled expression over parted (segmented) columns.
+ * Iterates segments as outer loop, rebinds data pointers per segment,
+ * then dispatches the existing morsel evaluator per segment. Zero copy. */
+static td_t* expr_eval_full_parted(const td_expr_t* expr, int64_t nrows) {
+    td_t* out = td_vec_new(expr->out_type, nrows);
+    if (!out || TD_IS_ERR(out)) {
+        return out;
+    }
+    out->len = nrows;
+
+    /* Find first parted register to get segment structure */
+    td_t* ref_parted = NULL;
+    for (uint8_t r = 0; r < expr->n_regs; r++) {
+        if (expr->regs[r].is_parted) {
+            ref_parted = expr->regs[r].parted_col;
+            break;
+        }
+    }
+    if (!ref_parted) { td_release(out); return TD_ERR_PTR(TD_ERR_NYI); }
+
+    int64_t n_segs = ref_parted->len;
+    td_t** ref_segs = (td_t**)td_data(ref_parted);
+    uint8_t esz = td_elem_size(expr->out_type);
+    td_pool_t* pool = td_pool_get();
+    int64_t global_off = 0;
+
+    for (int64_t s = 0; s < n_segs; s++) {
+        int64_t seg_len = ref_segs[s]->len;
+        if (seg_len <= 0) continue;
+
+        /* Stack-copy expr, rebind parted registers to this segment's data */
+        td_expr_t seg_expr = *expr;
+        for (uint8_t r = 0; r < seg_expr.n_regs; r++) {
+            if (seg_expr.regs[r].is_parted) {
+                td_t** segs = (td_t**)td_data(seg_expr.regs[r].parted_col);
+                seg_expr.regs[r].data = td_data(segs[s]);
+            }
+        }
+
+        expr_full_ctx_t ctx = {
+            .expr = &seg_expr,
+            .out_data = (char*)td_data(out) + global_off * esz,
+            .out_type = expr->out_type,
+        };
+        if (pool && seg_len >= TD_PARALLEL_THRESHOLD)
+            td_pool_dispatch(pool, expr_full_fn, &ctx, seg_len);
+        else
+            expr_full_fn(&ctx, 0, 0, seg_len);
+
+        global_off += seg_len;
+    }
+    return out;
+}
+
 /* Evaluate compiled expression into a full-length output vector.
  * Replaces exec_node() for expression subtrees — no intermediate vectors. */
 static td_t* expr_eval_full(const td_expr_t* expr, int64_t nrows) {
+    if (expr->has_parted)
+        return expr_eval_full_parted(expr, nrows);
+
     td_t* out = td_vec_new(expr->out_type, nrows);
     if (!out || TD_IS_ERR(out)) return out;
     out->len = nrows;
@@ -1606,6 +1678,36 @@ static void gather_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
  * Filter execution
  * ============================================================================ */
 
+/* Gather from a parted column using global row indices (sorted ascending).
+ * Walks match_idx with an advancing segment cursor — O(count + n_segs). */
+static void parted_gather_col(td_t* parted_col, const int64_t* match_idx,
+                               int64_t count, td_t* dst_col) {
+    int64_t n_segs = parted_col->len;
+    td_t** segs = (td_t**)td_data(parted_col);
+    int8_t base = (int8_t)TD_PARTED_BASETYPE(parted_col->type);
+    uint8_t esz = td_elem_size(base);
+    char* dst = (char*)td_data(dst_col);
+
+    /* Build prefix-sum segment end table */
+    int64_t seg_ends[n_segs];
+    int64_t cumul = 0;
+    for (int64_t i = 0; i < n_segs; i++) {
+        cumul += segs[i]->len;
+        seg_ends[i] = cumul;
+    }
+
+    /* Walk match_idx (sorted ascending) with advancing segment cursor */
+    int64_t seg = 0;
+    for (int64_t i = 0; i < count; i++) {
+        int64_t row = match_idx[i];
+        while (seg < n_segs - 1 && row >= seg_ends[seg]) seg++;
+        int64_t seg_start = (seg > 0) ? seg_ends[seg - 1] : 0;
+        int64_t local_row = row - seg_start;
+        char* src = (char*)td_data(segs[seg]);
+        memcpy(dst + i * esz, src + local_row * esz, esz);
+    }
+}
+
 /* Filter a single vector by boolean predicate. */
 static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
     uint8_t esz = td_elem_size(input->type);
@@ -1633,6 +1735,36 @@ static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
     return result;
 }
 
+/* Filter a parted column by boolean predicate (sequential). */
+static td_t* exec_filter_parted_vec(td_t* parted_col, td_t* pred,
+                                     int64_t pass_count) {
+    int8_t base = (int8_t)TD_PARTED_BASETYPE(parted_col->type);
+    uint8_t esz = td_elem_size(base);
+    td_t* result = td_vec_new(base, pass_count);
+    if (!result || TD_IS_ERR(result)) return result;
+    result->len = pass_count;
+
+    td_t** segs = (td_t**)td_data(parted_col);
+    int64_t n_segs = parted_col->len;
+    int64_t out_idx = 0;
+    int64_t pred_off = 0;
+    uint8_t* pred_data = (uint8_t*)td_data(pred);
+
+    for (int64_t s = 0; s < n_segs; s++) {
+        int64_t seg_len = segs[s]->len;
+        char* src = (char*)td_data(segs[s]);
+        char* dst = (char*)td_data(result);
+        for (int64_t i = 0; i < seg_len; i++) {
+            if (pred_data[pred_off + i]) {
+                memcpy(dst + out_idx * esz, src + i * esz, esz);
+                out_idx++;
+            }
+        }
+        pred_off += seg_len;
+    }
+    return result;
+}
+
 /* Sequential table filter fallback (small tables or alloc failure). */
 static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
                              int64_t pass_count) {
@@ -1641,8 +1773,14 @@ static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
     for (int64_t c = 0; c < ncols; c++) {
         td_t* col = td_table_get_col_idx(input, c);
         if (!col || TD_IS_ERR(col)) continue;
+        /* Skip virtual partition column */
+        if (col->type == TD_MAPCOMMON) continue;
         int64_t name_id = td_table_col_name(input, c);
-        td_t* filtered = exec_filter_vec(col, pred, pass_count);
+        td_t* filtered;
+        if (TD_IS_PARTED(col->type))
+            filtered = exec_filter_parted_vec(col, pred, pass_count);
+        else
+            filtered = exec_filter_vec(col, pred, pass_count);
         if (!filtered || TD_IS_ERR(filtered)) { td_release(tbl); return filtered; }
         td_table_add_col(tbl, name_id, filtered);
         td_release(filtered);
@@ -1714,18 +1852,39 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
     int64_t col_names[ncols];
     int64_t valid_ncols = 0;
 
+    bool has_parted_cols = false;
     for (int64_t c = 0; c < ncols; c++) {
         td_t* col = td_table_get_col_idx(input, c);
         col_names[c] = td_table_col_name(input, c);
         if (!col || TD_IS_ERR(col)) { new_cols[c] = NULL; continue; }
-        td_t* nc = td_vec_new(col->type, pass_count);
+        int8_t out_type = TD_IS_PARTED(col->type)
+                        ? (int8_t)TD_PARTED_BASETYPE(col->type)
+                        : col->type;
+        if (TD_IS_PARTED(col->type)) has_parted_cols = true;
+        td_t* nc = td_vec_new(out_type, pass_count);
         if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
         valid_ncols++;
     }
 
-    if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
+    if (has_parted_cols) {
+        /* Parted-aware gather: use parted_gather_col for parted columns,
+         * sequential flat gather for non-parted columns */
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(input, c);
+            if (!col || !new_cols[c]) continue;
+            if (TD_IS_PARTED(col->type)) {
+                parted_gather_col(col, match_idx, pass_count, new_cols[c]);
+            } else {
+                uint8_t esz = td_elem_size(col->type);
+                char* src = (char*)td_data(col);
+                char* dst = (char*)td_data(new_cols[c]);
+                for (int64_t i = 0; i < pass_count; i++)
+                    memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
+            }
+        }
+    } else if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
         /* Fused multi-column gather */
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
@@ -1770,6 +1929,160 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
 
     scratch_free(idx_hdr);
     return tbl;
+}
+
+/* ============================================================================
+ * sel_compact — materialize a table by applying a TD_SEL bitmap
+ *
+ * Used at boundary ops (sort/join/window) that need dense contiguous data.
+ * Reuses the same parallel multi-column gather as exec_filter.
+ * ============================================================================ */
+
+static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
+    (void)g;
+    if (!tbl || TD_IS_ERR(tbl) || !sel || sel->type != TD_SEL)
+        return tbl;
+
+    int64_t nrows = td_table_nrows(tbl);
+    td_sel_meta_t* meta = td_sel_meta(sel);
+    int64_t pass_count = meta->total_pass;
+
+    /* All-pass: nothing to compact */
+    if (pass_count == nrows) { td_retain(tbl); return tbl; }
+
+    /* None-pass: return empty table with same schema */
+    if (pass_count == 0) {
+        int64_t ncols = td_table_ncols(tbl);
+        td_t* empty = td_table_new(ncols);
+        if (!empty || TD_IS_ERR(empty)) return empty;
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(tbl, c);
+            if (!col) continue;
+            int8_t ct = TD_IS_PARTED(col->type)
+                      ? (int8_t)TD_PARTED_BASETYPE(col->type) : col->type;
+            td_t* nc = td_vec_new(ct, 0);
+            if (nc && !TD_IS_ERR(nc)) {
+                nc->len = 0;
+                td_table_add_col(empty, td_table_col_name(tbl, c), nc);
+                td_release(nc);
+            }
+        }
+        return empty;
+    }
+
+    int64_t ncols = td_table_ncols(tbl);
+    if (ncols <= 0) { td_retain(tbl); return tbl; }
+
+    /* Build match_idx from bitmap */
+    td_t* idx_hdr = NULL;
+    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
+                                       (size_t)pass_count * sizeof(int64_t));
+    if (!match_idx) { td_retain(tbl); return tbl; }
+
+    {
+        const uint64_t* bits = td_sel_bits(sel);
+        const uint8_t* flags = td_sel_flags(sel);
+        uint32_t n_segs = meta->n_segs;
+        int64_t j = 0;
+        for (uint32_t seg = 0; seg < n_segs; seg++) {
+            int64_t seg_start = (int64_t)seg * TD_MORSEL_ELEMS;
+            int64_t seg_end = seg_start + TD_MORSEL_ELEMS;
+            if (seg_end > nrows) seg_end = nrows;
+
+            if (flags[seg] == TD_SEL_NONE) continue;
+            if (flags[seg] == TD_SEL_ALL) {
+                for (int64_t r = seg_start; r < seg_end; r++)
+                    match_idx[j++] = r;
+            } else {
+                for (int64_t r = seg_start; r < seg_end; r++)
+                    if (TD_SEL_BIT_TEST(bits, r)) match_idx[j++] = r;
+            }
+        }
+    }
+
+    /* Parallel multi-column gather (same pattern as exec_filter) */
+    td_pool_t* pool = td_pool_get();
+    td_t* out = td_table_new(ncols);
+    if (!out || TD_IS_ERR(out)) { scratch_free(idx_hdr); return out; }
+
+    /* VLA guard: 256 cols max for stack arrays */
+    if (ncols > 256) ncols = 256;
+
+    td_t* new_cols[ncols];
+    int64_t col_names[ncols];
+    int64_t valid_ncols = 0;
+    bool has_parted = false;
+
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(tbl, c);
+        col_names[c] = td_table_col_name(tbl, c);
+        if (!col || TD_IS_ERR(col)) { new_cols[c] = NULL; continue; }
+        int8_t ct = TD_IS_PARTED(col->type)
+                  ? (int8_t)TD_PARTED_BASETYPE(col->type) : col->type;
+        if (TD_IS_PARTED(col->type)) has_parted = true;
+        td_t* nc = td_vec_new(ct, pass_count);
+        if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
+        nc->len = pass_count;
+        new_cols[c] = nc;
+        valid_ncols++;
+    }
+
+    if (has_parted) {
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(tbl, c);
+            if (!col || !new_cols[c]) continue;
+            if (TD_IS_PARTED(col->type)) {
+                parted_gather_col(col, match_idx, pass_count, new_cols[c]);
+            } else {
+                uint8_t esz = td_elem_size(col->type);
+                char* src = (char*)td_data(col);
+                char* dst = (char*)td_data(new_cols[c]);
+                for (int64_t i = 0; i < pass_count; i++)
+                    memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
+            }
+        }
+    } else if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
+        multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
+        for (int64_t c = 0; c < ncols; c++) {
+            if (!new_cols[c]) continue;
+            td_t* col = td_table_get_col_idx(tbl, c);
+            int64_t ci = mgctx.ncols;
+            mgctx.srcs[ci] = (char*)td_data(col);
+            mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
+            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.ncols++;
+        }
+        td_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
+    } else if (pool) {
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(tbl, c);
+            if (!col || !new_cols[c]) continue;
+            gather_ctx_t gctx = {
+                .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
+                .esz = td_elem_size(col->type), .nullable = false,
+            };
+            td_pool_dispatch(pool, gather_fn, &gctx, pass_count);
+        }
+    } else {
+        for (int64_t c = 0; c < ncols; c++) {
+            td_t* col = td_table_get_col_idx(tbl, c);
+            if (!col || !new_cols[c]) continue;
+            uint8_t esz = td_elem_size(col->type);
+            char* src = (char*)td_data(col);
+            char* dst = (char*)td_data(new_cols[c]);
+            for (int64_t i = 0; i < pass_count; i++)
+                memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
+        }
+    }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        if (!new_cols[c]) continue;
+        td_table_add_col(out, col_names[c], new_cols[c]);
+        td_release(new_cols[c]);
+    }
+
+    scratch_free(idx_hdr);
+    return out;
 }
 
 /* ============================================================================
@@ -3570,7 +3883,8 @@ typedef struct {
     uint32_t     n_workers;
     radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
     ght_layout_t layout;
-    const uint8_t* mask;
+    const uint64_t* mask;
+    const uint8_t*  sel_flags; /* per-segment TD_SEL_NONE/ALL/MIX (NULL=all pass) */
 } radix_phase1_ctx_t;
 
 static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -3581,13 +3895,22 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     uint8_t na = ly->n_aggs;
     uint8_t nv = ly->n_agg_vals;
     uint16_t estride = ly->entry_stride;
-    const uint8_t* mask = c->mask;
+    const uint64_t* mask = c->mask;
+    const uint8_t* sel_flags = c->sel_flags;
 
     int64_t keys[8];
     int64_t agg_vals[8];
 
-    for (int64_t row = start; row < end; row++) {
-        if (TD_UNLIKELY(mask && !mask[row])) continue;
+    for (int64_t row = start; row < end; ) {
+        /* Segment-level skip for TD_SEL_NONE */
+        if (sel_flags) {
+            uint32_t seg = (uint32_t)(row / TD_MORSEL_ELEMS);
+            int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
+            if (seg_end > end) seg_end = end;
+            if (sel_flags[seg] == TD_SEL_NONE) { row = seg_end; continue; }
+        }
+
+        if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, row))) { row++; continue; }
         uint64_t h = 0;
         for (uint8_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
@@ -3634,6 +3957,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 
         uint32_t part = RADIX_PART(h);
         radix_buf_push(&my_bufs[part], estride, h, keys, nk, agg_vals, nv);
+        row++;
     }
 }
 
@@ -3851,39 +4175,58 @@ typedef struct {
     int64_t*    per_worker_min;  /* [n_workers] */
     int64_t*    per_worker_max;  /* [n_workers] */
     uint32_t    n_workers;
-    const uint8_t* mask;
+    const uint64_t* mask;
+    const uint8_t*  sel_flags;   /* per-segment TD_SEL_NONE/ALL/MIX (NULL=all pass) */
 } minmax_ctx_t;
 
 static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     minmax_ctx_t* c = (minmax_ctx_t*)ctx;
     uint32_t wid = worker_id % c->n_workers;
-    const uint8_t* mask = c->mask;
+    const uint64_t* mask = c->mask;
+    const uint8_t* sel_flags = c->sel_flags;
     int64_t kmin = INT64_MAX, kmax = INT64_MIN;
     int8_t t = c->key_type;
-    if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP) {
-        const int64_t* kd = (const int64_t*)c->key_data;
-        for (int64_t r = start; r < end; r++) {
-            if (TD_UNLIKELY(mask && !mask[r])) continue;
-            if (kd[r] < kmin) kmin = kd[r];
-            if (kd[r] > kmax) kmax = kd[r];
-        }
-    } else if (t == TD_ENUM) {
-        const uint32_t* kd = (const uint32_t*)c->key_data;
-        for (int64_t r = start; r < end; r++) {
-            if (TD_UNLIKELY(mask && !mask[r])) continue;
-            int64_t v = (int64_t)kd[r];
-            if (v < kmin) kmin = v;
-            if (v > kmax) kmax = v;
-        }
-    } else { /* TD_I32, TD_DATE, TD_TIME */
-        const int32_t* kd = (const int32_t*)c->key_data;
-        for (int64_t r = start; r < end; r++) {
-            if (TD_UNLIKELY(mask && !mask[r])) continue;
-            int64_t v = (int64_t)kd[r];
-            if (v < kmin) kmin = v;
-            if (v > kmax) kmax = v;
-        }
-    }
+
+    #define MINMAX_SEG_LOOP(TYPE, CAST) \
+        do { \
+            const TYPE* kd = (const TYPE*)c->key_data; \
+            for (int64_t r = start; r < end; ) { \
+                if (sel_flags) { \
+                    uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS); \
+                    int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS; \
+                    if (seg_end > end) seg_end = end; \
+                    if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; } \
+                    bool need_bit = (sel_flags[seg] == TD_SEL_MIX); \
+                    for (; r < seg_end; r++) { \
+                        if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue; \
+                        int64_t v = (int64_t)CAST kd[r]; \
+                        if (v < kmin) kmin = v; \
+                        if (v > kmax) kmax = v; \
+                    } \
+                } else if (mask) { \
+                    if (!TD_SEL_BIT_TEST(mask, r)) { r++; continue; } \
+                    int64_t v = (int64_t)CAST kd[r]; \
+                    if (v < kmin) kmin = v; \
+                    if (v > kmax) kmax = v; \
+                    r++; \
+                } else { \
+                    int64_t v = (int64_t)CAST kd[r]; \
+                    if (v < kmin) kmin = v; \
+                    if (v > kmax) kmax = v; \
+                    r++; \
+                } \
+            } \
+        } while (0)
+
+    if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
+        MINMAX_SEG_LOOP(int64_t, );
+    else if (t == TD_ENUM)
+        MINMAX_SEG_LOOP(uint32_t, );
+    else /* TD_I32, TD_DATE, TD_TIME */
+        MINMAX_SEG_LOOP(int32_t, );
+
+    #undef MINMAX_SEG_LOOP
+
     /* Merge with existing per-worker values (a worker may process multiple morsels) */
     if (kmin < c->per_worker_min[wid]) c->per_worker_min[wid] = kmin;
     if (kmax > c->per_worker_max[wid]) c->per_worker_max[wid] = kmax;
@@ -4076,7 +4419,8 @@ typedef struct {
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
     uint32_t       n_slots;
-    const uint8_t* mask;
+    const uint64_t* mask;
+    const uint8_t*  sel_flags;   /* per-segment TD_SEL_NONE/ALL/MIX (NULL=all pass) */
 } da_ctx_t;
 
 /* Composite GID from multi-key.  Arithmetic overflow is prevented in practice
@@ -4198,7 +4542,8 @@ typedef struct {
     agg_linear_t*  agg_linear;
     uint8_t        n_aggs;
     uint8_t        need_flags;
-    const uint8_t* mask;
+    const uint64_t* mask;
+    const uint8_t*  sel_flags;   /* per-segment TD_SEL_NONE/ALL/MIX (NULL=all pass) */
     /* per-worker accumulators (1 slot each) */
     da_accum_t*    accums;
     uint32_t       n_accums;
@@ -4265,47 +4610,108 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
 }
 
 /* Generic scalar accumulation: handles all ops, all types, mask */
+/* Inner scalar accumulation for a single row */
+static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r) {
+    uint8_t n_aggs = c->n_aggs;
+    acc->count[0]++;
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        double fv; int64_t iv;
+        if (c->agg_linear && c->agg_linear[a].enabled) {
+            const agg_linear_t* lin = &c->agg_linear[a];
+            iv = lin->bias_i64;
+            for (uint8_t t = 0; t < lin->n_terms; t++) {
+                iv += lin->coeff_i64[t] *
+                      scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
+            }
+            fv = (double)iv;
+        } else {
+            if (!c->agg_ptrs[a]) continue;
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+        }
+        uint16_t op = c->agg_ops[a];
+        bool is_f = (c->agg_types[a] == TD_F64);
+        if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+            if (is_f) acc->sum[a].f += fv;
+            else acc->sum[a].i += iv;
+            if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
+        } else if (op == OP_FIRST) {
+            if (acc->count[0] == 1) {
+                if (is_f) acc->sum[a].f = fv; else acc->sum[a].i = iv;
+            }
+        } else if (op == OP_LAST) {
+            if (is_f) acc->sum[a].f = fv; else acc->sum[a].i = iv;
+        } else if (op == OP_MIN) {
+            if (is_f) { if (fv < acc->min_val[a].f) acc->min_val[a].f = fv; }
+            else      { if (iv < acc->min_val[a].i) acc->min_val[a].i = iv; }
+        } else if (op == OP_MAX) {
+            if (is_f) { if (fv > acc->max_val[a].f) acc->max_val[a].f = fv; }
+            else      { if (iv > acc->max_val[a].i) acc->max_val[a].i = iv; }
+        }
+    }
+}
+
 static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = &c->accums[worker_id];
-    uint8_t n_aggs = c->n_aggs;
-    const uint8_t* mask = c->mask;
+    const uint64_t* mask = c->mask;
+    const uint8_t* sel_flags = c->sel_flags;
 
-    for (int64_t r = start; r < end; r++) {
-        if (TD_UNLIKELY(mask && !mask[r])) continue;
-        acc->count[0]++;
-        for (uint8_t a = 0; a < n_aggs; a++) {
-            double fv; int64_t iv;
-            if (c->agg_linear && c->agg_linear[a].enabled) {
-                const agg_linear_t* lin = &c->agg_linear[a];
-                iv = lin->bias_i64;
-                for (uint8_t t = 0; t < lin->n_terms; t++) {
-                    iv += lin->coeff_i64[t] *
-                          scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
-                }
-                fv = (double)iv;
-            } else {
-                if (!c->agg_ptrs[a]) continue;
-                da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+    for (int64_t r = start; r < end; ) {
+        /* Segment-level skip */
+        if (sel_flags) {
+            uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS);
+            int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
+            if (seg_end > end) seg_end = end;
+            if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; }
+            bool need_bit = (sel_flags[seg] == TD_SEL_MIX);
+
+            for (; r < seg_end; r++) {
+                if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
+                scalar_accum_row(c, acc, r);
             }
-            uint16_t op = c->agg_ops[a];
-            bool is_f = (c->agg_types[a] == TD_F64);
-            if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
-                if (is_f) acc->sum[a].f += fv;
-                else acc->sum[a].i += iv;
-                if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
-            } else if (op == OP_FIRST) {
-                if (acc->count[0] == 1) {
-                    if (is_f) acc->sum[a].f = fv; else acc->sum[a].i = iv;
-                }
-            } else if (op == OP_LAST) {
-                if (is_f) acc->sum[a].f = fv; else acc->sum[a].i = iv;
-            } else if (op == OP_MIN) {
-                if (is_f) { if (fv < acc->min_val[a].f) acc->min_val[a].f = fv; }
-                else      { if (iv < acc->min_val[a].i) acc->min_val[a].i = iv; }
-            } else if (op == OP_MAX) {
-                if (is_f) { if (fv > acc->max_val[a].f) acc->max_val[a].f = fv; }
-                else      { if (iv > acc->max_val[a].i) acc->max_val[a].i = iv; }
+            continue;
+        }
+
+        if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
+        scalar_accum_row(c, acc, r);
+        r++;
+    }
+}
+
+/* Inner DA accumulation for a single row — shared by single-key and multi-key paths */
+static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r) {
+    uint8_t n_aggs = c->n_aggs;
+    acc->count[gid]++;
+    size_t base = (size_t)gid * n_aggs;
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        if (!c->agg_ptrs[a]) continue;
+        size_t idx = base + a;
+        double fv; int64_t iv;
+        da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+        uint16_t op = c->agg_ops[a];
+        if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+            if (c->agg_types[a] == TD_F64) acc->sum[idx].f += fv;
+            else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
+            if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
+        } else if (op == OP_FIRST) {
+            if (acc->count[gid] == 1) {
+                if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
+                else acc->sum[idx].i = iv;
+            }
+        } else if (op == OP_LAST) {
+            if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
+            else acc->sum[idx].i = iv;
+        } else if (op == OP_MIN) {
+            if (c->agg_types[a] == TD_F64) {
+                if (fv < acc->min_val[idx].f) acc->min_val[idx].f = fv;
+            } else {
+                if (iv < acc->min_val[idx].i) acc->min_val[idx].i = iv;
+            }
+        } else if (op == OP_MAX) {
+            if (c->agg_types[a] == TD_F64) {
+                if (fv > acc->max_val[idx].f) acc->max_val[idx].f = fv;
+            } else {
+                if (iv > acc->max_val[idx].i) acc->max_val[idx].i = iv;
             }
         }
     }
@@ -4316,7 +4722,8 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     da_accum_t* acc = &c->accums[worker_id];
     uint8_t n_aggs = c->n_aggs;
     uint8_t n_keys = c->n_keys;
-    const uint8_t* mask = c->mask;
+    const uint64_t* mask = c->mask;
+    const uint8_t* sel_flags = c->sel_flags;
 
     /* Fast path: single key — avoid composite GID loop overhead */
     if (n_keys == 1) {
@@ -4325,11 +4732,44 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         int64_t kmin = c->key_mins[0];
         #define DA_PF_DIST 8
         bool da_prefetch = c->n_slots >= 4096;
-        for (int64_t r = start; r < end; r++) {
-            if (TD_UNLIKELY(mask && !mask[r])) continue;
-            /* Stride-ahead prefetch: compute gid for r+PF_DIST and
-             * prefetch the accumulator slots while processing r.
-             * Only beneficial when n_slots is large enough to exceed L1/L2. */
+
+        for (int64_t r = start; r < end; ) {
+            /* Segment-level skip */
+            if (sel_flags) {
+                uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS);
+                int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
+                if (seg_end > end) seg_end = end;
+                if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; }
+                bool need_bit = (sel_flags[seg] == TD_SEL_MIX);
+
+                for (; r < seg_end; r++) {
+                    if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
+                    if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
+                        int64_t pf_kv;
+                        if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
+                            pf_kv = ((const int64_t*)kptr)[r + DA_PF_DIST];
+                        else if (kt == TD_ENUM)
+                            pf_kv = (int64_t)((const uint32_t*)kptr)[r + DA_PF_DIST];
+                        else
+                            pf_kv = (int64_t)((const int32_t*)kptr)[r + DA_PF_DIST];
+                        size_t pf_base = (size_t)(int32_t)(pf_kv - kmin) * n_aggs;
+                        __builtin_prefetch(&acc->count[(int32_t)(pf_kv - kmin)], 1, 1);
+                        if (acc->sum) __builtin_prefetch(&acc->sum[pf_base], 1, 1);
+                    }
+                    int64_t kv;
+                    if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
+                        kv = ((const int64_t*)kptr)[r];
+                    else if (kt == TD_ENUM)
+                        kv = (int64_t)((const uint32_t*)kptr)[r];
+                    else
+                        kv = (int64_t)((const int32_t*)kptr)[r];
+                    da_accum_row(c, acc, (int32_t)(kv - kmin), r);
+                }
+                continue;
+            }
+
+            /* No sel_flags: original per-row mask check */
+            if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
             if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
                 int64_t pf_kv;
                 if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
@@ -4347,85 +4787,34 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 kv = ((const int64_t*)kptr)[r];
             else if (kt == TD_ENUM)
                 kv = (int64_t)((const uint32_t*)kptr)[r];
-            else /* TD_I32, TD_DATE, TD_TIME */
+            else
                 kv = (int64_t)((const int32_t*)kptr)[r];
-            int32_t gid = (int32_t)(kv - kmin);
-            acc->count[gid]++;
-            size_t base = (size_t)gid * n_aggs;
-            for (uint8_t a = 0; a < n_aggs; a++) {
-                if (!c->agg_ptrs[a]) continue;
-                size_t idx = base + a;
-                double fv; int64_t iv;
-                da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
-                uint16_t op = c->agg_ops[a];
-                if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
-                    if (c->agg_types[a] == TD_F64) acc->sum[idx].f += fv;
-                    else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
-                    if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
-                } else if (op == OP_FIRST) {
-                    if (acc->count[gid] == 1) {
-                        if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
-                        else acc->sum[idx].i = iv;
-                    }
-                } else if (op == OP_LAST) {
-                    if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
-                    else acc->sum[idx].i = iv;
-                } else if (op == OP_MIN) {
-                    if (c->agg_types[a] == TD_F64) {
-                        if (fv < acc->min_val[idx].f) acc->min_val[idx].f = fv;
-                    } else {
-                        if (iv < acc->min_val[idx].i) acc->min_val[idx].i = iv;
-                    }
-                } else if (op == OP_MAX) {
-                    if (c->agg_types[a] == TD_F64) {
-                        if (fv > acc->max_val[idx].f) acc->max_val[idx].f = fv;
-                    } else {
-                        if (iv > acc->max_val[idx].i) acc->max_val[idx].i = iv;
-                    }
-                }
-            }
+            da_accum_row(c, acc, (int32_t)(kv - kmin), r);
+            r++;
         }
         return;
     }
 
     /* Multi-key composite GID path */
-    for (int64_t r = start; r < end; r++) {
-        if (TD_UNLIKELY(mask && !mask[r])) continue;
-        int32_t gid = da_composite_gid(c, r);
-        acc->count[gid]++;
-        size_t base = (size_t)gid * n_aggs;
-        for (uint8_t a = 0; a < n_aggs; a++) {
-            if (!c->agg_ptrs[a]) continue;
-            size_t idx = base + a;
-            double fv; int64_t iv;
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
-            uint16_t op = c->agg_ops[a];
-            if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
-                if (c->agg_types[a] == TD_F64) acc->sum[idx].f += fv;
-                else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
-                if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
-            } else if (op == OP_FIRST) {
-                if (acc->count[gid] == 1) {
-                    if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
-                    else acc->sum[idx].i = iv;
-                }
-            } else if (op == OP_LAST) {
-                if (c->agg_types[a] == TD_F64) acc->sum[idx].f = fv;
-                else acc->sum[idx].i = iv;
-            } else if (op == OP_MIN) {
-                if (c->agg_types[a] == TD_F64) {
-                    if (fv < acc->min_val[idx].f) acc->min_val[idx].f = fv;
-                } else {
-                    if (iv < acc->min_val[idx].i) acc->min_val[idx].i = iv;
-                }
-            } else if (op == OP_MAX) {
-                if (c->agg_types[a] == TD_F64) {
-                    if (fv > acc->max_val[idx].f) acc->max_val[idx].f = fv;
-                } else {
-                    if (iv > acc->max_val[idx].i) acc->max_val[idx].i = iv;
-                }
+    for (int64_t r = start; r < end; ) {
+        /* Segment-level skip */
+        if (sel_flags) {
+            uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS);
+            int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
+            if (seg_end > end) seg_end = end;
+            if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; }
+            bool need_bit = (sel_flags[seg] == TD_SEL_MIX);
+
+            for (; r < seg_end; r++) {
+                if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
+                da_accum_row(c, acc, da_composite_gid(c, r), r);
             }
+            continue;
         }
+
+        if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
+        da_accum_row(c, acc, da_composite_gid(c, r), r);
+        r++;
     }
 }
 
@@ -4729,11 +5118,14 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
-    /* Extract filter mask for pushdown (skip filtered rows in scan loops) */
-    const uint8_t* mask = NULL;
-    if (g->filter_mask && g->filter_mask->type == TD_BOOL
-        && g->filter_mask->len == nrows)
-        mask = (const uint8_t*)td_data(g->filter_mask);
+    /* Extract selection bitmap for pushdown (skip filtered rows in scan loops) */
+    const uint64_t* mask = NULL;
+    const uint8_t* sel_flags = NULL;
+    if (g->selection && g->selection->type == TD_SEL
+        && g->selection->len == nrows) {
+        mask = td_sel_bits(g->selection);
+        sel_flags = td_sel_flags(g->selection);
+    }
 
     if (n_keys > 8 || n_aggs > 8) return TD_ERR_PTR(TD_ERR_NYI);
 
@@ -4940,6 +5332,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
             .n_aggs     = n_aggs,
             .need_flags = need_flags,
             .mask       = mask,
+            .sel_flags  = sel_flags,
             .accums     = sc_acc,
             .n_accums   = sc_n,
         };
@@ -5079,6 +5472,7 @@ da_path:;
                     .per_worker_max = mm_maxs,
                     .n_workers      = mm_n,
                     .mask           = mask,
+                    .sel_flags      = sel_flags,
                 };
                 if (mm_n > 1) {
                     td_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, nrows);
@@ -5239,6 +5633,7 @@ da_path:;
                 .need_flags  = need_flags,
                 .n_slots     = n_slots,
                 .mask        = mask,
+                .sel_flags   = sel_flags,
             };
 
             if (da_n_workers > 1)
@@ -5537,6 +5932,7 @@ ht_path:;
             .bufs      = radix_bufs,
             .layout    = ght_layout,
             .mask      = mask,
+            .sel_flags = sel_flags,
         };
         td_pool_dispatch(pool, radix_phase1_fn, &p1ctx, nrows);
         CHECK_CANCEL_GOTO(pool, cleanup);
@@ -8492,6 +8888,25 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             if (!g->table) return TD_ERR_PTR(TD_ERR_SCHEMA);
             td_t* col = td_table_get_col(g->table, ext->sym);
             if (!col) return TD_ERR_PTR(TD_ERR_SCHEMA);
+            if (TD_IS_PARTED(col->type)) {
+                /* Concat parted segments into flat vector (cold path) */
+                int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
+                int64_t total = td_parted_nrows(col);
+                td_t* flat = td_vec_new(base, total);
+                if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
+                flat->len = total;
+                td_t** segs = (td_t**)td_data(col);
+                size_t esz = (size_t)td_elem_size(base);
+                int64_t off = 0;
+                for (int64_t s = 0; s < col->len; s++) {
+                    if (segs[s] && segs[s]->len > 0) {
+                        memcpy((char*)td_data(flat) + off * esz,
+                               td_data(segs[s]), (size_t)segs[s]->len * esz);
+                        off += segs[s]->len;
+                    }
+                }
+                return flat;
+            }
             td_retain(col);
             return col;
         }
@@ -8558,6 +8973,31 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* pred  = exec_node(g, op->inputs[1]);
             if (!input || TD_IS_ERR(input)) { if (pred && !TD_IS_ERR(pred)) td_release(pred); return input; }
             if (!pred || TD_IS_ERR(pred)) { td_release(input); return pred; }
+
+            /* Lazy filter: convert predicate to TD_SEL bitmap instead of
+             * materializing a compacted table.  Only for TABLE inputs —
+             * downstream ops (group-by) consume the bitmap directly;
+             * boundary ops (sort/join/window) compact on demand.
+             * Vector inputs must still materialize immediately since
+             * downstream ops like COUNT rely on compacted length. */
+            if (pred->type == TD_BOOL && input->type == TD_TABLE) {
+                td_t* new_sel = td_sel_from_pred(pred);
+                td_release(pred);
+                if (!new_sel || TD_IS_ERR(new_sel)) { td_release(input); return new_sel; }
+
+                if (g->selection) {
+                    /* Chained filter: AND with existing selection */
+                    td_t* merged = td_sel_and(g->selection, new_sel);
+                    td_release(new_sel);
+                    td_release(g->selection);
+                    g->selection = merged;
+                } else {
+                    g->selection = new_sel;
+                }
+                return input;  /* original table, not compacted */
+            }
+
+            /* Eager filter for vector inputs and non-BOOL predicates */
             td_t* result = exec_filter(g, op, input, pred);
             td_release(input);
             td_release(pred);
@@ -8568,6 +9008,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
             td_t* tbl = (input->type == TD_TABLE) ? input : g->table;
+            /* Compact lazy selection before sort (needs dense data) */
+            if (g->selection && tbl && !TD_IS_ERR(tbl) && tbl->type == TD_TABLE) {
+                td_t* compacted = sel_compact(g, tbl, g->selection);
+                if (input != g->table) td_release(input);
+                td_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                tbl = compacted;
+            }
             td_t* result = exec_sort(g, op, tbl, 0);
             if (input != g->table) td_release(input);
             return result;
@@ -8583,6 +9032,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* right = exec_node(g, op->inputs[1]);
             if (!left || TD_IS_ERR(left)) { if (right && !TD_IS_ERR(right)) td_release(right); return left; }
             if (!right || TD_IS_ERR(right)) { td_release(left); return right; }
+            /* Compact lazy selection before join (needs dense data) */
+            if (g->selection && left && !TD_IS_ERR(left) && left->type == TD_TABLE) {
+                td_t* compacted = sel_compact(g, left, g->selection);
+                td_release(left);
+                td_release(g->selection);
+                g->selection = NULL;
+                left = compacted;
+            }
             td_t* result = exec_join(g, op, left, right);
             td_release(left);
             td_release(right);
@@ -8593,6 +9050,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             td_t* input = exec_node(g, op->inputs[0]);
             if (!input || TD_IS_ERR(input)) return input;
             td_t* wdf = (input->type == TD_TABLE) ? input : g->table;
+            /* Compact lazy selection before window (needs dense data) */
+            if (g->selection && wdf && !TD_IS_ERR(wdf) && wdf->type == TD_TABLE) {
+                td_t* compacted = sel_compact(g, wdf, g->selection);
+                if (input != g->table) td_release(input);
+                td_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                wdf = compacted;
+            }
             td_t* result = exec_window(g, op, wdf);
             if (input != g->table) td_release(input);
             return result;
@@ -8608,6 +9074,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 td_t* sort_input = exec_node(g, child_op->inputs[0]);
                 if (!sort_input || TD_IS_ERR(sort_input)) return sort_input;
                 td_t* tbl = (sort_input->type == TD_TABLE) ? sort_input : g->table;
+                /* Compact lazy selection before sort */
+                if (g->selection && tbl && !TD_IS_ERR(tbl) && tbl->type == TD_TABLE) {
+                    td_t* compacted = sel_compact(g, tbl, g->selection);
+                    if (sort_input != g->table) td_release(sort_input);
+                    td_release(g->selection);
+                    g->selection = NULL;
+                    sort_input = compacted;
+                    tbl = compacted;
+                }
                 td_t* result = exec_sort(g, child_op, tbl, n);
                 if (sort_input != g->table) td_release(sort_input);
                 return result;
@@ -8623,16 +9098,42 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 for (int64_t c = 0; c < ncols; c++) {
                     td_t* col = td_table_get_col_idx(input, c);
                     int64_t name_id = td_table_col_name(input, c);
-                    /* Materialized copy (td_vec_slice creates zero-copy views
-                       that the morsel iterator can't handle) */
-                    uint8_t esz = td_elem_size(col->type);
-                    td_t* head_vec = td_vec_new(col->type, n);
-                    if (head_vec && !TD_IS_ERR(head_vec)) {
-                        head_vec->len = n;
-                        memcpy(td_data(head_vec), td_data(col), (size_t)n * esz);
+                    if (!col) continue;
+                    /* Skip virtual partition column (no element data) */
+                    if (col->type == TD_MAPCOMMON) continue;
+                    if (TD_IS_PARTED(col->type)) {
+                        /* Copy first n rows from parted segments */
+                        int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
+                        uint8_t esz = td_elem_size(base);
+                        td_t* head_vec = td_vec_new(base, n);
+                        if (head_vec && !TD_IS_ERR(head_vec)) {
+                            head_vec->len = n;
+                            td_t** segs = (td_t**)td_data(col);
+                            int64_t remaining = n;
+                            int64_t dst_off = 0;
+                            for (int64_t s = 0; s < col->len && remaining > 0; s++) {
+                                int64_t take = segs[s]->len;
+                                if (take > remaining) take = remaining;
+                                memcpy((char*)td_data(head_vec) + dst_off * esz,
+                                       td_data(segs[s]), (size_t)take * esz);
+                                dst_off += take;
+                                remaining -= take;
+                            }
+                        }
+                        result = td_table_add_col(result, name_id, head_vec);
+                        td_release(head_vec);
+                    } else {
+                        /* Flat column: direct copy */
+                        uint8_t esz = td_elem_size(col->type);
+                        td_t* head_vec = td_vec_new(col->type, n);
+                        if (head_vec && !TD_IS_ERR(head_vec)) {
+                            head_vec->len = n;
+                            memcpy(td_data(head_vec), td_data(col),
+                                   (size_t)n * esz);
+                        }
+                        result = td_table_add_col(result, name_id, head_vec);
+                        td_release(head_vec);
                     }
-                    result = td_table_add_col(result, name_id, head_vec);
-                    td_release(head_vec);
                 }
                 td_release(input);
                 return result;
@@ -8803,5 +9304,17 @@ td_t* td_execute(td_graph_t* g, td_op_t* root) {
     if (pool)
         atomic_store_explicit(&pool->cancelled, 0, memory_order_relaxed);
 
-    return exec_node(g, root);
+    td_t* result = exec_node(g, root);
+
+    /* Final compaction: if a lazy selection remains unconsumed (e.g., filter
+     * followed directly by a terminal node), materialize it now. */
+    if (g->selection && result && !TD_IS_ERR(result)
+        && result->type == TD_TABLE) {
+        td_t* compacted = sel_compact(g, result, g->selection);
+        td_release(result);
+        td_release(g->selection);
+        g->selection = NULL;
+        result = compacted;
+    }
+    return result;
 }

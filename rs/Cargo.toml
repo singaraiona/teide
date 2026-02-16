@@ -13,6 +13,7 @@ links = "teide"
 [features]
 default = []
 cli = ["reedline", "clap", "nu-ansi-term"]
+server = ["tokio", "pgwire", "async-trait", "futures", "clap"]
 
 [dependencies]
 sqlparser = { version = "0.53", features = ["visitor"] }
@@ -30,10 +31,29 @@ optional = true
 version = "0.50"
 optional = true
 
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "net", "macros", "signal"]
+optional = true
+
+[dependencies.pgwire]
+version = "0.38"
+optional = true
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
+[dependencies.futures]
+version = "0.3"
+optional = true
+
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 sqllogictest = "0.29"
+tokio-postgres = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 
 [build-dependencies]
 cc = "1"
@@ -42,6 +62,11 @@ cc = "1"
 name = "teide"
 path = "src/cli/main.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "teide-server"
+path = "src/server/main.rs"
+required-features = ["server"]
 
 [[bench]]
 name = "h2oai"

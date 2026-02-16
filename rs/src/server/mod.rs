@@ -19,17 +19,9 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! teide: Fast columnar computation engine powered by a zero-dependency C17 core.
-//!
-//! Provides safe Rust wrappers around the C engine, plus a SQL parser/planner.
+//! PostgreSQL wire protocol server for the Teide columnar engine.
 
-pub mod engine;
-pub mod ffi;
-#[cfg(feature = "server")]
-pub mod server;
-pub mod sql;
-
-// Re-export everything from engine at crate root
-pub use engine::*;
-// Re-export sql module types
-pub use sql::{execute_sql, ExecResult, Session, SqlError, SqlResult};
+pub mod catalog;
+pub mod encode;
+pub mod handler;
+pub mod types;

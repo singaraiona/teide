@@ -37,6 +37,22 @@ use pgwire::error::PgWireResult;
 use super::handler::SessionMeta;
 use super::types::teide_to_pg_type;
 
+/// Returns true if the SQL is a simple `SELECT <constant>` with no FROM clause.
+/// Connection pools and BI tools use `SELECT 1` as a health-check ping.
+fn is_select_constant(lower: &str) -> bool {
+    if let Some(rest) = lower.strip_prefix("select ") {
+        let rest = rest.trim().trim_end_matches(';').trim();
+        // Integer literal, string literal, or TRUE/FALSE/NULL
+        rest.parse::<i64>().is_ok()
+            || (rest.starts_with('\'') && rest.ends_with('\''))
+            || rest == "true"
+            || rest == "false"
+            || rest == "null"
+    } else {
+        false
+    }
+}
+
 /// Returns true if the lowercased SQL looks like a catalog/system query
 /// that we should intercept rather than forwarding to the Teide engine.
 pub fn is_catalog_query(sql: &str) -> bool {
@@ -66,6 +82,7 @@ pub fn is_catalog_query(sql: &str) -> bool {
         || lower.starts_with("deallocate ")
         || lower.starts_with("close ")
         || lower.starts_with("discard ")
+        || is_select_constant(lower)
 }
 
 /// Handle a catalog query, returning a pgwire Response.
@@ -147,6 +164,14 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
             "version",
             &["PostgreSQL 16.6 (Teide 0.2.0)"],
         ));
+    }
+
+    // SELECT <constant> — health-check ping (e.g. SELECT 1)
+    if is_select_constant(lower) {
+        if let Some(rest) = lower.strip_prefix("select ") {
+            let val = rest.trim().trim_end_matches(';').trim();
+            return Some(single_text_result("?column?", &[val]));
+        }
     }
 
     // information_schema.tables — list session tables

@@ -64,6 +64,8 @@ pub fn is_catalog_query(sql: &str) -> bool {
         || lower.contains("pg_namespace")
         || lower.contains("pg_class")
         || lower.contains("pg_attribute")
+        || lower.contains("pg_constraint")
+        || lower.contains("pg_index")
         || lower.contains("pg_settings")
         || lower.contains("pg_database")
         || lower.contains("information_schema")
@@ -184,6 +186,29 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         return Some(handle_information_schema_columns(meta));
     }
 
+    // pg_constraint — PK, FK, unique, check constraints
+    // MUST come before pg_attribute: constraint queries contain pg_attribute
+    // in subqueries but expect constraint-shaped results, not column metadata.
+    if lower.contains("pg_constraint") {
+        // FK and check constraint queries use LEFT OUTER JOIN from pg_class,
+        // so SQLAlchemy expects at least 1 row per table (with NULL constraint
+        // fields) to confirm the table exists.
+        let table_names = extract_catalog_table_names(lower);
+        if lower.contains("contype = 'f'") {
+            return Some(handle_fk_constraints(&table_names, meta));
+        }
+        if lower.contains("contype = 'c'") {
+            return Some(handle_check_constraints(&table_names, meta));
+        }
+        // PK (contype='p') and unique (contype='u') use subqueries — empty is correct
+        return Some(empty_result(&[("conname", Type::VARCHAR)]));
+    }
+
+    // pg_index — index introspection (return empty, no indexes)
+    if lower.contains("pg_index") {
+        return Some(empty_result(&[("indexrelid", Type::INT4)]));
+    }
+
     // pg_attribute — column introspection (SQLAlchemy PG dialect)
     // MUST come before pg_type/pg_namespace: complex pg_attribute queries
     // contain pg_type/pg_namespace in subqueries.
@@ -207,8 +232,7 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         if lower.contains("nspname") && lower.contains("'public'") && lower.contains("relkind") {
             let has_tables = lower.contains("'r'") || lower.contains("'p'");
             if has_tables {
-                let names: Vec<&str> = meta.tables.iter().map(|(n, _)| n.as_str()).collect();
-                return Some(single_text_result("relname", &names));
+                return Some(handle_pg_class(meta));
             }
         }
         // Views, materialized views, foreign tables, or other schemas → empty
@@ -595,6 +619,125 @@ fn handle_pg_attribute(tables: &[(&String, &TableMeta)]) -> PgWireResult<Vec<Res
             encoder.encode_field(&None::<String>)?; // collation
             rows.push(Ok(encoder.take_row()));
         }
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+/// FK constraint query result: one row per table with NULL constraint fields.
+/// Columns: relname, conname, anon_1 (constraintdef), nspname, description
+fn handle_fk_constraints(
+    table_names: &[String],
+    meta: &SessionMeta,
+) -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("relname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("conname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("anon_1".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("nspname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "description".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::new();
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let names: Vec<&str> = if table_names.is_empty() {
+        meta.tables.iter().map(|(n, _)| n.as_str()).collect()
+    } else {
+        meta.tables
+            .iter()
+            .filter(|(n, _)| table_names.contains(n))
+            .map(|(n, _)| n.as_str())
+            .collect()
+    };
+    for name in names {
+        encoder.encode_field(&Some(name.to_string()))?; // relname
+        encoder.encode_field(&None::<String>)?; // conname
+        encoder.encode_field(&None::<String>)?; // anon_1
+        encoder.encode_field(&None::<String>)?; // nspname
+        encoder.encode_field(&None::<String>)?; // description
+        rows.push(Ok(encoder.take_row()));
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+/// Check constraint query result: one row per table with NULL constraint fields.
+/// Columns: relname, conname, anon_1 (constraintdef), description
+fn handle_check_constraints(
+    table_names: &[String],
+    meta: &SessionMeta,
+) -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("relname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("conname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("anon_1".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "description".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::new();
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let names: Vec<&str> = if table_names.is_empty() {
+        meta.tables.iter().map(|(n, _)| n.as_str()).collect()
+    } else {
+        meta.tables
+            .iter()
+            .filter(|(n, _)| table_names.contains(n))
+            .map(|(n, _)| n.as_str())
+            .collect()
+    };
+    for name in names {
+        encoder.encode_field(&Some(name.to_string()))?; // relname
+        encoder.encode_field(&None::<String>)?; // conname
+        encoder.encode_field(&None::<String>)?; // anon_1
+        encoder.encode_field(&None::<String>)?; // description
+        rows.push(Ok(encoder.take_row()));
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+/// Return pg_class rows with oid + relname for tables in the 'public' schema.
+/// SQLAlchemy queries pg_class.oid to pass into subsequent constraint queries.
+fn handle_pg_class(meta: &SessionMeta) -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("oid".into(), None, None, Type::INT4, FieldFormat::Text),
+        FieldInfo::new(
+            "relname".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::with_capacity(meta.tables.len());
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    for (i, (name, _)) in meta.tables.iter().enumerate() {
+        // Fake OIDs starting at 16384 (first user-created OID in PostgreSQL)
+        encoder.encode_field(&Some((16384 + i as i32).to_string()))?;
+        encoder.encode_field(&Some(name.clone()))?;
+        rows.push(Ok(encoder.take_row()));
     }
 
     let row_stream = stream::iter(rows);

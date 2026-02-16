@@ -195,6 +195,14 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         ]));
     }
 
+    // pg_namespace — return public + information_schema
+    if lower.contains("pg_namespace") {
+        return Some(single_text_result(
+            "nspname",
+            &["public", "information_schema"],
+        ));
+    }
+
     // pg_tables — list session tables
     if lower.contains("pg_tables") {
         return Some(handle_pg_tables(meta));

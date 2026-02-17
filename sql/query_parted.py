@@ -23,7 +23,7 @@
 
 """Query a partitioned table with H2OAI groupby benchmarks (q1-q7).
 
-Opens the parted table via td_part_open (zero-copy mmap), then runs
+Opens the parted table via td_read_parted (zero-copy mmap), then runs
 all 7 groupby queries. The partition-aware executor concatenates
 segments and runs a single exec_group pass.
 
@@ -102,11 +102,11 @@ def main():
     # Open parted table (zero-copy mmap)
     print(f"Opening parted table from {db_root} ...")
     t0 = time.perf_counter()
-    tbl = lib.part_open(db_root, TABLE_NAME)
+    tbl = lib.read_parted(db_root, TABLE_NAME)
     open_ms = (time.perf_counter() - t0) * 1000
 
     if not tbl or tbl < 32:
-        print("td_part_open FAILED")
+        print("td_read_parted FAILED")
         sys.exit(1)
 
     nrows = lib.table_nrows(tbl)

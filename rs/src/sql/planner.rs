@@ -24,9 +24,9 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
-    BinaryOperator, ColumnDef, DataType, Distinct, Expr, GroupByExpr, Ident, Insert,
-    JoinConstraint, JoinOperator, ObjectName, ObjectType, Query, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Value, Values,
+    BinaryOperator, ColumnDef, DataType, Distinct, Expr, FunctionArg, FunctionArgExpr,
+    GroupByExpr, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value, Values,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -1060,52 +1060,102 @@ fn plan_query(
 
 /// Resolve a table name: check session registry first, then CSV file.
 fn resolve_table(
-    ctx: &Context,
     name: &str,
     tables: Option<&HashMap<String, StoredTable>>,
 ) -> Result<Table, SqlError> {
-    // Check session registry (case-insensitive)
+    // Only match session-registered tables (case-insensitive).
+    // File-based loading uses explicit table functions:
+    //   read_csv('/path'), read_splayed('/path'), read_parted('/db', 'table')
     if let Some(registry) = tables {
         let lower = name.to_lowercase();
         if let Some(stored) = registry.get(&lower) {
             return Ok(stored.table.clone_ref());
         }
     }
+    Err(SqlError::Plan(format!(
+        "Table '{}' not found. Use read_csv(), read_splayed(), or read_parted() for file-based tables",
+        name
+    )))
+}
 
-    // Fall back to CSV file or parted table
-    let stripped = name.trim_matches('\'').trim_matches('"');
+// ---------------------------------------------------------------------------
+// Table functions: read_csv, read_splayed, read_parted
+// ---------------------------------------------------------------------------
 
-    // Reject unsafe paths (absolute, parent traversal, null bytes, home expansion)
-    if !is_safe_table_path(stripped) {
-        return Err(SqlError::Plan(format!("unsafe table path: {}", name)));
+/// Extract a string literal from a FunctionArg.
+fn extract_string_arg(arg: &FunctionArg) -> Result<String, SqlError> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(Value::SingleQuotedString(s)))) => {
+            Ok(s.clone())
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            Value::DoubleQuotedString(s),
+        ))) => Ok(s.clone()),
+        _ => Err(SqlError::Plan(format!(
+            "Expected a string literal argument, got: {arg}"
+        ))),
     }
+}
 
-    // Try CSV first (normalize_path appends .csv if no extension)
-    let path = normalize_path(name);
-    match ctx.read_csv(&path) {
-        Ok(table) => Ok(table),
-        Err(_csv_err) => {
-            // Try parted table: interpret as db_root/table_name
-            if let Some(pos) = stripped.rfind('/') {
-                let db_root = &stripped[..pos];
-                let table_name = &stripped[pos + 1..];
-                if !db_root.is_empty() && !table_name.is_empty() {
-                    if let Ok(table) = ctx.part_open(db_root, table_name) {
-                        return Ok(table);
-                    }
-                }
+/// Resolve a table function call (read_csv, read_splayed, read_parted).
+fn resolve_table_function(
+    ctx: &Context,
+    name: &str,
+    args: &[FunctionArg],
+) -> Result<Table, SqlError> {
+    match name {
+        "read_csv" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(SqlError::Plan(
+                    "read_csv() requires 1-3 arguments: read_csv('/path/to/file.csv' [, delimiter, header])".into(),
+                ));
             }
-
-            // Neither CSV nor parted succeeded
-            if !name.contains('/') && !name.contains('\\') && !name.contains('.') {
-                Err(SqlError::Plan(format!("Table '{}' not found", name)))
+            let path = extract_string_arg(&args[0])?;
+            if args.len() == 1 {
+                ctx.read_csv(&path)
+                    .map_err(|e| SqlError::Plan(format!("read_csv('{path}'): {e}")))
             } else {
-                Err(SqlError::Plan(format!(
-                    "Could not open '{}' as CSV or partitioned table",
-                    stripped
-                )))
+                let delim_str = extract_string_arg(&args[1])?;
+                let delimiter = delim_str.chars().next().unwrap_or(',');
+                let header = if args.len() == 3 {
+                    let h = extract_string_arg(&args[2])?;
+                    !matches!(h.to_lowercase().as_str(), "false" | "0" | "no")
+                } else {
+                    true
+                };
+                ctx.read_csv_opts(&path, delimiter, header, None)
+                    .map_err(|e| SqlError::Plan(format!("read_csv('{path}'): {e}")))
             }
         }
+        "read_splayed" => {
+            if args.len() < 1 || args.len() > 2 {
+                return Err(SqlError::Plan(
+                    "read_splayed() requires 1-2 arguments: read_splayed('/path/to/dir' [, '/path/to/sym'])".into(),
+                ));
+            }
+            let dir = extract_string_arg(&args[0])?;
+            let sym_path = if args.len() == 2 {
+                Some(extract_string_arg(&args[1])?)
+            } else {
+                None
+            };
+            ctx.read_splayed(&dir, sym_path.as_deref())
+                .map_err(|e| SqlError::Plan(format!("read_splayed('{dir}'): {e}")))
+        }
+        "read_parted" => {
+            if args.len() != 2 {
+                return Err(SqlError::Plan(
+                    "read_parted() requires exactly 2 arguments: read_parted('/db_root', 'table_name')".into(),
+                ));
+            }
+            let db_root = extract_string_arg(&args[0])?;
+            let table_name = extract_string_arg(&args[1])?;
+            ctx.read_parted(&db_root, &table_name)
+                .map_err(|e| SqlError::Plan(format!("read_parted('{db_root}', '{table_name}'): {e}")))
+        }
+        _ => Err(SqlError::Plan(format!(
+            "Unknown table function '{name}'. Supported: read_csv(), read_splayed(), read_parted()"
+        ))),
     }
 }
 
@@ -1342,9 +1392,16 @@ fn resolve_table_factor(
     tables: Option<&HashMap<String, StoredTable>>,
 ) -> Result<(Table, HashMap<String, usize>), SqlError> {
     match factor {
-        TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, args, .. } => {
             let table_name = object_name_to_string(name);
-            let table = resolve_table(ctx, &table_name, tables)?;
+            // Table functions: read_csv(...), read_splayed(...), read_parted(...)
+            if let Some(func_args) = args {
+                let func_name = table_name.to_lowercase();
+                let table = resolve_table_function(ctx, &func_name, &func_args.args)?;
+                let schema = build_schema(&table);
+                return Ok((table, schema));
+            }
+            let table = resolve_table(&table_name, tables)?;
             let schema = build_schema(&table);
             Ok((table, schema))
         }
@@ -1356,7 +1413,7 @@ fn resolve_table_factor(
             Ok((table, schema))
         }
         _ => Err(SqlError::Plan(
-            "Only simple table references and subqueries are supported in FROM".into(),
+            "Only table references, table functions, and subqueries are supported in FROM".into(),
         )),
     }
 }
@@ -2691,20 +2748,6 @@ fn object_name_to_string(name: &ObjectName) -> String {
 
 /// Check that a table path is safe: no parent traversal or null bytes.
 /// Absolute paths are allowed (local library, user has full file access).
-fn is_safe_table_path(p: &str) -> bool {
-    !p.contains('\0') && !p.contains("..")
-}
-
-/// Ensure path has .csv extension if no extension present.
-fn normalize_path(path: &str) -> String {
-    let path = path.trim_matches('\'').trim_matches('"');
-    if path.contains('.') {
-        path.to_string()
-    } else {
-        format!("{path}.csv")
-    }
-}
-
 /// Build a column name -> index map from the table.
 fn build_schema(table: &Table) -> HashMap<String, usize> {
     let mut map = HashMap::new();

@@ -1066,10 +1066,10 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
 }
 
 /* --------------------------------------------------------------------------
- * td_csv_read_opts — main CSV parser
+ * td_read_csv_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
-td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
+td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
                         const int8_t* col_types_in, int32_t n_types) {
     /* ---- 1. Open file and get size ---- */
     int fd = open(path, O_RDONLY);
@@ -1350,9 +1350,9 @@ fail_unmap:
 }
 
 /* --------------------------------------------------------------------------
- * td_csv_read — convenience wrapper with default options
+ * td_read_csv — convenience wrapper with default options
  * -------------------------------------------------------------------------- */
 
-td_t* td_csv_read(const char* path) {
-    return td_csv_read_opts(path, 0, true, NULL, 0);
+td_t* td_read_csv(const char* path) {
+    return td_read_csv_opts(path, 0, true, NULL, 0);
 }

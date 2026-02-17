@@ -731,7 +731,7 @@ class Context:
 
     def read_csv(self, path):
         """Read a CSV file into a Table."""
-        tbl_ptr = self._lib.csv_read(path)
+        tbl_ptr = self._lib.read_csv(path)
         if not tbl_ptr or tbl_ptr < 32:
             raise RuntimeError(f"Failed to read CSV: {path}")
         return Table(self._lib, tbl_ptr)

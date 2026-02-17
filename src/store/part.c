@@ -274,14 +274,14 @@ td_t* td_part_load(const char* db_root, const char* table_name) {
 }
 
 /* --------------------------------------------------------------------------
- * td_part_open — zero-copy open of a partitioned table
+ * td_read_parted — zero-copy open of a partitioned table
  *
  * Builds parted columns (TD_PARTED_BASE + base_type) where each segment
- * is an mmap'd vector from td_splay_open. Also builds a MAPCOMMON column
+ * is an mmap'd vector from td_read_splayed. Also builds a MAPCOMMON column
  * with partition key names and row counts.
  * -------------------------------------------------------------------------- */
 
-td_t* td_part_open(const char* db_root, const char* table_name) {
+td_t* td_read_parted(const char* db_root, const char* table_name) {
     if (!db_root || !table_name) return TD_ERR_PTR(TD_ERR_IO);
 
     /* Validate table_name: no path separators or traversal */
@@ -353,7 +353,7 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
         }
     }
 
-    /* Open each partition via td_splay_open */
+    /* Open each partition via td_read_splayed */
     td_t** part_tables = (td_t**)td_sys_alloc((size_t)part_count * sizeof(td_t*));
     if (!part_tables) goto fail_dirs;
     memset(part_tables, 0, (size_t)part_count * sizeof(td_t*));
@@ -365,7 +365,7 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
             part_tables[p] = NULL;
             goto fail_tables;
         }
-        part_tables[p] = td_splay_open(path, sym_path);
+        part_tables[p] = td_read_splayed(path, sym_path);
         if (!part_tables[p] || TD_IS_ERR(part_tables[p])) {
             part_tables[p] = NULL;
             goto fail_tables;

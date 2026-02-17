@@ -94,12 +94,12 @@ def main():
 
     print(f"Loading x: {os.path.abspath(X_CSV)} ...")
     t0 = time.perf_counter()
-    x = lib.csv_read(os.path.abspath(X_CSV))
+    x = lib.read_csv(os.path.abspath(X_CSV))
     print(f"  {lib.table_nrows(x):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms")
 
     print(f"Loading y: {os.path.abspath(Y_CSV)} ...")
     t0 = time.perf_counter()
-    y = lib.csv_read(os.path.abspath(Y_CSV))
+    y = lib.read_csv(os.path.abspath(Y_CSV))
     print(f"  {lib.table_nrows(y):,} rows in {(time.perf_counter()-t0)*1000:.0f} ms\n")
 
     print("Join benchmarks (execution time only, excludes build/optimize):")

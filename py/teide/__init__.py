@@ -292,12 +292,12 @@ class TeideLib:
         lib.td_execute.restype = c_td_p
 
         # ===== CSV =====
-        lib.td_csv_read.argtypes = [ctypes.c_char_p]
-        lib.td_csv_read.restype = c_td_p
+        lib.td_read_csv.argtypes = [ctypes.c_char_p]
+        lib.td_read_csv.restype = c_td_p
 
-        lib.td_csv_read_opts.argtypes = [ctypes.c_char_p, ctypes.c_char, ctypes.c_bool,
+        lib.td_read_csv_opts.argtypes = [ctypes.c_char_p, ctypes.c_char, ctypes.c_bool,
                                             ctypes.POINTER(ctypes.c_int8), ctypes.c_int32]
-        lib.td_csv_read_opts.restype = c_td_p
+        lib.td_read_csv_opts.restype = c_td_p
 
         # ===== Symbol serialization =====
         lib.td_sym_save.argtypes = [ctypes.c_char_p]
@@ -313,14 +313,14 @@ class TeideLib:
         lib.td_splay_load.argtypes = [ctypes.c_char_p]
         lib.td_splay_load.restype = c_td_p
 
-        lib.td_splay_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        lib.td_splay_open.restype = c_td_p
+        lib.td_read_splayed.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.td_read_splayed.restype = c_td_p
 
         lib.td_part_load.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
         lib.td_part_load.restype = c_td_p
 
-        lib.td_part_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        lib.td_part_open.restype = c_td_p
+        lib.td_read_parted.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.td_read_parted.restype = c_td_p
 
     # ===== Convenience methods =====
 
@@ -349,8 +349,8 @@ class TeideLib:
     def release(self, ptr):
         self._lib.td_release(ptr)
 
-    def csv_read(self, path):
-        return self._lib.td_csv_read(path.encode('utf-8'))
+    def read_csv(self, path):
+        return self._lib.td_read_csv(path.encode('utf-8'))
 
     def graph_new(self, tbl):
         return self._lib.td_graph_new(tbl)
@@ -490,16 +490,16 @@ class TeideLib:
     def splay_load(self, path):
         return self._lib.td_splay_load(path.encode('utf-8'))
 
-    def splay_open(self, path, sym_path=None):
+    def read_splayed(self, path, sym_path=None):
         sp = sym_path.encode('utf-8') if sym_path else None
-        return self._lib.td_splay_open(path.encode('utf-8'), sp)
+        return self._lib.td_read_splayed(path.encode('utf-8'), sp)
 
     def part_load(self, db_root, table_name):
         return self._lib.td_part_load(db_root.encode('utf-8'),
                                        table_name.encode('utf-8'))
 
-    def part_open(self, db_root, table_name):
-        return self._lib.td_part_open(db_root.encode('utf-8'),
+    def read_parted(self, db_root, table_name):
+        return self._lib.td_read_parted(db_root.encode('utf-8'),
                                        table_name.encode('utf-8'))
 
 

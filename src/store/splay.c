@@ -165,13 +165,13 @@ td_t* td_splay_load(const char* dir) {
 }
 
 /* --------------------------------------------------------------------------
- * td_splay_open — zero-copy splayed table load via mmap (mmod=1)
+ * td_read_splayed — zero-copy splayed table load via mmap (mmod=1)
  *
  * Nearly identical to td_splay_load, but uses td_col_mmap for each column
  * file. The .d schema is still loaded via td_col_load (small, buddy copy).
  * -------------------------------------------------------------------------- */
 
-td_t* td_splay_open(const char* dir, const char* sym_path) {
+td_t* td_read_splayed(const char* dir, const char* sym_path) {
     if (!dir) return TD_ERR_PTR(TD_ERR_IO);
 
     /* sym_path loading is Phase 2 — ignore for now */

@@ -21,23 +21,23 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Generate a partitioned table from H2OAI CSV for on-disk benchmarks.
+"""Generate a 500M-row partitioned table from H2OAI 10M CSV.
 
-Creates N date-partitioned splayed tables under DB_ROOT, mirroring the
-directory structure used by rayforce's parted.rfl example:
+Replicates the full 10M-row CSV into 50 date-partitioned splayed tables,
+producing 500M total rows under /tmp/db:
 
-    db_root/
+    /tmp/db/
       sym                          <- shared symbol intern table
       2024.01.01/
-        quotes/                    <- splayed table (partition 1)
-          .d, id1, id2, ...
+        quotes/                    <- splayed table (partition 1, 10M rows)
       2024.01.02/
-        quotes/                    <- splayed table (partition 2)
-          .d, id1, id2, ...
+        quotes/                    <- splayed table (partition 2, 10M rows)
       ...
+      2024.02.19/
+        quotes/                    <- splayed table (partition 50, 10M rows)
 
 Usage:
-    TEIDE_LIB=build_release/libteide.so python bench_gen_parted.py [--parts N] [--db /tmp/teide_db]
+    TEIDE_LIB=build_release/libteide.so python gen_500m.py
 """
 
 import ctypes
@@ -45,7 +45,6 @@ import time
 import sys
 import os
 import shutil
-import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "py"))
 from teide import TeideLib
@@ -54,18 +53,14 @@ CSV_PATH = os.path.join(os.path.dirname(__file__),
                         "..", "rayforce-bench", "datasets",
                         "G1_1e7_1e2_0_0", "G1_1e7_1e2_0_0.csv")
 
+DB_ROOT = "/tmp/db"
 TABLE_NAME = "quotes"
+N_PARTS = 50
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate partitioned table from H2OAI CSV")
-    parser.add_argument("--parts", type=int, default=5, help="Number of partitions (default: 5)")
-    parser.add_argument("--db", type=str, default="/tmp/teide_db", help="Database root directory")
-    args = parser.parse_args()
-
-    n_parts = args.parts
-    db_root = os.path.abspath(args.db)
     csv_path = os.path.abspath(CSV_PATH)
+    db_root = os.path.abspath(DB_ROOT)
 
     if not os.path.exists(csv_path):
         print(f"CSV not found: {csv_path}")
@@ -75,7 +70,7 @@ def main():
     lib.arena_init()
     lib.sym_init()
 
-    # Load CSV
+    # Load CSV once
     print(f"Loading {csv_path} ...")
     t0 = time.perf_counter()
     tbl = lib.read_csv(csv_path)
@@ -88,35 +83,32 @@ def main():
     nrows = lib.table_nrows(tbl)
     ncols = lib.table_ncols(tbl)
     print(f"Loaded: {nrows:,} rows x {ncols} cols in {load_ms:.0f} ms")
+    print(f"\nGenerating {N_PARTS} partitions x {nrows:,} rows = {N_PARTS * nrows:,} total rows")
 
     # Clean and create db_root
     if os.path.exists(db_root):
         shutil.rmtree(db_root)
     os.makedirs(db_root, exist_ok=True)
 
-    # Split into N partitions
-    rows_per_part = nrows // n_parts
-    print(f"\nSplitting into {n_parts} partitions of ~{rows_per_part:,} rows each ...")
-
     t0 = time.perf_counter()
 
-    for p in range(n_parts):
-        start = p * rows_per_part
-        end = nrows if p == n_parts - 1 else (p + 1) * rows_per_part
-        part_rows = end - start
+    for p in range(N_PARTS):
+        # Date: 2024.01.01 through 2024.02.19 (50 days starting Jan 1)
+        day = p + 1
+        if day <= 31:
+            date_str = f"2024.01.{day:02d}"
+        else:
+            date_str = f"2024.02.{day - 31:02d}"
 
-        # Create partition directory: db_root/YYYY.MM.DD/table_name/
-        date_str = f"2024.01.{p + 1:02d}"
         part_dir = os.path.join(db_root, date_str, TABLE_NAME)
         os.makedirs(part_dir, exist_ok=True)
 
-        # Build sub-table with sliced columns
-        # td_vec_slice(vec, offset, len) — NOT (start, end)
+        # Build sub-table: full copy of all columns via slice(0, nrows)
         sub_tbl = lib.table_new(ncols)
         for c in range(ncols):
             col = lib.table_get_col_idx(tbl, c)
             name_id = lib.table_col_name(tbl, c)
-            sliced = lib._lib.td_vec_slice(col, start, part_rows)
+            sliced = lib._lib.td_vec_slice(col, 0, nrows)
             if sliced and sliced > 32:
                 sub_tbl = lib._lib.td_table_add_col(sub_tbl, name_id, sliced)
                 lib.release(sliced)
@@ -128,7 +120,12 @@ def main():
             sys.exit(1)
 
         lib.release(sub_tbl)
-        print(f"  {date_str}/{TABLE_NAME}: {part_rows:,} rows")
+
+        elapsed = time.perf_counter() - t0
+        rate = (p + 1) / elapsed
+        eta = (N_PARTS - p - 1) / rate if rate > 0 else 0
+        print(f"  [{p+1:2d}/{N_PARTS}] {date_str}/{TABLE_NAME}: {nrows:,} rows  "
+              f"({elapsed:.1f}s elapsed, ETA {eta:.0f}s)")
 
     # Save shared symfile
     sym_path = os.path.join(db_root, "sym")
@@ -145,9 +142,10 @@ def main():
         for f in files:
             total_size += os.path.getsize(os.path.join(root, f))
 
-    print(f"\nDone in {save_ms:.0f} ms")
+    print(f"\nDone in {save_ms / 1000:.1f} s")
     print(f"Database: {db_root}")
-    print(f"Total size: {total_size / 1024 / 1024:.1f} MB ({n_parts} partitions)")
+    print(f"Total rows: {N_PARTS * nrows:,}")
+    print(f"Total size: {total_size / 1024 / 1024 / 1024:.1f} GB ({N_PARTS} partitions)")
     print(f"Sym count: {lib._lib.td_sym_count()}")
 
     lib.release(tbl)

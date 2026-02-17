@@ -266,7 +266,7 @@ static MunitResult test_splay_open_roundtrip(const void* params, void* fixture) 
     munit_assert_int(err, ==, TD_OK);
 
     /* Open via mmap (zero-copy) */
-    td_t* loaded = td_splay_open(TMP_SPLAY_DIR, NULL);
+    td_t* loaded = td_read_splayed(TMP_SPLAY_DIR, NULL);
     munit_assert_ptr_not_null(loaded);
     munit_assert_false(TD_IS_ERR(loaded));
 
@@ -483,8 +483,8 @@ static MunitResult test_part_open(const void* params, void* fixture) {
     td_release(a1); td_release(b1); td_release(tbl1);
     td_release(a2); td_release(b2); td_release(tbl2);
 
-    /* Open via td_part_open */
-    td_t* parted = td_part_open(TMP_PART_DB, TMP_TABLE_NAME);
+    /* Open via td_read_parted */
+    td_t* parted = td_read_parted(TMP_PART_DB, TMP_TABLE_NAME);
     munit_assert_ptr_not_null(parted);
     munit_assert_false(TD_IS_ERR(parted));
 

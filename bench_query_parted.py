@@ -23,7 +23,7 @@
 
 """Mount a partitioned table from disk and run groupby benchmarks.
 
-Opens each partition via td_splay_open (zero-copy mmap), then runs
+Opens each partition via td_read_splayed (zero-copy mmap), then runs
 queries per-partition. The on-disk column format IS the in-memory format,
 so mmap'd vectors are used directly by the executor — no copies.
 
@@ -98,7 +98,7 @@ def main():
     parser = argparse.ArgumentParser(description="Query partitioned table with groupby benchmarks")
     parser.add_argument("--db", type=str, default="/tmp/teide_db", help="Database root directory")
     parser.add_argument("--mode", choices=["parted", "per-partition", "both"], default="both",
-                        help="Query mode: parted (td_part_open), per-partition, or both")
+                        help="Query mode: parted (td_read_parted), per-partition, or both")
     args = parser.parse_args()
 
     db_root = os.path.abspath(args.db)
@@ -117,15 +117,15 @@ def main():
     lib.arena_init()
     lib.sym_init()
 
-    # === td_part_open: unified parted table ===
+    # === td_read_parted: unified parted table ===
     if args.mode in ("parted", "both"):
-        print(f"=== td_part_open (zero-copy parted table) ===")
+        print(f"=== td_read_parted (zero-copy parted table) ===")
         t0 = time.perf_counter()
-        parted_tbl = lib.part_open(db_root, TABLE_NAME)
+        parted_tbl = lib.read_parted(db_root, TABLE_NAME)
         open_ms = (time.perf_counter() - t0) * 1000
 
         if not parted_tbl or parted_tbl < 32:
-            print(f"td_part_open FAILED")
+            print(f"td_read_parted FAILED")
         else:
             nrows = lib.table_nrows(parted_tbl)
             ncols = lib.table_ncols(parted_tbl)
@@ -167,12 +167,12 @@ def main():
         print(f"\nFound {len(parts)} partitions")
 
         # Open each partition via mmap (zero-copy)
-        print(f"Opening partitions via td_splay_open (zero-copy mmap) ...")
+        print(f"Opening partitions via td_read_splayed (zero-copy mmap) ...")
         t0 = time.perf_counter()
         tables = []
         total_rows = 0
         for date_str, path in parts:
-            tbl = lib.splay_open(path)
+            tbl = lib.read_splayed(path)
             if not tbl or tbl < 32:
                 print(f"  {date_str}: FAILED")
                 continue

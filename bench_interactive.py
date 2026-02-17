@@ -58,7 +58,7 @@ lib.sym_init()
 
 print(f"Loading {CSV_PATH} ...")
 t0 = time.perf_counter()
-tbl = lib.csv_read(CSV_PATH)
+tbl = lib.read_csv(CSV_PATH)
 load_ms = (time.perf_counter() - t0) * 1000
 nrows = lib.table_nrows(tbl)
 ncols = lib.table_ncols(tbl)

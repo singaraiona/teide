@@ -388,7 +388,7 @@ impl Context {
     /// Read a CSV file into a `Table`.
     pub fn read_csv(&self, path: &str) -> Result<Table> {
         let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
-        let ptr = unsafe { ffi::td_csv_read(c_path.as_ptr()) };
+        let ptr = unsafe { ffi::td_read_csv(c_path.as_ptr()) };
         let ptr = check_ptr(ptr)?;
         Ok(Table {
             raw: ptr,
@@ -414,7 +414,7 @@ impl Context {
             None => (std::ptr::null(), 0),
         };
         let ptr = unsafe {
-            ffi::td_csv_read_opts(
+            ffi::td_read_csv_opts(
                 c_path.as_ptr(),
                 delimiter as std::os::raw::c_char,
                 header,
@@ -430,6 +430,26 @@ impl Context {
         })
     }
 
+    /// Open a splayed table from disk (zero-copy mmap).
+    ///
+    /// `dir` is the splayed table directory containing `.d` + column files.
+    /// `sym_path` is the path to the shared sym file (or None to skip).
+    pub fn read_splayed(&self, dir: &str, sym_path: Option<&str>) -> Result<Table> {
+        let c_dir = CString::new(dir).map_err(|_| Error::InvalidInput)?;
+        let c_sym = match sym_path {
+            Some(s) => Some(CString::new(s).map_err(|_| Error::InvalidInput)?),
+            None => None,
+        };
+        let sym_ptr = c_sym.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        let ptr = unsafe { ffi::td_read_splayed(c_dir.as_ptr(), sym_ptr) };
+        let ptr = check_ptr(ptr)?;
+        Ok(Table {
+            raw: ptr,
+            engine: self.engine.clone(),
+            _not_send_sync: PhantomData,
+        })
+    }
+
     /// Open a partitioned table from disk (zero-copy mmap).
     ///
     /// `db_root` is the database directory (e.g. `/tmp/teide_db`),
@@ -437,7 +457,7 @@ impl Context {
     /// The symfile at `db_root/sym` is loaded automatically.
     /// Results are cached — subsequent calls with the same path return a
     /// clone_ref of the cached table (no re-open, no sym_load).
-    pub fn part_open(&self, db_root: &str, table_name: &str) -> Result<Table> {
+    pub fn read_parted(&self, db_root: &str, table_name: &str) -> Result<Table> {
         let cache_key = format!("{db_root}/{table_name}");
 
         // Return cached table if available
@@ -447,7 +467,7 @@ impl Context {
 
         let c_root = CString::new(db_root).map_err(|_| Error::InvalidInput)?;
         let c_name = CString::new(table_name).map_err(|_| Error::InvalidInput)?;
-        let ptr = unsafe { ffi::td_part_open(c_root.as_ptr(), c_name.as_ptr()) };
+        let ptr = unsafe { ffi::td_read_parted(c_root.as_ptr(), c_name.as_ptr()) };
         let ptr = check_ptr(ptr)?;
         let table = Table {
             raw: ptr,

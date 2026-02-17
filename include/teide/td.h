@@ -769,11 +769,11 @@ td_t*    td_col_mmap(const char* path);
 /* Splayed table I/O */
 td_err_t td_splay_save(td_t* tbl, const char* dir, const char* sym_path);
 td_t*    td_splay_load(const char* dir);
-td_t*    td_splay_open(const char* dir, const char* sym_path);
+td_t*    td_read_splayed(const char* dir, const char* sym_path);
 
 /* Partitioned table */
 td_t*    td_part_load(const char* db_root, const char* table_name);
-td_t*    td_part_open(const char* db_root, const char* table_name);
+td_t*    td_read_parted(const char* db_root, const char* table_name);
 
 /* Metadata */
 td_err_t td_meta_save_d(td_t* schema, const char* path);
@@ -781,9 +781,10 @@ td_t*    td_meta_load_d(const char* path);
 
 /* ===== CSV API ===== */
 
-td_t* td_csv_read(const char* path);
-td_t* td_csv_read_opts(const char* path, char delimiter, bool header,
+td_t* td_read_csv(const char* path);
+td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
                         const int8_t* col_types, int32_t n_types);
+
 
 /* ===== Pool / Parallel API ===== */
 

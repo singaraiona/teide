@@ -72,7 +72,7 @@ def main():
     # Load CSV
     print(f"Loading {csv_path} ...")
     t0 = time.perf_counter()
-    tbl = lib.csv_read(csv_path)
+    tbl = lib.read_csv(csv_path)
     load_ms = (time.perf_counter() - t0) * 1000
 
     if not tbl or tbl < 32:

@@ -818,9 +818,9 @@ extern "C" {
     pub fn td_col_load(path: *const c_char) -> *mut td_t;
     pub fn td_splay_save(tbl: *mut td_t, dir: *const c_char, sym_path: *const c_char) -> td_err_t;
     pub fn td_splay_load(dir: *const c_char) -> *mut td_t;
-    pub fn td_splay_open(dir: *const c_char, sym_path: *const c_char) -> *mut td_t;
+    pub fn td_read_splayed(dir: *const c_char, sym_path: *const c_char) -> *mut td_t;
     pub fn td_part_load(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
-    pub fn td_part_open(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
+    pub fn td_read_parted(db_root: *const c_char, table_name: *const c_char) -> *mut td_t;
     pub fn td_meta_save_d(schema: *mut td_t, path: *const c_char) -> td_err_t;
     pub fn td_meta_load_d(path: *const c_char) -> *mut td_t;
 
@@ -829,8 +829,8 @@ extern "C" {
     pub fn td_sym_load(path: *const c_char) -> td_err_t;
 
     // --- CSV API ---
-    pub fn td_csv_read(path: *const c_char) -> *mut td_t;
-    pub fn td_csv_read_opts(
+    pub fn td_read_csv(path: *const c_char) -> *mut td_t;
+    pub fn td_read_csv_opts(
         path: *const c_char,
         delimiter: c_char,
         header: bool,

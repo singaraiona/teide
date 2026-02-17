@@ -746,6 +746,12 @@ extern "C" {
         n_aggs: u8,
     ) -> *mut td_op_t;
 
+    pub fn td_distinct(
+        g: *mut td_graph_t,
+        keys: *mut *mut td_op_t,
+        n_keys: u8,
+    ) -> *mut td_op_t;
+
     pub fn td_join(
         g: *mut td_graph_t,
         left_df: *mut td_op_t,

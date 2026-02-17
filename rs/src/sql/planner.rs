@@ -1923,33 +1923,15 @@ fn plan_distinct(
         }
     }
 
-    // GROUP BY all selected columns with a dummy COUNT(*) aggregate
+    // Native DISTINCT: GROUP BY with 0 aggregates — single graph, no dummy COUNT
     let mut g = ctx.graph(working_table)?;
     let key_nodes: Vec<Column> = col_names
         .iter()
         .map(|k| g.scan(k))
         .collect::<crate::Result<Vec<_>>>()?;
 
-    // Need at least one aggregate for td_group — use COUNT on first column
-    let first_col = schema
-        .iter()
-        .min_by_key(|(_k, v)| **v)
-        .map(|(k, _)| k.clone())
-        .ok_or_else(|| SqlError::Plan("DISTINCT on empty table".into()))?;
-    let count_input = g.scan(&first_col)?;
-    let group_node = g.group_by(&key_nodes, &[crate::AggOp::Count], &[count_input])?;
-    let group_result = g.execute(group_node)?;
-
-    // The result has keys + 1 COUNT column. We only want the keys.
-    // Build a SELECT projection to drop the count column.
-    let pg = ctx.graph(&group_result)?;
-    let table_node = pg.const_table(&group_result)?;
-    let proj_cols: Vec<Column> = col_names
-        .iter()
-        .map(|k| pg.scan(k))
-        .collect::<crate::Result<Vec<_>>>()?;
-    let proj = pg.select(table_node, &proj_cols)?;
-    let result = pg.execute(proj)?;
+    let distinct_node = g.distinct(&key_nodes)?;
+    let result = g.execute(distinct_node)?;
 
     Ok((result, col_names.to_vec()))
 }

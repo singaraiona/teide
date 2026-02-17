@@ -667,6 +667,10 @@ td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
     return &g->nodes[ext->base.id];
 }
 
+td_op_t* td_distinct(td_graph_t* g, td_op_t** keys, uint8_t n_keys) {
+    return td_group(g, keys, n_keys, NULL, NULL, 0);
+}
+
 td_op_t* td_join(td_graph_t* g,
                   td_op_t* left_table, td_op_t** left_keys,
                   td_op_t* right_table, td_op_t** right_keys,

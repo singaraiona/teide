@@ -724,6 +724,7 @@ td_op_t* td_sort_op(td_graph_t* g, td_op_t* table_node,
                      uint8_t n_cols);
 td_op_t* td_group(td_graph_t* g, td_op_t** keys, uint8_t n_keys,
                    uint16_t* agg_ops, td_op_t** agg_ins, uint8_t n_aggs);
+td_op_t* td_distinct(td_graph_t* g, td_op_t** keys, uint8_t n_keys);
 td_op_t* td_join(td_graph_t* g,
                   td_op_t* left_table, td_op_t** left_keys,
                   td_op_t* right_table, td_op_t** right_keys,

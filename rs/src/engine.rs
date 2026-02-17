@@ -1306,6 +1306,16 @@ impl Graph<'_> {
         Self::check_op(raw)
     }
 
+    /// Distinct — GROUP BY with 0 aggregates, returns unique key combinations.
+    pub fn distinct(&mut self, keys: &[Column]) -> Result<Column> {
+        let mut key_ptrs: Vec<*mut ffi::td_op_t> = keys.iter().map(|c| c.raw).collect();
+        let raw = unsafe {
+            ffi::td_distinct(self.raw, key_ptrs.as_mut_ptr(), to_u8(keys.len())?)
+        };
+        self._pinned.push(Box::new(key_ptrs));
+        Self::check_op(raw)
+    }
+
     /// Hash join.
     pub fn join(
         &mut self,

@@ -2070,6 +2070,94 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
 }
 
 /* ============================================================================
+ * exec_filter_head — filter table, keeping only the first `limit` matches
+ *
+ * Scans the predicate sequentially, collecting matching row indices and
+ * stopping as soon as `limit` matches are found.  Only those rows are
+ * gathered into the result table, avoiding full-table gather when the
+ * number of matches far exceeds the limit.
+ * ============================================================================ */
+static td_t* exec_filter_head(td_t* input, td_t* pred, int64_t limit) {
+    if (!input || TD_IS_ERR(input)) return input;
+    if (!pred || TD_IS_ERR(pred)) return pred;
+    if (input->type != TD_TABLE || pred->type != TD_BOOL) return input;
+
+    int64_t ncols = td_table_ncols(input);
+    int64_t nrows = td_table_nrows(input);
+    if (limit <= 0 || ncols <= 0) return td_table_new(0);
+    if (limit > nrows) limit = nrows;
+
+    /* VLA guard */
+    if (ncols > 256) return input;
+
+    /* Collect up to `limit` matching row indices, stopping early */
+    td_t* idx_hdr = NULL;
+    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
+                                    (size_t)limit * sizeof(int64_t));
+    if (!match_idx) return input;
+
+    int64_t found = 0;
+    {
+        td_morsel_t mp;
+        td_morsel_init(&mp, pred);
+        int64_t row_base = 0;
+        while (td_morsel_next(&mp) && found < limit) {
+            uint8_t* bits = (uint8_t*)mp.morsel_ptr;
+            for (int64_t i = 0; i < mp.morsel_len && found < limit; i++)
+                if (bits[i]) match_idx[found++] = row_base + i;
+            row_base += mp.morsel_len;
+        }
+    }
+
+    /* Build result table with gathered rows */
+    td_t* tbl = td_table_new(ncols);
+    if (!tbl || TD_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl; }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        td_t* col = td_table_get_col_idx(input, c);
+        int64_t name_id = td_table_col_name(input, c);
+        if (!col) continue;
+        int8_t out_type = TD_IS_PARTED(col->type)
+                        ? (int8_t)TD_PARTED_BASETYPE(col->type) : col->type;
+        if (out_type == TD_MAPCOMMON) continue;
+        uint8_t esz = td_elem_size(out_type);
+        td_t* new_col = td_vec_new(out_type, found);
+        if (!new_col || TD_IS_ERR(new_col)) continue;
+        new_col->len = found;
+        char* dst = (char*)td_data(new_col);
+
+        if (TD_IS_PARTED(col->type)) {
+            /* Parted column: build flat pointer + length arrays for lookup */
+            td_t** segs = (td_t**)td_data(col);
+            int64_t n_segs = col->len;
+            /* Build prefix sums for segment offsets */
+            int64_t seg_start = 0;
+            int64_t cur_seg = 0;
+            int64_t cur_seg_end = (n_segs > 0 && segs[0]) ? segs[0]->len : 0;
+            for (int64_t j = 0; j < found; j++) {
+                int64_t r = match_idx[j];
+                while (cur_seg < n_segs - 1 && r >= cur_seg_end) {
+                    seg_start = cur_seg_end;
+                    cur_seg++;
+                    cur_seg_end += segs[cur_seg] ? segs[cur_seg]->len : 0;
+                }
+                char* src = (char*)td_data(segs[cur_seg]);
+                memcpy(dst + j * esz, src + (r - seg_start) * esz, esz);
+            }
+        } else {
+            char* src = (char*)td_data(col);
+            for (int64_t j = 0; j < found; j++)
+                memcpy(dst + j * esz, src + match_idx[j] * esz, esz);
+        }
+        tbl = td_table_add_col(tbl, name_id, new_col);
+        td_release(new_col);
+    }
+
+    scratch_free(idx_hdr);
+    return tbl;
+}
+
+/* ============================================================================
  * sel_compact — materialize a table by applying a TD_SEL bitmap
  *
  * Used at boundary ops (sort/join/window) that need dense contiguous data.
@@ -9218,6 +9306,37 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         }
 
         case OP_FILTER: {
+            /* HAVING fusion: FILTER(GROUP) — evaluate the predicate against
+             * the GROUP result rather than the original input table.
+             * SCAN nodes in the predicate tree resolve column names via
+             * g->table, so we temporarily swap it to the GROUP output. */
+            td_op_t* filter_child = op->inputs[0];
+            if (filter_child && filter_child->opcode == OP_GROUP) {
+                td_t* group_result = exec_node(g, filter_child);
+                if (!group_result || TD_IS_ERR(group_result))
+                    return group_result;
+
+                td_t* saved_table = g->table;
+                td_t* saved_sel   = g->selection;
+                g->table     = group_result;
+                g->selection = NULL;
+
+                td_t* pred = exec_node(g, op->inputs[1]);
+
+                g->table     = saved_table;
+                g->selection = saved_sel;
+
+                if (!pred || TD_IS_ERR(pred)) {
+                    td_release(group_result);
+                    return pred;
+                }
+
+                td_t* result = exec_filter(g, op, group_result, pred);
+                td_release(pred);
+                td_release(group_result);
+                return result;
+            }
+
             td_t* input = exec_node(g, op->inputs[0]);
             td_t* pred  = exec_node(g, op->inputs[1]);
             if (!input || TD_IS_ERR(input)) { if (pred && !TD_IS_ERR(pred)) td_release(pred); return input; }
@@ -9403,6 +9522,42 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 }
                 input = exec_group(g, child_op, tbl, n);
                 if (owned_tbl) td_release(owned_tbl);
+            } else if (child_op && child_op->opcode == OP_FILTER) {
+                /* HEAD(FILTER): early-termination filter — gather only
+                 * the first N matching rows instead of all matches. */
+                td_t* filter_input = exec_node(g, child_op->inputs[0]);
+                if (!filter_input || TD_IS_ERR(filter_input))
+                    return filter_input;
+
+                /* Compact lazy selection before filter evaluation */
+                td_t* ftbl = (filter_input->type == TD_TABLE)
+                           ? filter_input : g->table;
+                if (g->selection && ftbl && ftbl->type == TD_TABLE) {
+                    td_t* compacted = sel_compact(g, ftbl, g->selection);
+                    if (filter_input != g->table) td_release(filter_input);
+                    td_release(g->selection);
+                    g->selection = NULL;
+                    filter_input = compacted;
+                    ftbl = compacted;
+                }
+
+                /* Swap table for predicate evaluation */
+                td_t* saved_table = g->table;
+                g->table = ftbl;
+                td_t* pred = exec_node(g, child_op->inputs[1]);
+                g->table = saved_table;
+
+                if (!pred || TD_IS_ERR(pred)) {
+                    if (filter_input != saved_table)
+                        td_release(filter_input);
+                    return pred;
+                }
+
+                td_t* result = exec_filter_head(ftbl, pred, n);
+                td_release(pred);
+                if (filter_input != saved_table)
+                    td_release(filter_input);
+                return result;
             } else {
                 input = exec_node(g, op->inputs[0]);
             }

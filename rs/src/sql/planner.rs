@@ -37,6 +37,7 @@ use super::expr::{
     agg_op_from_name, collect_aggregates, collect_window_functions, expr_default_name,
     format_agg_name, has_window_functions, is_aggregate, is_count_distinct, is_pure_aggregate,
     parse_window_frame, plan_agg_input, plan_expr, plan_having_expr, plan_post_agg_expr,
+    predict_c_agg_name,
 };
 use super::{ExecResult, Session, SqlError, SqlResult, StoredTable};
 
@@ -868,8 +869,28 @@ fn plan_query(
         _ => false,
     });
 
+    // ORDER/LIMIT/OFFSET metadata (extracted early for WHERE+LIMIT fusion).
+    let order_by_exprs = extract_order_by(query)?;
+    let offset_val = extract_offset(query)?;
+    let limit_val = extract_limit(query)?;
+    let has_windows = has_window_functions(select_items);
+
     // Stage 1: WHERE filter (resolve subqueries first)
     // Uses effective_where which may have had predicates removed by pushdown above.
+    //
+    // WHERE + LIMIT fusion: when the query has no GROUP BY, ORDER BY, HAVING,
+    // or window functions, we can fuse HEAD(FILTER) in a single graph.
+    // The C executor detects HEAD(FILTER) and gathers only the first N
+    // matching rows, avoiding full-table materialization.
+    let can_fuse_where_limit = effective_where.is_some()
+        && limit_val.is_some()
+        && !has_group_by
+        && !has_aggregates
+        && !has_windows
+        && order_by_exprs.is_empty()
+        && select.having.is_none();
+    let mut where_limit_fused = false;
+
     let (working_table, selection): (Table, Option<*mut crate::td_t>) =
         if let Some(ref where_expr) = effective_where {
             let resolved = if has_subqueries(where_expr) {
@@ -878,21 +899,29 @@ fn plan_query(
                 where_expr.clone()
             };
             {
-                // Always materialize a filtered table. The parallel
-                // indexed-gather in exec_filter is much faster than passing
-                // a boolean mask to GROUP BY (which still iterates all rows).
                 let mut g = ctx.graph(&table)?;
                 let table_node = g.const_table(&table)?;
                 let pred = plan_expr(&mut g, &resolved, &schema)?;
                 let filtered = g.filter(table_node, pred)?;
-                (g.execute(filtered)?, None)
+                if can_fuse_where_limit {
+                    // Fuse LIMIT into WHERE: HEAD(FILTER(table, pred), n)
+                    let total = match (offset_val, limit_val) {
+                        (Some(off), Some(lim)) => off.saturating_add(lim),
+                        (_, Some(lim)) => lim,
+                        _ => unreachable!(),
+                    };
+                    let head_node = g.head(filtered, total)?;
+                    where_limit_fused = true;
+                    (g.execute(head_node)?, None)
+                } else {
+                    (g.execute(filtered)?, None)
+                }
             }
         } else {
             (table, None)
         };
 
     // Stage 1.5: Window functions (before GROUP BY)
-    let has_windows = has_window_functions(select_items);
     let (working_table, schema, select_items) = if has_windows {
         let (wt, ws, wi) = plan_window_stage(ctx, &working_table, select_items, &schema)?;
         (wt, ws, std::borrow::Cow::Owned(wi))
@@ -904,11 +933,6 @@ fn plan_query(
         )
     };
     let select_items: &[SelectItem] = &select_items;
-
-    // ORDER/LIMIT/OFFSET metadata (used by planning decisions below and execution later).
-    let order_by_exprs = extract_order_by(query)?;
-    let offset_val = extract_offset(query)?;
-    let limit_val = extract_limit(query)?;
 
     // Stage 2: GROUP BY / aggregation / DISTINCT
     // Fuse LIMIT into GROUP BY graph when safe (no ORDER BY, no HAVING).
@@ -935,6 +959,7 @@ fn plan_query(
             &alias_exprs,
             selection,
             group_limit,
+            select.having.as_ref(),
         )?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
@@ -960,29 +985,6 @@ fn plan_query(
                 &hidden_order_cols,
             )?
         }
-    };
-
-    // Stage 2.5: HAVING (filter on aggregation result)
-    let result_table = if let Some(ref having_expr) = select.having {
-        // Build HAVING schema from native table column names + display aliases
-        // so HAVING can resolve both "v1_sum" (native) and "sum(v1)" (SQL style)
-        let mut having_schema = build_schema(&result_table);
-        for (i, alias) in result_aliases.iter().enumerate() {
-            having_schema.entry(alias.clone()).or_insert(i);
-        }
-        // Build a map from schema index → native column name so that
-        // plan_having_expr can resolve aliases back to the actual column
-        // names in the result table (e.g. "sum(val)" → "val_sum").
-        let native_names: Vec<String> = (0..result_table.ncols() as usize)
-            .map(|i| result_table.col_name_str(i).to_string())
-            .collect();
-        let mut g = ctx.graph(&result_table)?;
-        let table_node = g.const_table(&result_table)?;
-        let pred = plan_having_expr(&mut g, having_expr, &having_schema, &schema, &native_names)?;
-        let filtered = g.filter(table_node, pred)?;
-        g.execute(filtered)?
-    } else {
-        result_table
     };
 
     let (result_table, limit_fused) = if !order_by_exprs.is_empty() {
@@ -1014,7 +1016,7 @@ fn plan_query(
         };
         (g.execute(root)?, total_limit.is_some())
     } else {
-        (result_table, group_limit.is_some())
+        (result_table, group_limit.is_some() || where_limit_fused)
     };
 
     // Stage 4: OFFSET + LIMIT (only parts not already fused)
@@ -1452,6 +1454,7 @@ fn plan_group_select(
     alias_exprs: &HashMap<String, Expr>,
     selection: Option<*mut crate::td_t>,
     group_limit: Option<i64>,
+    having: Option<&Expr>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     // RAII guard: ensures the selection is released on all exit paths
     // (including early returns). set_selection does its own retain, so the
@@ -1618,10 +1621,39 @@ fn plan_group_select(
     }
     // Fuse LIMIT into GROUP BY graph so the C engine can optimize
     // (e.g. short-circuit per-partition loop for MAPCOMMON-only keys).
-    let exec_root = match group_limit {
+    let mut exec_root = match group_limit {
         Some(n) => g.head(group_node, n)?,
         None => group_node,
     };
+
+    // HAVING fusion: build FILTER(GROUP, having_pred) in the same graph.
+    // The C executor detects FILTER(GROUP) and temporarily swaps g->table
+    // to the GROUP result so SCAN nodes resolve against output columns.
+    if let Some(having_expr) = having {
+        // Predict GROUP output schema without executing.
+        // Layout: [key_0, ..., key_n, agg_0, ..., agg_m]
+        let mut predicted_schema: HashMap<String, usize> = HashMap::new();
+        let mut predicted_names: Vec<String> = Vec::new();
+        for (i, k) in key_names.iter().enumerate() {
+            predicted_schema.insert(k.clone(), i);
+            predicted_names.push(k.clone());
+        }
+        for (i, agg) in all_aggs.iter().enumerate() {
+            let idx = key_names.len() + i;
+            // Predict C engine native name (e.g. "v1_sum")
+            let native = predict_c_agg_name(&agg.func, schema)
+                .unwrap_or_else(|| agg.alias.clone());
+            predicted_schema.insert(native.clone(), idx);
+            // Also register the format_agg_name alias (e.g. "sum(v1)")
+            predicted_schema.entry(agg.alias.clone()).or_insert(idx);
+            predicted_names.push(native);
+        }
+        let having_pred = plan_having_expr(
+            &mut g, having_expr, &predicted_schema, schema, &predicted_names,
+        )?;
+        exec_root = g.filter(exec_root, having_pred)?;
+    }
+
     let group_result = g.execute(exec_root)?;
 
     // Build result schema from NATIVE column names + our format_agg_name aliases.

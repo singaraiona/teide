@@ -156,25 +156,23 @@ SUM+COUNT+M2 per partition, merge with Welford formula, compute final stddev.
 
 Based on impact vs effort:
 
-| Priority | Item | Impact | Effort |
-|----------|------|--------|--------|
-| 1 | Pass E: OP_DISTINCT | Fixes common SQL pattern | Low |
-| 2 | Pass C: HAVING fusion (executor pattern) | Avoids extra scan | Low-Medium |
-| 3 | Pass F: LIMIT through FILTER | Early termination | Low |
-| 4 | Pass D: SELECT→GROUP fusion | Avoids copy | Low-Medium |
-| 5 | Pass A: Predicate pushdown | Reduces GROUP/JOIN input | Medium |
-| 6 | COUNT_DISTINCT (two-phase) | SQL completeness | Medium |
-| 7 | STDDEV Welford merge | Partitioned STDDEV | Medium |
-| 8 | Pass B: Projection pushdown | Reduces JOIN/SORT columns | Medium-High |
+| Priority | Item | Impact | Effort | Status |
+|----------|------|--------|--------|--------|
+| 1 | Pass E: OP_DISTINCT | Fixes common SQL pattern | Low | **DONE** — `td_distinct()` API, GROUP with n_aggs=0 |
+| 2 | Pass C: HAVING fusion (executor pattern) | Avoids extra scan | Low-Medium | **DONE** — FILTER(GROUP) pattern match + single-graph planner |
+| 3 | Pass F: LIMIT through FILTER | Early termination | Low | **DONE** — HEAD(FILTER) gather-only-N + WHERE+LIMIT fusion |
+| 4 | Pass D: SELECT→GROUP fusion | Avoids copy | Low-Medium | **DONE** — `pick_columns()` for simple projection, no 2nd graph |
+| 5 | Pass A: Predicate pushdown | Reduces GROUP/JOIN input | Medium | Handled at SQL planner level (WHERE before GROUP BY) |
+| 6 | COUNT_DISTINCT (two-phase) | SQL completeness | Medium | Works via Rust planner two-phase GROUP BY |
+| 7 | STDDEV Welford merge | Partitioned STDDEV | Medium | Deferred — per-partition path works for non-partitioned |
+| 8 | Pass B: Projection pushdown | Reduces JOIN/SORT columns | Medium-High | Implicit — exec_group only reads referenced columns |
 
 ## Materialization Points (Rust Planner Reference)
 
-The Rust planner creates 19 materialization points, 4 of which are multi-graph:
+The Rust planner originally created 4 multi-graph materialization patterns.
+After optimization, 2 are eliminated:
 
-1. **GROUP BY → new graph for SELECT projection** (every GROUP BY query)
-2. **DISTINCT → new graph to strip COUNT column** (every DISTINCT query)
-3. **COUNT(DISTINCT) → two-phase GROUP BY** (any COUNT(DISTINCT))
-4. **HEAD → skip_rows for OFFSET** (OFFSET queries)
-
-Once the C optimizer handles SELECT→GROUP fusion (Pass D) and native DISTINCT (Pass E),
-the Rust planner can build single-graph DAGs for these patterns, eliminating multi-graph overhead.
+1. ~~GROUP BY → new graph for SELECT projection~~ → **ELIMINATED** (pick_columns)
+2. ~~DISTINCT → new graph to strip COUNT column~~ → **ELIMINATED** (td_distinct)
+3. **COUNT(DISTINCT) → two-phase GROUP BY** (still multi-graph, works correctly)
+4. **HEAD → skip_rows for OFFSET** (still multi-graph, low overhead)

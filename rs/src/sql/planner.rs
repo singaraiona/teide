@@ -1683,9 +1683,7 @@ fn plan_group_select(
         return Ok((group_result, final_aliases));
     }
 
-    // Phase 4: Post-aggregation expressions
-    // Build mapping: display alias → native column name
-    // SCAN nodes must use native names (what the C table actually contains).
+    // Build mapping: display alias → native column name in the group result.
     let mut alias_to_native: HashMap<String, String> = HashMap::new();
     for (i, agg) in all_aggs.iter().enumerate() {
         let col_idx = key_names.len() + i;
@@ -1693,6 +1691,27 @@ fn plan_group_select(
         alias_to_native.insert(agg.alias.clone(), native.to_string());
     }
 
+    // Simple projection (no post-agg expressions): pick columns directly
+    // from the group result without creating a second graph.
+    if !needs_post_processing {
+        let mut pick_names: Vec<String> = Vec::new();
+        for plan in &select_plan {
+            match plan {
+                SelectPlan::KeyRef(alias) => pick_names.push(alias.clone()),
+                SelectPlan::PureAgg(idx, _) => {
+                    let col_idx = key_names.len() + *idx;
+                    pick_names.push(group_result.col_name_str(col_idx));
+                }
+                _ => unreachable!(),
+            }
+        }
+        let pick_refs: Vec<&str> = pick_names.iter().map(|s| s.as_str()).collect();
+        let result = group_result.pick_columns(&pick_refs)
+            .map_err(|e| SqlError::Plan(format!("column projection failed: {e}")))?;
+        return Ok((result, final_aliases));
+    }
+
+    // Phase 4: Post-aggregation expressions — requires a second graph
     let mut pg = ctx.graph(&group_result)?;
     let table_node = pg.const_table(&group_result)?;
 
@@ -1706,7 +1725,6 @@ fn plan_group_select(
                 proj_aliases.push(alias.clone());
             }
             SelectPlan::PureAgg(idx, alias) => {
-                // Always scan by native C engine name
                 let col_idx = key_names.len() + *idx;
                 let native = group_result.col_name_str(col_idx);
                 proj_cols.push(pg.scan(&native)?);

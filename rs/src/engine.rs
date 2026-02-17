@@ -687,6 +687,34 @@ impl Table {
         }
     }
 
+    /// Build a new table by picking columns by name in the given order.
+    /// Columns are shared (ref-counted), so no data is copied.
+    pub fn pick_columns(&self, names: &[&str]) -> Result<Self> {
+        unsafe {
+            let mut tbl = ffi::td_table_new(names.len() as i64);
+            if tbl.is_null() || ffi::td_is_err(tbl) {
+                return Err(Error::Oom);
+            }
+            for &name in names {
+                let name_id = sym_intern(name)?;
+                let col = ffi::td_table_get_col(self.raw, name_id);
+                if col.is_null() || ffi::td_is_err(col) {
+                    ffi::td_release(tbl);
+                    return Err(Error::Schema);
+                }
+                ffi::td_retain(col);
+                let next = ffi::td_table_add_col(tbl, name_id, col);
+                if next.is_null() || ffi::td_is_err(next) {
+                    ffi::td_release(col);
+                    ffi::td_release(tbl);
+                    return Err(Error::Oom);
+                }
+                tbl = next;
+            }
+            Table::from_raw(tbl)
+        }
+    }
+
     /// Raw column vector at index (returns None for out-of-range or error).
     pub fn get_col_idx(&self, idx: i64) -> Option<*mut ffi::td_t> {
         let p = unsafe { ffi::td_table_get_col_idx(self.raw, idx) };

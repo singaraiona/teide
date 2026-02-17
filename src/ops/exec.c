@@ -129,12 +129,26 @@ static td_t* materialize_mapcommon(td_t* mc) {
     if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
     flat->len = total;
 
+    /* Pattern-fill: broadcast each partition's key value across its row range.
+     * Typed fill avoids per-element memcpy overhead. */
     char* out = (char*)td_data(flat);
     int64_t off = 0;
     for (int64_t p = 0; p < n_parts; p++) {
         int64_t cnt = counts[p];
-        for (int64_t r = 0; r < cnt; r++)
-            memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        if (esz == 8) {
+            uint64_t v;
+            memcpy(&v, kdata + (size_t)p * 8, 8);
+            uint64_t* dst = (uint64_t*)(out + off * 8);
+            for (int64_t r = 0; r < cnt; r++) dst[r] = v;
+        } else if (esz == 4) {
+            uint32_t v;
+            memcpy(&v, kdata + (size_t)p * 4, 4);
+            uint32_t* dst = (uint32_t*)(out + off * 4);
+            for (int64_t r = 0; r < cnt; r++) dst[r] = v;
+        } else {
+            for (int64_t r = 0; r < cnt; r++)
+                memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        }
         off += cnt;
     }
     return flat;
@@ -160,8 +174,20 @@ static td_t* materialize_mapcommon_head(td_t* mc, int64_t n) {
     for (int64_t p = 0; p < n_parts && off < n; p++) {
         int64_t take = counts[p];
         if (take > n - off) take = n - off;
-        for (int64_t r = 0; r < take; r++)
-            memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        if (esz == 8) {
+            uint64_t v;
+            memcpy(&v, kdata + (size_t)p * 8, 8);
+            uint64_t* dst = (uint64_t*)(out + off * 8);
+            for (int64_t r = 0; r < take; r++) dst[r] = v;
+        } else if (esz == 4) {
+            uint32_t v;
+            memcpy(&v, kdata + (size_t)p * 4, 4);
+            uint32_t* dst = (uint32_t*)(out + off * 4);
+            for (int64_t r = 0; r < take; r++) dst[r] = v;
+        } else {
+            for (int64_t r = 0; r < take; r++)
+                memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        }
         off += take;
     }
     return flat;
@@ -3003,10 +3029,12 @@ static void topn_scan_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     c->counts[wid] = cnt;
 }
 
+#define TOPN_MAX 8192  /* max limit for heap-based top-N (merge VLA ≤ 128KB) */
+
 static int64_t topn_merge_fused(fused_topn_ctx_t* ctx, uint32_t n_workers,
                                  int64_t* out, int64_t limit) {
-    /* Clamp to TOPN_MAX (1024) for VLA stack safety — max 16KB. */
-    if (limit > 1024) limit = 1024;
+    /* Clamp to TOPN_MAX for VLA stack safety (≤ 128KB). */
+    if (limit > TOPN_MAX) limit = TOPN_MAX;
     topn_entry_t merge[limit];
     int64_t cnt = 0;
     for (uint32_t w = 0; w < n_workers; w++) {
@@ -3041,8 +3069,8 @@ static int64_t topn_merge_fused(fused_topn_ctx_t* ctx, uint32_t n_workers,
 /* Merge per-worker heaps → sorted indices in out[0..return_val-1]. */
 static int64_t topn_merge(topn_ctx_t* ctx, uint32_t n_workers,
                            int64_t* out, int64_t limit) {
-    /* Clamp to TOPN_MAX (1024) for VLA stack safety. */
-    if (limit > 1024) limit = 1024;
+    /* Clamp to TOPN_MAX for VLA stack safety (≤ 128KB). */
+    if (limit > TOPN_MAX) limit = TOPN_MAX;
     topn_entry_t merge[limit];
     int64_t cnt = 0;
 
@@ -3077,8 +3105,6 @@ static int64_t topn_merge(topn_ctx_t* ctx, uint32_t n_workers,
         out[i] = merge[i].idx;
     return cnt;
 }
-
-#define TOPN_MAX 1024  /* max limit for heap-based top-N */
 
 static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
     if (!tbl || TD_IS_ERR(tbl)) return tbl;
@@ -4334,6 +4360,10 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
         MINMAX_SEG_LOOP(int64_t, );
     else if (t == TD_ENUM)
         MINMAX_SEG_LOOP(uint32_t, );
+    else if (t == TD_BOOL || t == TD_U8)
+        MINMAX_SEG_LOOP(uint8_t, );
+    else if (t == TD_I16)
+        MINMAX_SEG_LOOP(int16_t, );
     else /* TD_I32, TD_DATE, TD_TIME */
         MINMAX_SEG_LOOP(int32_t, );
 
@@ -4846,6 +4876,17 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         int8_t kt = c->key_types[0];
         int64_t kmin = c->key_mins[0];
         #define DA_PF_DIST 8
+        /* Key read macro: typed load to int64_t */
+        #define DA_READ_KEY(ptr, row) \
+            ((kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP) \
+                ? ((const int64_t*)(ptr))[(row)] \
+            : (kt == TD_ENUM) \
+                ? (int64_t)((const uint32_t*)(ptr))[(row)] \
+            : (kt == TD_BOOL || kt == TD_U8) \
+                ? (int64_t)((const uint8_t*)(ptr))[(row)] \
+            : (kt == TD_I16) \
+                ? (int64_t)((const int16_t*)(ptr))[(row)] \
+            :   (int64_t)((const int32_t*)(ptr))[(row)])
         bool da_prefetch = c->n_slots >= 4096;
 
         for (int64_t r = start; r < end; ) {
@@ -4860,24 +4901,12 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
                 for (; r < seg_end; r++) {
                     if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
                     if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
-                        int64_t pf_kv;
-                        if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                            pf_kv = ((const int64_t*)kptr)[r + DA_PF_DIST];
-                        else if (kt == TD_ENUM)
-                            pf_kv = (int64_t)((const uint32_t*)kptr)[r + DA_PF_DIST];
-                        else
-                            pf_kv = (int64_t)((const int32_t*)kptr)[r + DA_PF_DIST];
+                        int64_t pf_kv = DA_READ_KEY(kptr, r + DA_PF_DIST);
                         size_t pf_base = (size_t)(int32_t)(pf_kv - kmin) * n_aggs;
                         __builtin_prefetch(&acc->count[(int32_t)(pf_kv - kmin)], 1, 1);
                         if (acc->sum) __builtin_prefetch(&acc->sum[pf_base], 1, 1);
                     }
-                    int64_t kv;
-                    if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                        kv = ((const int64_t*)kptr)[r];
-                    else if (kt == TD_ENUM)
-                        kv = (int64_t)((const uint32_t*)kptr)[r];
-                    else
-                        kv = (int64_t)((const int32_t*)kptr)[r];
+                    int64_t kv = DA_READ_KEY(kptr, r);
                     da_accum_row(c, acc, (int32_t)(kv - kmin), r);
                 }
                 continue;
@@ -4886,31 +4915,20 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
             /* No sel_flags: original per-row mask check */
             if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
             if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
-                int64_t pf_kv;
-                if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                    pf_kv = ((const int64_t*)kptr)[r + DA_PF_DIST];
-                else if (kt == TD_ENUM)
-                    pf_kv = (int64_t)((const uint32_t*)kptr)[r + DA_PF_DIST];
-                else
-                    pf_kv = (int64_t)((const int32_t*)kptr)[r + DA_PF_DIST];
+                int64_t pf_kv = DA_READ_KEY(kptr, r + DA_PF_DIST);
                 size_t pf_base = (size_t)(int32_t)(pf_kv - kmin) * n_aggs;
                 __builtin_prefetch(&acc->count[(int32_t)(pf_kv - kmin)], 1, 1);
                 if (acc->sum) __builtin_prefetch(&acc->sum[pf_base], 1, 1);
             }
-            int64_t kv;
-            if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                kv = ((const int64_t*)kptr)[r];
-            else if (kt == TD_ENUM)
-                kv = (int64_t)((const uint32_t*)kptr)[r];
-            else
-                kv = (int64_t)((const int32_t*)kptr)[r];
+            int64_t kv = DA_READ_KEY(kptr, r);
             da_accum_row(c, acc, (int32_t)(kv - kmin), r);
             r++;
         }
         return;
     }
 
-    /* Multi-key composite GID path */
+    /* Multi-key composite GID path (with stride-ahead prefetch) */
+    bool da_prefetch_mk = c->n_slots >= 4096;
     for (int64_t r = start; r < end; ) {
         /* Segment-level skip */
         if (sel_flags) {
@@ -4922,12 +4940,22 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
 
             for (; r < seg_end; r++) {
                 if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
+                if (da_prefetch_mk && TD_LIKELY(r + DA_PF_DIST < end)) {
+                    int32_t pf_gid = da_composite_gid(c, r + DA_PF_DIST);
+                    __builtin_prefetch(&acc->count[pf_gid], 1, 1);
+                    if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1);
+                }
                 da_accum_row(c, acc, da_composite_gid(c, r), r);
             }
             continue;
         }
 
         if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
+        if (da_prefetch_mk && TD_LIKELY(r + DA_PF_DIST < end)) {
+            int32_t pf_gid = da_composite_gid(c, r + DA_PF_DIST);
+            __builtin_prefetch(&acc->count[pf_gid], 1, 1);
+            if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1);
+        }
         da_accum_row(c, acc, da_composite_gid(c, r), r);
         r++;
     }
@@ -5047,7 +5075,7 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
 
     /* Check eligibility for per-partition exec + merge:
      * - All keys and agg inputs must be simple SCANs
-     * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG */
+     * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG, FIRST, LAST */
     int can_partition = 1;
     int has_avg = 0;
     int64_t key_syms[8];
@@ -5060,7 +5088,8 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
     for (uint8_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN &&
-            aop != OP_MAX && aop != OP_AVG) { can_partition = 0; break; }
+            aop != OP_MAX && aop != OP_AVG && aop != OP_FIRST &&
+            aop != OP_LAST) { can_partition = 0; break; }
         if (aop == OP_AVG) has_avg = 1;
         td_op_ext_t* ae = find_ext(g, ext->agg_ins[a]->id);
         if (!ae || ae->base.opcode != OP_SCAN) { can_partition = 0; break; }
@@ -5574,7 +5603,8 @@ da_path:;
             if (!key_data[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
             if (t != TD_I64 && t != TD_SYM && t != TD_I32 && t != TD_ENUM
-                && t != TD_TIMESTAMP && t != TD_DATE && t != TD_TIME)
+                && t != TD_TIMESTAMP && t != TD_DATE && t != TD_TIME
+                && t != TD_BOOL && t != TD_U8 && t != TD_I16)
                 da_eligible = false;
         }
 
@@ -6482,7 +6512,7 @@ cleanup:
  * Runs exec_group on each partition independently (zero-copy mmap segments),
  * then merges the small partial results via a second exec_group pass.
  *
- * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX.
+ * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
  * AVG: decomposed into SUM+COUNT per partition, merged, then divided.
  *
  * Returns NULL if any step fails (caller falls through to concat path).
@@ -6546,7 +6576,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         part_n_aggs++;
     }
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
-     * plus the appended COUNT cols → SUM */
+     * FIRST→FIRST, LAST→LAST, plus the appended COUNT cols → SUM */
     for (uint8_t a = 0; a < part_n_aggs; a++) {
         merge_ops[a] = part_ops[a];
         if (merge_ops[a] == OP_COUNT) merge_ops[a] = OP_SUM;
@@ -9457,16 +9487,72 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 for (int64_t c = 0; c < ncols; c++) {
                     td_t* col = td_table_get_col_idx(input, c);
                     int64_t name_id = td_table_col_name(input, c);
-                    uint8_t esz = td_elem_size(col->type);
-                    td_t* tail_vec = td_vec_new(col->type, n);
-                    if (tail_vec && !TD_IS_ERR(tail_vec)) {
-                        tail_vec->len = n;
-                        memcpy(td_data(tail_vec),
-                               (char*)td_data(col) + (size_t)skip * esz,
-                               (size_t)n * esz);
+                    if (!col) continue;
+                    if (col->type == TD_MAPCOMMON) {
+                        /* Materialize last N rows from MAPCOMMON partitions */
+                        td_t** mc_ptrs = (td_t**)td_data(col);
+                        td_t* kv = mc_ptrs[0];
+                        td_t* rc = mc_ptrs[1];
+                        int64_t n_parts = kv->len;
+                        int8_t kv_type = kv->type;
+                        size_t esz = (size_t)td_elem_size(kv_type);
+                        const char* kdata = (const char*)td_data(kv);
+                        const int64_t* counts = (const int64_t*)td_data(rc);
+                        td_t* flat = td_vec_new(kv_type, n);
+                        if (flat && !TD_IS_ERR(flat)) {
+                            flat->len = n;
+                            char* out = (char*)td_data(flat);
+                            /* Walk partitions from end, fill output from end */
+                            int64_t remaining = n;
+                            int64_t dst = n;
+                            for (int64_t p = n_parts - 1; p >= 0 && remaining > 0; p--) {
+                                int64_t take = counts[p];
+                                if (take > remaining) take = remaining;
+                                dst -= take;
+                                for (int64_t r = 0; r < take; r++)
+                                    memcpy(out + (dst + r) * esz, kdata + (size_t)p * esz, esz);
+                                remaining -= take;
+                            }
+                        }
+                        result = td_table_add_col(result, name_id, flat);
+                        td_release(flat);
+                        continue;
                     }
-                    result = td_table_add_col(result, name_id, tail_vec);
-                    td_release(tail_vec);
+                    if (TD_IS_PARTED(col->type)) {
+                        /* Copy last N rows from parted segments */
+                        int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
+                        uint8_t esz = td_elem_size(base);
+                        td_t* tail_vec = td_vec_new(base, n);
+                        if (tail_vec && !TD_IS_ERR(tail_vec)) {
+                            tail_vec->len = n;
+                            td_t** segs = (td_t**)td_data(col);
+                            int64_t remaining = n;
+                            int64_t dst = n;
+                            for (int64_t s = col->len - 1; s >= 0 && remaining > 0; s--) {
+                                int64_t take = segs[s]->len;
+                                if (take > remaining) take = remaining;
+                                dst -= take;
+                                memcpy((char*)td_data(tail_vec) + (size_t)dst * esz,
+                                       (char*)td_data(segs[s]) + (size_t)(segs[s]->len - take) * esz,
+                                       (size_t)take * esz);
+                                remaining -= take;
+                            }
+                        }
+                        result = td_table_add_col(result, name_id, tail_vec);
+                        td_release(tail_vec);
+                    } else {
+                        /* Flat column: direct copy */
+                        uint8_t esz = td_elem_size(col->type);
+                        td_t* tail_vec = td_vec_new(col->type, n);
+                        if (tail_vec && !TD_IS_ERR(tail_vec)) {
+                            tail_vec->len = n;
+                            memcpy(td_data(tail_vec),
+                                   (char*)td_data(col) + (size_t)skip * esz,
+                                   (size_t)n * esz);
+                        }
+                        result = td_table_add_col(result, name_id, tail_vec);
+                        td_release(tail_vec);
+                    }
                 }
                 td_release(input);
                 return result;

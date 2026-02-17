@@ -297,6 +297,59 @@ static bool replace_with_const(td_graph_t* g, td_op_t* node, td_t* literal) {
     return true;
 }
 
+static bool fold_unary_const(td_graph_t* g, td_op_t* node) {
+    td_op_t* operand = node->inputs[0];
+    if (!is_const(operand)) return false;
+
+    td_op_ext_t* oe = find_ext(g, operand->id);
+    if (!oe || !oe->literal || !td_is_atom(oe->literal)) return false;
+
+    double vf = 0.0;
+    int64_t vi = 0;
+    bool is_f64 = false;
+    if (!atom_to_numeric(oe->literal, &vf, &vi, &is_f64)) return false;
+
+    td_t* folded = NULL;
+    switch (node->opcode) {
+        case OP_NEG:
+            folded = is_f64 ? td_f64(-vf) : td_i64(-vi);
+            break;
+        case OP_ABS:
+            if (is_f64)
+                folded = td_f64(fabs(vf));
+            else
+                folded = td_i64(vi < 0 ? -vi : vi);
+            break;
+        case OP_NOT:
+            folded = td_bool(is_f64 ? vf == 0.0 : vi == 0);
+            break;
+        case OP_SQRT:
+            folded = td_f64(sqrt(is_f64 ? vf : (double)vi));
+            break;
+        case OP_LOG:
+            folded = td_f64(log(is_f64 ? vf : (double)vi));
+            break;
+        case OP_EXP:
+            folded = td_f64(exp(is_f64 ? vf : (double)vi));
+            break;
+        case OP_CEIL:
+            folded = is_f64 ? td_f64(ceil(vf)) : td_i64(vi);
+            break;
+        case OP_FLOOR:
+            folded = is_f64 ? td_f64(floor(vf)) : td_i64(vi);
+            break;
+        default:
+            return false;
+    }
+
+    if (!folded || TD_IS_ERR(folded)) return false;
+    if (!replace_with_const(g, node, folded)) {
+        td_release(folded);
+        return false;
+    }
+    return true;
+}
+
 static bool fold_binary_const(td_graph_t* g, td_op_t* node) {
     td_op_t* lhs = node->inputs[0];
     td_op_t* rhs = node->inputs[1];
@@ -434,7 +487,11 @@ static bool fold_filter_const_predicate(td_graph_t* g, td_op_t* node) {
 }
 
 static void fold_node(td_graph_t* g, td_op_t* node) {
-    /* Only fold element-wise binary ops with two const inputs */
+    /* Fold unary element-wise ops with constant input */
+    if (node->arity == 1 && node->opcode >= OP_NEG && node->opcode <= OP_FLOOR) {
+        (void)fold_unary_const(g, node);
+    }
+    /* Fold binary element-wise ops with two const inputs */
     if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
         (void)fold_binary_const(g, node);
     }

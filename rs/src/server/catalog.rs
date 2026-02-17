@@ -68,6 +68,13 @@ pub fn is_catalog_query(sql: &str) -> bool {
         || lower.contains("pg_index")
         || lower.contains("pg_settings")
         || lower.contains("pg_database")
+        || lower.contains("pg_roles")
+        || lower.contains("pg_user")
+        || lower.contains("pg_proc")
+        || lower.contains("pg_am")
+        || lower.contains("pg_description")
+        || lower.contains("pg_enum")
+        || lower.contains("pg_stat_activity")
         || lower.contains("information_schema")
         || lower.starts_with("select current_schema")
         || lower.starts_with("select current_database")
@@ -296,15 +303,49 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         return Some(empty_result(&[("relname", Type::VARCHAR)]));
     }
 
-    // pg_type — only match direct FROM (not in subqueries of other handlers)
+    // pg_type — return built-in type rows with real OIDs (JDBC maps by OID)
     if lower.contains("from pg_type") || lower.contains("from pg_catalog.pg_type") {
-        return Some(empty_result(&[
-            ("oid", Type::INT4),
-            ("typname", Type::VARCHAR),
-            ("typnamespace", Type::INT4),
-            ("typlen", Type::INT2),
-            ("typtype", Type::CHAR),
-        ]));
+        return Some(handle_pg_type());
+    }
+
+    // pg_settings — GUC parameters (JDBC handshake, monitoring tools)
+    if lower.contains("pg_settings") {
+        return Some(handle_pg_settings());
+    }
+
+    // pg_database — database listing
+    if lower.contains("pg_database") {
+        return Some(handle_pg_database());
+    }
+
+    // pg_roles / pg_user — role/user listing
+    if lower.contains("pg_roles") || lower.contains("pg_user") {
+        return Some(handle_pg_roles());
+    }
+
+    // pg_proc — stored procedures (empty, none in Teide)
+    if lower.contains("pg_proc") {
+        return Some(empty_result(&[("proname", Type::VARCHAR)]));
+    }
+
+    // pg_am — access methods (empty)
+    if lower.contains("pg_am") {
+        return Some(empty_result(&[("amname", Type::VARCHAR)]));
+    }
+
+    // pg_description — object comments (empty)
+    if lower.contains("pg_description") {
+        return Some(empty_result(&[("description", Type::VARCHAR)]));
+    }
+
+    // pg_enum — enum types (empty, Teide enums are internal)
+    if lower.contains("pg_enum") {
+        return Some(empty_result(&[("enumlabel", Type::VARCHAR)]));
+    }
+
+    // pg_stat_activity — connection monitoring (fake single row)
+    if lower.contains("pg_stat_activity") {
+        return Some(handle_pg_stat_activity());
     }
 
     // pg_namespace — only match direct FROM (schema listing), not JOINs
@@ -801,6 +842,230 @@ fn handle_pg_class(meta: &SessionMeta) -> PgWireResult<Vec<Response>> {
         schema, row_stream,
     ))])
 }
+
+// ---------------------------------------------------------------------------
+// pg_type — real OIDs for JDBC type mapping
+// ---------------------------------------------------------------------------
+
+/// Return built-in PostgreSQL type rows. JDBC maps column types by OID,
+/// so these must match the OIDs used in FieldInfo for query results.
+fn handle_pg_type() -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("oid".into(), None, None, Type::INT4, FieldFormat::Text),
+        FieldInfo::new("typname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "typnamespace".into(),
+            None,
+            None,
+            Type::INT4,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new("typlen".into(), None, None, Type::INT2, FieldFormat::Text),
+        FieldInfo::new("typtype".into(), None, None, Type::CHAR, FieldFormat::Text),
+        FieldInfo::new("typarray".into(), None, None, Type::INT4, FieldFormat::Text),
+    ]);
+
+    // (oid, typname, typnamespace=11 (pg_catalog), typlen, typtype, typarray)
+    let types: &[(&str, &str, &str, &str, &str, &str)] = &[
+        ("16", "bool", "11", "1", "b", "1000"),
+        ("20", "int8", "11", "8", "b", "1016"),
+        ("21", "int2", "11", "2", "b", "1005"),
+        ("23", "int4", "11", "4", "b", "1007"),
+        ("25", "text", "11", "-1", "b", "1009"),
+        ("26", "oid", "11", "4", "b", "1028"),
+        ("700", "float4", "11", "4", "b", "1021"),
+        ("701", "float8", "11", "8", "b", "1022"),
+        ("1043", "varchar", "11", "-1", "b", "1015"),
+        ("1082", "date", "11", "4", "b", "1182"),
+        ("1083", "time", "11", "8", "b", "1183"),
+        ("1114", "timestamp", "11", "8", "b", "1115"),
+        ("1700", "numeric", "11", "-1", "b", "1231"),
+        ("2278", "void", "11", "4", "p", "0"),
+    ];
+
+    let mut rows = Vec::with_capacity(types.len());
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    for &(oid, name, ns, len, tt, arr) in types {
+        encoder.encode_field(&Some(oid.to_string()))?;
+        encoder.encode_field(&Some(name.to_string()))?;
+        encoder.encode_field(&Some(ns.to_string()))?;
+        encoder.encode_field(&Some(len.to_string()))?;
+        encoder.encode_field(&Some(tt.to_string()))?;
+        encoder.encode_field(&Some(arr.to_string()))?;
+        rows.push(Ok(encoder.take_row()));
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+// ---------------------------------------------------------------------------
+// pg_settings — GUC parameters
+// ---------------------------------------------------------------------------
+
+fn handle_pg_settings() -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "setting".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let settings: &[(&str, &str)] = &[
+        ("max_identifier_length", "63"),
+        ("server_version", "16.6"),
+        ("server_version_num", "160006"),
+        ("default_transaction_read_only", "off"),
+        ("server_encoding", "UTF8"),
+        ("client_encoding", "UTF8"),
+        ("standard_conforming_strings", "on"),
+        ("DateStyle", "ISO, MDY"),
+        ("TimeZone", "UTC"),
+        ("integer_datetimes", "on"),
+        ("is_superuser", "on"),
+    ];
+
+    let mut rows = Vec::with_capacity(settings.len());
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    for &(name, val) in settings {
+        encoder.encode_field(&Some(name.to_string()))?;
+        encoder.encode_field(&Some(val.to_string()))?;
+        rows.push(Ok(encoder.take_row()));
+    }
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+// ---------------------------------------------------------------------------
+// pg_database
+// ---------------------------------------------------------------------------
+
+fn handle_pg_database() -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("oid".into(), None, None, Type::INT4, FieldFormat::Text),
+        FieldInfo::new(
+            "datname".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "encoding".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::with_capacity(1);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    encoder.encode_field(&Some("1".to_string()))?;
+    encoder.encode_field(&Some("teide".to_string()))?;
+    encoder.encode_field(&Some("UTF8".to_string()))?;
+    rows.push(Ok(encoder.take_row()));
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+// ---------------------------------------------------------------------------
+// pg_roles / pg_user
+// ---------------------------------------------------------------------------
+
+fn handle_pg_roles() -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("oid".into(), None, None, Type::INT4, FieldFormat::Text),
+        FieldInfo::new(
+            "rolname".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "rolsuper".into(),
+            None,
+            None,
+            Type::BOOL,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "rolcreatedb".into(),
+            None,
+            None,
+            Type::BOOL,
+            FieldFormat::Text,
+        ),
+    ]);
+
+    let mut rows = Vec::with_capacity(1);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    encoder.encode_field(&Some("10".to_string()))?;
+    encoder.encode_field(&Some("teide".to_string()))?;
+    encoder.encode_field(&true)?;
+    encoder.encode_field(&true)?;
+    rows.push(Ok(encoder.take_row()));
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+// ---------------------------------------------------------------------------
+// pg_stat_activity — connection monitoring
+// ---------------------------------------------------------------------------
+
+fn handle_pg_stat_activity() -> PgWireResult<Vec<Response>> {
+    let schema = Arc::new(vec![
+        FieldInfo::new("pid".into(), None, None, Type::INT4, FieldFormat::Text),
+        FieldInfo::new(
+            "datname".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "usename".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new("state".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+    ]);
+
+    let mut rows = Vec::with_capacity(1);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    encoder.encode_field(&Some("1".to_string()))?;
+    encoder.encode_field(&Some("teide".to_string()))?;
+    encoder.encode_field(&Some("teide".to_string()))?;
+    encoder.encode_field(&Some("active".to_string()))?;
+    rows.push(Ok(encoder.take_row()));
+
+    let row_stream = stream::iter(rows);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
+}
+
+// ---------------------------------------------------------------------------
+// Type display names
+// ---------------------------------------------------------------------------
 
 fn pg_type_display_name(ty: &Type) -> &'static str {
     match *ty {

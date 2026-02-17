@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use futures::stream;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse};
+use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 
 use super::handler::WireResult;
@@ -35,12 +36,23 @@ use super::types::teide_to_pg_type;
 ///
 /// All cell values have already been formatted as strings by the engine
 /// thread, so this is purely a wire-encoding step — no C engine access.
-pub fn encode_wire_result(wr: &WireResult) -> PgWireResult<QueryResponse> {
+///
+/// When `all_text` is true, all column types are mapped to VARCHAR.
+/// This is needed for the extended query protocol because clients like
+/// tokio-postgres always request binary format and use type-specific
+/// binary deserializers (`i64::from_be_bytes`, etc). Since we only
+/// have pre-formatted text strings, mapping to VARCHAR makes the binary
+/// encoding identical to text (raw UTF-8 bytes), which works correctly.
+pub fn encode_wire_result(wr: &WireResult, all_text: bool) -> PgWireResult<QueryResponse> {
     let schema = Arc::new(
         wr.columns
             .iter()
             .map(|(name, td_type)| {
-                let pg_type = teide_to_pg_type(*td_type);
+                let pg_type = if all_text {
+                    Type::VARCHAR
+                } else {
+                    teide_to_pg_type(*td_type)
+                };
                 FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
             })
             .collect::<Vec<_>>(),

@@ -25,13 +25,26 @@
 //! OS thread. The async pgwire handler communicates with it via channels,
 //! avoiding any Send/Sync issues with the C engine's thread-local arenas.
 
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::sink::Sink;
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{Response, Tag};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers};
+use pgwire::api::results::{
+    DescribePortalResponse, DescribeResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    Response, Tag,
+};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
+use pgwire::api::ClientPortalStore;
+use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::PgWireBackendMessage;
+use tokio::sync::Mutex;
 
 use super::catalog;
 use super::encode;
@@ -222,19 +235,21 @@ impl SessionMeta {
 
 /// Per-connection handler. Owns a SessionBridge (engine-thread handle) and
 /// SessionMeta (for catalog queries without hitting the engine).
+///
+/// The `describe_cache` holds query results from Describe (statement) so that
+/// the subsequent Execute can return the cached result without re-running.
+/// This is needed because the extended protocol requires column metadata
+/// from Describe before Execute sends any data rows.
 pub struct TeideHandler {
     bridge: SessionBridge,
     meta: SessionMeta,
+    describe_cache: Arc<Mutex<HashMap<String, WireResult>>>,
 }
 
-#[async_trait]
-impl SimpleQueryHandler for TeideHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        eprintln!("[query] {query}");
-
+impl TeideHandler {
+    /// Execute a SQL query through the catalog handler or engine bridge.
+    /// Returns the pgwire Response(s).
+    async fn execute_sql(&self, query: &str) -> PgWireResult<Vec<Response>> {
         // Check for catalog queries (handled locally, no engine needed)
         if catalog::is_catalog_query(query) {
             if let Some(result) = catalog::handle_catalog_query(query, &self.meta) {
@@ -242,11 +257,9 @@ impl SimpleQueryHandler for TeideHandler {
             }
         }
 
-        // Strip schema prefix: Teide is single-schema, but clients (Superset,
-        // SQLAlchemy) generate schema-qualified names like `public.t` or `"public".t`.
-        let sql = query
-            .replace("public.", "")
-            .replace("\"public\".", "");
+        // Strip schema prefix
+        let sql = query.replace("public.", "").replace("\"public\".", "");
+
         let result = self.bridge.query(sql).await.map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
@@ -257,11 +270,310 @@ impl SimpleQueryHandler for TeideHandler {
 
         match result {
             EngineResponse::Query(wire_result) => {
-                let qr = encode::encode_wire_result(&wire_result)?;
+                let qr = encode::encode_wire_result(&wire_result, false)?;
                 Ok(vec![Response::Query(qr)])
             }
             EngineResponse::Ddl(msg) => Ok(vec![Response::Execution(Tag::new(&msg).with_rows(0))]),
         }
+    }
+
+    /// Execute a query and cache the WireResult for subsequent do_query.
+    /// Returns the column schema for Describe responses.
+    ///
+    /// All column types are mapped to VARCHAR for the extended protocol.
+    /// tokio-postgres (and most JDBC drivers) always request binary format
+    /// in Bind. Since we only have text-encoded values, VARCHAR is the
+    /// correct type — its binary representation is identical to text
+    /// (raw UTF-8 bytes).
+    async fn describe_and_cache(&self, sql: &str) -> PgWireResult<Vec<FieldInfo>> {
+        let lower = sql.to_lowercase();
+        let lower = lower.trim();
+
+        // Catalog queries
+        if catalog::is_catalog_query(sql) {
+            // DDL-like: SET, BEGIN, COMMIT, DEALLOCATE, etc. → no result columns
+            if lower.starts_with("set ")
+                || lower == "begin"
+                || lower == "commit"
+                || lower == "rollback"
+                || lower == "end"
+                || lower.starts_with("begin;")
+                || lower.starts_with("commit;")
+                || lower.starts_with("rollback;")
+                || lower.starts_with("deallocate ")
+                || lower.starts_with("close ")
+                || lower.starts_with("discard ")
+            {
+                return Ok(vec![]);
+            }
+
+            // SELECT <constant> (e.g. SELECT 1, SELECT 'hello') → cache result
+            if let Some(rest) = lower.strip_prefix("select ") {
+                let val = rest.trim().trim_end_matches(';').trim();
+                let is_constant = val.parse::<i64>().is_ok()
+                    || (val.starts_with('\'') && val.ends_with('\''))
+                    || val == "true"
+                    || val == "false"
+                    || val == "null";
+                if is_constant {
+                    let display_val = val.trim_matches('\'').to_string();
+                    let wr = WireResult {
+                        columns: vec![("?column?".to_string(), 0)],
+                        rows: vec![vec![Some(display_val)]],
+                    };
+                    let fields = vec![FieldInfo::new(
+                        "?column?".to_string(),
+                        None,
+                        None,
+                        Type::VARCHAR,
+                        FieldFormat::Text,
+                    )];
+                    let mut cache = self.describe_cache.lock().await;
+                    cache.insert(sql.to_string(), wr);
+                    return Ok(fields);
+                }
+            }
+
+            // SELECT version(), SELECT current_schema, etc. → single VARCHAR column
+            if lower.starts_with("select version()")
+                || lower.starts_with("select current_schema")
+                || lower.starts_with("select current_database")
+                || lower.contains("pg_backend_pid()")
+            {
+                // Run catalog handler to get the actual value
+                if let Some(Ok(responses)) = catalog::handle_catalog_query(sql, &self.meta) {
+                    // These catalog functions return single-column, single-row results.
+                    // Cache a generic WireResult so do_query can skip re-running.
+                    let fields = vec![FieldInfo::new(
+                        "?column?".to_string(),
+                        None,
+                        None,
+                        Type::VARCHAR,
+                        FieldFormat::Text,
+                    )];
+                    // We can't extract data from Response, but do_query will re-run
+                    // the catalog handler if there's no cache hit.
+                    drop(responses);
+                    return Ok(fields);
+                }
+            }
+
+            // Other catalog queries: return empty schema.
+            // do_query will handle them by running the catalog handler.
+            return Ok(vec![]);
+        }
+
+        let clean_sql = sql.replace("public.", "").replace("\"public\".", "");
+
+        let result = self.bridge.query(clean_sql).await.map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "XX000".to_string(),
+                e,
+            )))
+        })?;
+
+        match result {
+            EngineResponse::Query(wire_result) => {
+                // All columns as VARCHAR for extended protocol compatibility
+                let schema: Vec<FieldInfo> = wire_result
+                    .columns
+                    .iter()
+                    .map(|(name, _td_type)| {
+                        FieldInfo::new(
+                            name.clone(),
+                            None,
+                            None,
+                            Type::VARCHAR,
+                            FieldFormat::Text,
+                        )
+                    })
+                    .collect();
+
+                // Cache the result for subsequent do_query
+                let mut cache = self.describe_cache.lock().await;
+                cache.insert(sql.to_string(), wire_result);
+
+                Ok(schema)
+            }
+            EngineResponse::Ddl(_) => Ok(vec![]),
+        }
+    }
+}
+
+#[async_trait]
+impl SimpleQueryHandler for TeideHandler {
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        eprintln!("[query] {query}");
+        self.execute_sql(query).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extended Query Protocol: TeideQueryParser + ExtendedQueryHandler
+// ---------------------------------------------------------------------------
+
+/// Query parser for the extended protocol. Stores the raw SQL string as the
+/// "statement" — Teide's SQL planner handles actual parsing during execution.
+pub struct TeideQueryParser;
+
+#[async_trait]
+impl QueryParser for TeideQueryParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<String>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(sql.to_string())
+    }
+
+    fn get_parameter_types(&self, _stmt: &String) -> PgWireResult<Vec<Type>> {
+        // No parameterized queries yet
+        Ok(vec![])
+    }
+
+    fn get_result_schema(
+        &self,
+        _stmt: &String,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<pgwire::api::results::FieldInfo>> {
+        // Lazy: schema determined at execution time, not parse time.
+        // Describe returns NoData; JDBC handles this gracefully.
+        Ok(vec![])
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for TeideHandler {
+    type Statement = String;
+    type QueryParser = TeideQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(TeideQueryParser)
+    }
+
+    async fn do_query<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<String>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = String>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let query = portal.statement.statement.as_str();
+        eprintln!("[extended] {query}");
+
+        // Check describe cache first (Describe already ran the query)
+        {
+            let mut cache = self.describe_cache.lock().await;
+            if let Some(wire_result) = cache.remove(query) {
+                // all_text=true: map all types to VARCHAR for extended protocol
+                let qr = encode::encode_wire_result(&wire_result, true)?;
+                return Ok(Response::Query(qr));
+            }
+        }
+
+        // Not cached (e.g. DDL, catalog, or Describe was skipped) — execute now
+        let mut responses = self.execute_sql(query).await?;
+        Ok(responses.remove(0))
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        statement: &StoredStatement<String>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = String>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &statement.statement;
+
+        // Execute the query now, cache results for do_query, return schema
+        let fields = self.describe_and_cache(sql).await?;
+
+        // No params (we don't support parameterized queries yet)
+        Ok(DescribeStatementResponse::new(vec![], fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<String>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = String>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &portal.statement.statement;
+
+        // Check if we already described (and cached) this statement
+        let cache = self.describe_cache.lock().await;
+        if let Some(wire_result) = cache.get(sql.as_str()) {
+            let fields: Vec<FieldInfo> = wire_result
+                .columns
+                .iter()
+                .map(|(name, _td_type)| {
+                    // All VARCHAR for extended protocol compatibility
+                    FieldInfo::new(name.clone(), None, None, Type::VARCHAR, FieldFormat::Text)
+                })
+                .collect();
+            return Ok(DescribePortalResponse::new(fields));
+        }
+
+        Ok(DescribePortalResponse::no_data())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom startup handler with clean ParameterStatus
+// ---------------------------------------------------------------------------
+
+/// Startup handler that sends ParameterStatus with clean server_version
+/// (no pgwire suffix) and proper settings for JDBC compatibility.
+pub struct TeideStartupHandler;
+
+#[async_trait]
+impl StartupHandler for TeideStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let pgwire::messages::PgWireFrontendMessage::Startup(ref startup) = message {
+            pgwire::api::auth::protocol_negotiation(client, startup).await?;
+            pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+
+            // Customized parameters: clean server_version, ISO MDY date style
+            let mut params = DefaultServerParameterProvider::default();
+            params.server_version = "16.6".to_string();
+            params.date_style = "ISO, MDY".to_string();
+
+            pgwire::api::auth::finish_authentication(client, &params).await?;
+        }
+        Ok(())
     }
 }
 
@@ -298,6 +610,7 @@ impl TeideHandlerFactory {
         TeideHandler {
             bridge,
             meta: self.meta.clone(),
+            describe_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -308,10 +621,10 @@ impl PgWireServerHandlers for TeideHandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(self.make_handler())
     }
 
-    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
-        Arc::new(NoopHandler)
+    fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        Arc::new(TeideStartupHandler)
     }
 }

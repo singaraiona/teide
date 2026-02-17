@@ -22,11 +22,7 @@
 //! Integration tests for the PostgreSQL wire protocol server.
 //!
 //! Starts teide-server as a child process, connects via tokio-postgres,
-//! and runs queries over the PG **simple** query protocol.
-//!
-//! We use `simple_query()` because the server only implements
-//! `SimpleQueryHandler` — `tokio_postgres::Client::query()` uses the
-//! extended query protocol which is handled by `NoopHandler`.
+//! and runs queries over both simple and extended query protocols.
 
 #![cfg(feature = "server")]
 #![allow(clippy::await_holding_lock)] // Intentional: serializes tests for C engine global state
@@ -195,5 +191,109 @@ async fn server_error_handling() {
             || msg.to_lowercase().contains("error")
             || msg.contains("XX000"),
         "error should indicate failure: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Extended Query Protocol tests (JDBC/DBeaver path)
+//
+// tokio_postgres::Client::query() uses Parse/Bind/Execute (extended protocol).
+// These tests verify that the ExtendedQueryHandler works correctly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn extended_select_count() {
+    let _lock = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let csv = create_test_csv();
+    let _server = start_server(15440, csv.path().to_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let client = connect(15440).await;
+    // query() uses extended protocol (Parse/Bind/Execute)
+    let rows = client
+        .query("SELECT COUNT(*) FROM t", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // Extended protocol returns text-format values since we return NoData for Describe
+    let count: &str = rows[0].get(0);
+    assert_eq!(count, "5");
+}
+
+#[tokio::test]
+async fn extended_group_by() {
+    let _lock = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let csv = create_test_csv();
+    let _server = start_server(15441, csv.path().to_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let client = connect(15441).await;
+    let rows = client
+        .query(
+            "SELECT name, SUM(value) AS total FROM t GROUP BY name ORDER BY total DESC",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let name0: &str = rows[0].get(0);
+    let total0: &str = rows[0].get(1);
+    assert_eq!(name0, "bob");
+    assert_eq!(total0, "70");
+}
+
+#[tokio::test]
+async fn extended_catalog_set() {
+    let _lock = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let csv = create_test_csv();
+    let _server = start_server(15442, csv.path().to_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let client = connect(15442).await;
+    // JDBC sends SET during handshake via extended protocol
+    client
+        .execute("SET extra_float_digits = 3", &[])
+        .await
+        .unwrap();
+    client
+        .execute("SET application_name = 'DBeaver'", &[])
+        .await
+        .unwrap();
+    // If we get here without error, the extended protocol handled SET correctly
+}
+
+#[tokio::test]
+async fn extended_select_constant() {
+    let _lock = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let csv = create_test_csv();
+    let _server = start_server(15443, csv.path().to_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let client = connect(15443).await;
+    // Health-check ping via extended protocol
+    let rows = client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: &str = rows[0].get(0);
+    assert_eq!(val, "1");
+}
+
+#[tokio::test]
+async fn extended_error_handling() {
+    let _lock = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let csv = create_test_csv();
+    let _server = start_server(15444, csv.path().to_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let client = connect(15444).await;
+    let err = client
+        .query("SELECT * FROM nonexistent", &[])
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("nonexistent")
+            || msg.to_lowercase().contains("error")
+            || msg.contains("XX000"),
+        "extended protocol error should indicate failure: {msg}"
     );
 }

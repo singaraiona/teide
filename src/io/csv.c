@@ -1356,3 +1356,107 @@ fail_unmap:
 td_t* td_read_csv(const char* path) {
     return td_read_csv_opts(path, 0, true, NULL, 0);
 }
+
+/* ============================================================================
+ * td_write_csv — Write a table to a CSV file (RFC 4180)
+ *
+ * Writes header row with column names, then data rows.
+ * Strings containing commas, quotes, or newlines are quoted.
+ * Returns TD_OK on success, error code on failure.
+ * ============================================================================ */
+
+/* Write a string value, quoting if it contains special chars */
+static void csv_write_str(FILE* fp, const char* s, size_t len) {
+    int need_quote = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == ',' || s[i] == '"' || s[i] == '\n' || s[i] == '\r') {
+            need_quote = 1;
+            break;
+        }
+    }
+    if (need_quote) {
+        fputc('"', fp);
+        for (size_t i = 0; i < len; i++) {
+            if (s[i] == '"') fputc('"', fp);
+            fputc(s[i], fp);
+        }
+        fputc('"', fp);
+    } else {
+        fwrite(s, 1, len, fp);
+    }
+}
+
+td_err_t td_write_csv(td_t* table, const char* path) {
+    if (!table || !path) return TD_ERR_TYPE;
+
+    int64_t ncols = td_table_ncols(table);
+    int64_t nrows = td_table_nrows(table);
+    if (ncols <= 0) return TD_ERR_TYPE;
+
+    FILE* fp = fopen(path, "w");
+    if (!fp) return TD_ERR_IO;
+
+    /* Header row: column names */
+    for (int64_t c = 0; c < ncols; c++) {
+        if (c > 0) fputc(',', fp);
+        int64_t name_id = td_table_col_name(table, c);
+        td_t* name_atom = td_sym_str(name_id);
+        if (name_atom) {
+            const char* s = td_str_ptr(name_atom);
+            size_t slen = td_str_len(name_atom);
+            csv_write_str(fp, s, slen);
+        }
+    }
+    fputc('\n', fp);
+
+    /* Data rows */
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t c = 0; c < ncols; c++) {
+            if (c > 0) fputc(',', fp);
+            td_t* col = td_table_get_col_idx(table, c);
+            if (!col) continue;
+            int8_t t = col->type;
+            switch (t) {
+            case TD_I64: {
+                int64_t v = ((const int64_t*)td_data(col))[r];
+                fprintf(fp, "%ld", (long)v);
+                break;
+            }
+            case TD_I32: {
+                int32_t v = ((const int32_t*)td_data(col))[r];
+                fprintf(fp, "%d", v);
+                break;
+            }
+            case TD_F64: {
+                double v = ((const double*)td_data(col))[r];
+                fprintf(fp, "%.17g", v);
+                break;
+            }
+            case TD_BOOL: case TD_U8: {
+                uint8_t v = ((const uint8_t*)td_data(col))[r];
+                if (t == TD_BOOL) fputs(v ? "true" : "false", fp);
+                else fprintf(fp, "%u", (unsigned)v);
+                break;
+            }
+            case TD_SYM: {
+                int64_t sym = ((const int64_t*)td_data(col))[r];
+                td_t* s = td_sym_str(sym);
+                if (s) csv_write_str(fp, td_str_ptr(s), td_str_len(s));
+                break;
+            }
+            case TD_ENUM: {
+                uint32_t sym = ((const uint32_t*)td_data(col))[r];
+                td_t* s = td_sym_str((int64_t)sym);
+                if (s) csv_write_str(fp, td_str_ptr(s), td_str_len(s));
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        fputc('\n', fp);
+    }
+
+    fclose(fp);
+    return TD_OK;
+}

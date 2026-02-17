@@ -321,6 +321,7 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define OP_STDDEV_POP   73
 #define OP_VAR          74
 #define OP_VAR_POP      75
+#define OP_ILIKE        76
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -694,6 +695,7 @@ td_op_t* td_min2(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_max2(td_graph_t* g, td_op_t* a, td_op_t* b);
 td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_val);
 td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern);
+td_op_t* td_ilike(td_graph_t* g, td_op_t* input, td_op_t* pattern);
 td_op_t* td_upper(td_graph_t* g, td_op_t* a);
 td_op_t* td_lower(td_graph_t* g, td_op_t* a);
 td_op_t* td_strlen(td_graph_t* g, td_op_t* a);
@@ -785,6 +787,7 @@ td_t*    td_meta_load_d(const char* path);
 td_t* td_read_csv(const char* path);
 td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
                         const int8_t* col_types, int32_t n_types);
+td_err_t td_write_csv(td_t* table, const char* path);
 
 
 /* ===== Pool / Parallel API ===== */

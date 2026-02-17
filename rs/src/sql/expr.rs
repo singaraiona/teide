@@ -222,7 +222,7 @@ pub fn plan_expr(
             }
         }
 
-        // ILIKE (case-insensitive)
+        // ILIKE (case-insensitive) — native OP_ILIKE avoids LOWER() temporaries
         Expr::ILike {
             negated,
             expr: inner,
@@ -230,15 +230,8 @@ pub fn plan_expr(
             ..
         } => {
             let input = plan_expr(g, inner, schema)?;
-            let input_ci = g.lower(input)?;
-            let pat_ci = match pattern.as_ref() {
-                Expr::Value(Value::SingleQuotedString(s)) => g.const_str(&s.to_lowercase())?,
-                _ => {
-                    let pat = plan_expr(g, pattern, schema)?;
-                    g.lower(pat)?
-                }
-            };
-            let result = g.like(input_ci, pat_ci)?;
+            let pat = plan_expr(g, pattern, schema)?;
+            let result = g.ilike(input, pat)?;
             if *negated {
                 Ok(g.not(result)?)
             } else {

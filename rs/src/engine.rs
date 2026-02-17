@@ -715,6 +715,17 @@ impl Table {
         }
     }
 
+    /// Write this table to a CSV file.
+    pub fn write_csv(&self, path: &str) -> Result<()> {
+        let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
+        let err = unsafe { ffi::td_write_csv(self.raw, c_path.as_ptr()) };
+        if err != ffi::td_err_t::TD_OK {
+            Err(Error::from_code(err))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Raw column vector at index (returns None for out-of-range or error).
     pub fn get_col_idx(&self, idx: i64) -> Option<*mut ffi::td_t> {
         let p = unsafe { ffi::td_table_get_col_idx(self.raw, idx) };
@@ -1183,6 +1194,10 @@ impl Graph<'_> {
 
     pub fn like(&self, input: Column, pattern: Column) -> Result<Column> {
         Self::check_op(unsafe { ffi::td_like(self.raw, input.raw, pattern.raw) })
+    }
+
+    pub fn ilike(&self, input: Column, pattern: Column) -> Result<Column> {
+        Self::check_op(unsafe { ffi::td_ilike(self.raw, input.raw, pattern.raw) })
     }
 
     // ---- String ops -------------------------------------------------------

@@ -197,6 +197,7 @@ pub const OP_WINDOW: u16 = 72;
 pub const OP_STDDEV_POP: u16 = 73;
 pub const OP_VAR: u16 = 74;
 pub const OP_VAR_POP: u16 = 75;
+pub const OP_ILIKE: u16 = 76;
 
 // Window function kinds
 pub const TD_WIN_ROW_NUMBER: u8 = 0;
@@ -690,6 +691,7 @@ extern "C" {
         else_val: *mut td_op_t,
     ) -> *mut td_op_t;
     pub fn td_like(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_ilike(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t) -> *mut td_op_t;
     pub fn td_upper(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_lower(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_strlen(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
@@ -843,6 +845,7 @@ extern "C" {
         col_types: *const i8,
         n_types: i32,
     ) -> *mut td_t;
+    pub fn td_write_csv(table: *mut td_t, path: *const c_char) -> td_err_t;
 
     // --- Pool / Parallel API ---
     pub fn td_pool_init(n_workers: u32) -> td_err_t;

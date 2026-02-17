@@ -164,8 +164,15 @@ Based on impact vs effort:
 | 4 | Pass D: SELECT→GROUP fusion | Avoids copy | Low-Medium | **DONE** — `pick_columns()` for simple projection, no 2nd graph |
 | 5 | Pass A: Predicate pushdown | Reduces GROUP/JOIN input | Medium | Handled at SQL planner level (WHERE before GROUP BY) |
 | 6 | COUNT_DISTINCT (two-phase) | SQL completeness | Medium | Works via Rust planner two-phase GROUP BY |
-| 7 | STDDEV Welford merge | Partitioned STDDEV | Medium | Deferred — per-partition path works for non-partitioned |
+| 7 | STDDEV Welford merge | Partitioned STDDEV | Medium | **DONE** — SUM+SUM(x²)+COUNT decomposition, per-partition merge |
 | 8 | Pass B: Projection pushdown | Reduces JOIN/SORT columns | Medium-High | Implicit — exec_group only reads referenced columns |
+
+## Additional Completed Items (from engine audit)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| ILIKE native opcode | Case-insensitive LIKE without LOWER() temporaries | **DONE** — OP_ILIKE (opcode 76), `ilike_match()` inline CI compare |
+| CSV write API | Write table to CSV file | **DONE** — `td_write_csv()` in csv.c, RFC 4180 quoting |
 
 ## Materialization Points (Rust Planner Reference)
 

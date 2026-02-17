@@ -5132,7 +5132,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
 static td_t* exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                                        int32_t n_parts, const int64_t* key_syms,
                                        const int64_t* agg_syms, int has_avg,
-                                       int64_t group_limit);
+                                       int has_stddev, int64_t group_limit);
 
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
@@ -5163,9 +5163,11 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
 
     /* Check eligibility for per-partition exec + merge:
      * - All keys and agg inputs must be simple SCANs
-     * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG, FIRST, LAST */
+     * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG, FIRST, LAST,
+     *   STDDEV, STDDEV_POP, VAR, VAR_POP */
     int can_partition = 1;
     int has_avg = 0;
+    int has_stddev = 0;
     int64_t key_syms[8];
     for (uint8_t k = 0; k < n_keys && can_partition; k++) {
         td_op_ext_t* ke = find_ext(g, ext->keys[k]->id);
@@ -5177,8 +5179,11 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
         uint16_t aop = ext->agg_ops[a];
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN &&
             aop != OP_MAX && aop != OP_AVG && aop != OP_FIRST &&
-            aop != OP_LAST) { can_partition = 0; break; }
+            aop != OP_LAST && aop != OP_STDDEV && aop != OP_STDDEV_POP &&
+            aop != OP_VAR && aop != OP_VAR_POP) { can_partition = 0; break; }
         if (aop == OP_AVG) has_avg = 1;
+        if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
+            aop == OP_VAR || aop == OP_VAR_POP) has_stddev = 1;
         td_op_ext_t* ae = find_ext(g, ext->agg_ins[a]->id);
         if (!ae || ae->base.opcode != OP_SCAN) { can_partition = 0; break; }
         agg_syms[a] = ae->sym;
@@ -5243,7 +5248,7 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
     if (can_partition) {
         td_t* result = exec_group_per_partition(parted_tbl, ext, n_parts,
                                                  key_syms, agg_syms, has_avg,
-                                                 group_limit);
+                                                 has_stddev, group_limit);
         if (result) return result;
         /* NULL = per-partition failed, fall through to concat */
     }
@@ -6602,6 +6607,8 @@ cleanup:
  *
  * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
  * AVG: decomposed into SUM+COUNT per partition, merged, then divided.
+ * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+COUNT(x) per partition,
+ *   merged with SUM, then final variance/stddev computed from merged totals.
  *
  * Returns NULL if any step fails (caller falls through to concat path).
  * -------------------------------------------------------------------------- */
@@ -6609,14 +6616,14 @@ static td_t* __attribute__((noinline))
 exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                          int32_t n_parts, const int64_t* key_syms,
                          const int64_t* agg_syms, int has_avg,
-                         int64_t group_limit) {
+                         int has_stddev, int64_t group_limit) {
 
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
 
-    /* Guard: fixed-size arrays below cap at 16 agg ops and 8 AVG slots.
-     * n_aggs + n_avg <= 16 must hold (n_avg <= n_aggs), and n_keys <= 8
-     * for avg_idx.  Return NULL to fall through to concat path. */
+    /* Guard: fixed-size arrays below cap at 24 agg ops.
+     * Each AVG adds 1 extra (COUNT), each STDDEV/VAR adds 2 (SUM_SQ + COUNT).
+     * n_aggs + n_avg + 2*n_std must stay within 24. */
     if (n_aggs > 8 || n_keys > 8) return NULL;
 
     /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
@@ -6641,42 +6648,80 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
     if (group_limit > 0 && n_part_keys == 0 && group_limit < n_parts)
         n_parts = (int32_t)group_limit;
 
-    /* AVG decomposition: for merge, AVG(x) becomes SUM(x) + COUNT(x).
-     * Build the per-partition agg_ops: replace AVG with SUM, then append
-     * COUNT for each AVG slot. */
-    uint16_t part_ops[16];   /* per-partition agg ops (n_aggs + n_avg <= 16) */
-    uint16_t merge_ops[16];  /* merge agg ops */
+    /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
+     * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
+     * Build per-partition agg_ops with decomposed ops, then merge ops. */
+    uint16_t part_ops[24];   /* per-partition agg ops */
+    uint16_t merge_ops[24];  /* merge agg ops */
     uint8_t  avg_idx[8];     /* which original agg slots are AVG */
+    uint8_t  std_idx[8];     /* which original agg slots are STDDEV/VAR */
+    uint16_t std_orig_op[8]; /* original op for each std slot */
     uint8_t  n_avg = 0;
+    uint8_t  n_std = 0;
     uint8_t  part_n_aggs = n_aggs;
+    /* stddev_needs_sq[a]: index into part_ops for the SUM(x²) slot */
+    uint8_t  std_sq_slot[8];
+    uint8_t  std_cnt_slot[8];
 
     for (uint8_t a = 0; a < n_aggs; a++) {
-        if (ext->agg_ops[a] == OP_AVG) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop == OP_AVG) {
             part_ops[a] = OP_SUM;     /* partition: compute SUM */
             avg_idx[n_avg++] = a;
+        } else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
+                   aop == OP_VAR || aop == OP_VAR_POP) {
+            part_ops[a] = OP_SUM;     /* partition: compute SUM(x) */
+            std_orig_op[n_std] = aop;
+            std_idx[n_std++] = a;
         } else {
-            part_ops[a] = ext->agg_ops[a];
+            part_ops[a] = aop;
         }
     }
-    /* Append COUNT for each AVG column */
-    for (uint8_t i = 0; i < n_avg; i++) {
-        part_ops[part_n_aggs] = OP_COUNT;
-        part_n_aggs++;
+    /* Guard: total decomposed slots must fit */
+    if (n_aggs + n_avg + 2 * n_std > 24) return NULL;
+
+    /* Append SUM(x²) for each STDDEV/VAR slot */
+    for (uint8_t i = 0; i < n_std; i++) {
+        std_sq_slot[i] = part_n_aggs;
+        part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
+    /* Append COUNT for each AVG column */
+    for (uint8_t i = 0; i < n_avg; i++)
+        part_ops[part_n_aggs++] = OP_COUNT;
+    /* Append COUNT for each STDDEV/VAR column */
+    for (uint8_t i = 0; i < n_std; i++) {
+        std_cnt_slot[i] = part_n_aggs;
+        part_ops[part_n_aggs++] = OP_COUNT;
+    }
+
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
-     * FIRST→FIRST, LAST→LAST, plus the appended COUNT cols → SUM */
+     * FIRST→FIRST, LAST→LAST, all appended slots → SUM */
     for (uint8_t a = 0; a < part_n_aggs; a++) {
         merge_ops[a] = part_ops[a];
         if (merge_ops[a] == OP_COUNT) merge_ops[a] = OP_SUM;
     }
 
-    /* AVG agg input syms: the input column for each AVG's COUNT
-     * is the same as the input column for the AVG itself. */
-    int64_t part_agg_syms[16];
+    /* Agg input syms for the decomposed ops.
+     * AVG's COUNT uses same input column as the AVG itself.
+     * STDDEV's SUM(x²) and COUNT use same input column as the STDDEV. */
+    int64_t part_agg_syms[24];
+    /* Flag: slot needs x*x graph node (for SUM(x²)) */
+    int part_needs_sq[24];
+    memset(part_needs_sq, 0, sizeof(part_needs_sq));
+
     for (uint8_t a = 0; a < n_aggs; a++)
         part_agg_syms[a] = agg_syms[a];
+    /* SUM(x²) slots for STDDEV/VAR */
+    for (uint8_t i = 0; i < n_std; i++) {
+        part_agg_syms[std_sq_slot[i]] = agg_syms[std_idx[i]];
+        part_needs_sq[std_sq_slot[i]] = 1;
+    }
+    /* COUNT slots for AVG */
     for (uint8_t i = 0; i < n_avg; i++)
-        part_agg_syms[n_aggs + i] = agg_syms[avg_idx[i]];
+        part_agg_syms[n_aggs + n_std + i] = agg_syms[avg_idx[i]];
+    /* COUNT slots for STDDEV/VAR */
+    for (uint8_t i = 0; i < n_std; i++)
+        part_agg_syms[std_cnt_slot[i]] = agg_syms[std_idx[i]];
 
     /* Phase 1: exec_group per partition (zero-copy sub-tables) */
     td_t* partials[n_parts];
@@ -6684,7 +6729,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
 
     for (int32_t p = 0; p < n_parts; p++) {
         /* Collect unique agg input sym IDs (avoid duplicate columns) */
-        int64_t unique_agg[16];
+        int64_t unique_agg[24];
         int n_unique_agg = 0;
         for (uint8_t a = 0; a < part_n_aggs; a++) {
             int dup = 0;
@@ -6729,10 +6774,16 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
             td_t* sym_atom = td_sym_str(pk_syms[k]);
             pkeys[k] = td_scan(pg, td_str_ptr(sym_atom));
         }
-        td_op_t* pagg_ins[16];
+        td_op_t* pagg_ins[24];
         for (uint8_t a = 0; a < part_n_aggs; a++) {
             td_t* sym_atom = td_sym_str(part_agg_syms[a]);
             pagg_ins[a] = td_scan(pg, td_str_ptr(sym_atom));
+        }
+        /* For SUM(x²) slots: replace scan with td_mul(scan_x, scan_x) */
+        for (uint8_t i = 0; i < n_std; i++) {
+            uint8_t sq = std_sq_slot[i];
+            td_op_t* x = pagg_ins[sq]; /* already a scan for the same column */
+            pagg_ins[sq] = td_mul(pg, x, x);
         }
 
         td_op_t* proot = td_group(pg, pkeys, n_part_keys, part_ops, pagg_ins, part_n_aggs);
@@ -6833,7 +6884,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
 
     /* Scan partial agg result columns by their output names.
      * Agg columns start at n_part_keys in merge_tbl (MAPCOMMON keys appended after). */
-    td_op_t* magg_ins[16];
+    td_op_t* magg_ins[24];
     for (uint8_t a = 0; a < part_n_aggs; a++) {
         int64_t agg_name_id = td_table_col_name(merge_tbl, (int64_t)n_part_keys + a);
         td_t* agg_name = td_sym_str(agg_name_id);
@@ -6852,9 +6903,9 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
 
     int64_t rncols = td_table_ncols(result);
 
-    /* AVG post-processing: build trimmed table (n_keys + n_aggs cols),
-     * replacing merged-SUM columns with SUM/COUNT for AVG slots. */
-    if (has_avg) {
+    /* AVG/STDDEV post-processing: build trimmed table (n_keys + n_aggs cols),
+     * computing final AVG = SUM/COUNT and STDDEV/VAR from SUM, SUM_SQ, COUNT. */
+    if (has_avg || has_stddev) {
         td_t* trimmed = td_table_new((int64_t)(n_keys + n_aggs));
         if (!trimmed || TD_IS_ERR(trimmed)) {
             td_release(result);
@@ -6866,19 +6917,24 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         for (int64_t c = 0; c < (int64_t)(n_keys + n_aggs) && c < rncols; c++) {
             int64_t nm = td_table_col_name(result, c);
 
-            /* Check if this agg column is an AVG slot */
-            int is_avg_slot = 0;
-            uint8_t avg_i = 0;
+            /* Check if this agg column is an AVG or STDDEV/VAR slot */
+            int is_avg_slot = 0, is_std_slot = 0;
+            uint8_t avg_i = 0, std_i = 0;
             if (c >= n_keys) {
                 uint8_t a = (uint8_t)(c - n_keys);
                 for (uint8_t j = 0; j < n_avg; j++) {
                     if (avg_idx[j] == a) { is_avg_slot = 1; avg_i = j; break; }
                 }
+                for (uint8_t j = 0; j < n_std; j++) {
+                    if (std_idx[j] == a) { is_std_slot = 1; std_i = j; break; }
+                }
             }
 
             if (is_avg_slot) {
+                /* AVG = SUM(x) / COUNT(x) */
                 int64_t sum_ci = c;
-                int64_t cnt_ci = (int64_t)n_keys + n_aggs + avg_i;
+                /* AVG COUNT slots: after n_aggs + n_std SUM_SQ slots */
+                int64_t cnt_ci = (int64_t)n_keys + n_aggs + n_std + avg_i;
                 td_t* sum_col = td_table_get_col_idx(result, sum_ci);
                 td_t* cnt_col = (cnt_ci < rncols) ? td_table_get_col_idx(result, cnt_ci) : NULL;
                 if (!sum_col || !cnt_col) {
@@ -6893,10 +6949,8 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                 int64_t nrows = sum_col->len;
                 td_t* avg_col = td_vec_new(TD_F64, nrows);
                 if (!avg_col || TD_IS_ERR(avg_col)) {
-                    td_release(trimmed);
-                    td_release(result);
-                    td_graph_free(mg);
-                    td_release(merge_tbl);
+                    td_release(trimmed); td_release(result);
+                    td_graph_free(mg); td_release(merge_tbl);
                     return NULL;
                 }
                 avg_col->len = nrows;
@@ -6915,6 +6969,70 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                 }
                 trimmed = td_table_add_col(trimmed, nm, avg_col);
                 td_release(avg_col);
+            } else if (is_std_slot) {
+                /* STDDEV/VAR from merged SUM(x), SUM(x²), COUNT(x):
+                 * var_pop = SUM_SQ/N - (SUM/N)²
+                 * var_samp = var_pop * N/(N-1)
+                 * stddev_pop = sqrt(var_pop), stddev_samp = sqrt(var_samp) */
+                int64_t sum_ci = c;
+                int64_t sq_ci  = (int64_t)n_keys + std_sq_slot[std_i];
+                int64_t cnt_ci = (int64_t)n_keys + std_cnt_slot[std_i];
+                td_t* sum_col = td_table_get_col_idx(result, sum_ci);
+                td_t* sq_col  = (sq_ci < rncols) ? td_table_get_col_idx(result, sq_ci) : NULL;
+                td_t* cnt_col = (cnt_ci < rncols) ? td_table_get_col_idx(result, cnt_ci) : NULL;
+                if (!sum_col || !sq_col || !cnt_col) {
+                    if (sum_col) {
+                        td_retain(sum_col);
+                        trimmed = td_table_add_col(trimmed, nm, sum_col);
+                        td_release(sum_col);
+                    }
+                    continue;
+                }
+
+                int64_t nrows = sum_col->len;
+                td_t* out_col = td_vec_new(TD_F64, nrows);
+                if (!out_col || TD_IS_ERR(out_col)) {
+                    td_release(trimmed); td_release(result);
+                    td_graph_free(mg); td_release(merge_tbl);
+                    return NULL;
+                }
+                out_col->len = nrows;
+                double* out = (double*)td_data(out_col);
+
+                uint16_t orig_op = std_orig_op[std_i];
+                /* SUM(x) is always F64 after merge (SUM produces F64 for F64 input,
+                 * I64 for integer input; SUM(x²) via td_mul always produces F64). */
+                const double* sq = (const double*)td_data(sq_col);
+                const int64_t* cv = (const int64_t*)td_data(cnt_col);
+                if (sum_col->type == TD_F64) {
+                    const double* sv = (const double*)td_data(sum_col);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        double n = (double)cv[r];
+                        if (n <= 0) { out[r] = NAN; continue; }
+                        double mean = sv[r] / n;
+                        double var_pop = sq[r] / n - mean * mean;
+                        if (var_pop < 0) var_pop = 0;
+                        if (orig_op == OP_VAR_POP)         out[r] = var_pop;
+                        else if (orig_op == OP_VAR)         out[r] = n > 1 ? var_pop * n / (n - 1) : NAN;
+                        else if (orig_op == OP_STDDEV_POP)  out[r] = sqrt(var_pop);
+                        else /* OP_STDDEV */                out[r] = n > 1 ? sqrt(var_pop * n / (n - 1)) : NAN;
+                    }
+                } else {
+                    const int64_t* sv = (const int64_t*)td_data(sum_col);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        double n = (double)cv[r];
+                        if (n <= 0) { out[r] = NAN; continue; }
+                        double mean = (double)sv[r] / n;
+                        double var_pop = sq[r] / n - mean * mean;
+                        if (var_pop < 0) var_pop = 0;
+                        if (orig_op == OP_VAR_POP)         out[r] = var_pop;
+                        else if (orig_op == OP_VAR)         out[r] = n > 1 ? var_pop * n / (n - 1) : NAN;
+                        else if (orig_op == OP_STDDEV_POP)  out[r] = sqrt(var_pop);
+                        else /* OP_STDDEV */                out[r] = n > 1 ? sqrt(var_pop * n / (n - 1)) : NAN;
+                    }
+                }
+                trimmed = td_table_add_col(trimmed, nm, out_col);
+                td_release(out_col);
             } else {
                 td_t* col = td_table_get_col_idx(result, c);
                 if (col) {
@@ -7656,6 +7774,75 @@ static td_t* exec_like(td_graph_t* g, td_op_t* op) {
         }
     } else {
         /* Non-string type: all false */
+        memset(dst, 0, (size_t)len);
+    }
+
+    td_release(input); td_release(pat_v);
+    return result;
+}
+
+/* Case-insensitive LIKE: compare characters via tolower(). */
+static bool ilike_match(const char* str, size_t slen, const char* pat, size_t plen) {
+    size_t si = 0, pi = 0;
+    size_t star_p = (size_t)-1, star_s = 0;
+    while (si < slen) {
+        if (pi < plen && pat[pi] != '%') {
+            unsigned char sc = (unsigned char)str[si];
+            unsigned char pc = (unsigned char)pat[pi];
+            if (pc == '_' || (sc >= 'A' && sc <= 'Z' ? sc + 32 : sc) ==
+                             (pc >= 'A' && pc <= 'Z' ? pc + 32 : pc)) {
+                si++; pi++;
+            } else if (star_p != (size_t)-1) {
+                pi = star_p + 1; star_s++; si = star_s;
+            } else {
+                return false;
+            }
+        } else if (pi < plen && pat[pi] == '%') {
+            star_p = pi; star_s = si; pi++;
+        } else if (star_p != (size_t)-1) {
+            pi = star_p + 1; star_s++; si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while (pi < plen && pat[pi] == '%') pi++;
+    return pi == plen;
+}
+
+static td_t* exec_ilike(td_graph_t* g, td_op_t* op) {
+    td_t* input = exec_node(g, op->inputs[0]);
+    td_t* pat_v = exec_node(g, op->inputs[1]);
+    if (!input || TD_IS_ERR(input)) { if (pat_v && !TD_IS_ERR(pat_v)) td_release(pat_v); return input; }
+    if (!pat_v || TD_IS_ERR(pat_v)) { td_release(input); return pat_v; }
+
+    const char* pat_str = td_str_ptr(pat_v);
+    size_t pat_len = td_str_len(pat_v);
+
+    int64_t len = input->len;
+    td_t* result = td_vec_new(TD_BOOL, len);
+    if (!result || TD_IS_ERR(result)) {
+        td_release(input); td_release(pat_v);
+        return result;
+    }
+    result->len = len;
+    uint8_t* dst = (uint8_t*)td_data(result);
+
+    int8_t in_type = input->type;
+    if (in_type == TD_ENUM) {
+        uint32_t* data = (uint32_t*)td_data(input);
+        for (int64_t i = 0; i < len; i++) {
+            td_t* s = td_sym_str((int64_t)data[i]);
+            if (!s) { dst[i] = 0; continue; }
+            dst[i] = ilike_match(td_str_ptr(s), td_str_len(s), pat_str, pat_len) ? 1 : 0;
+        }
+    } else if (in_type == TD_SYM) {
+        int64_t* data = (int64_t*)td_data(input);
+        for (int64_t i = 0; i < len; i++) {
+            td_t* s = td_sym_str(data[i]);
+            if (!s) { dst[i] = 0; continue; }
+            dst[i] = ilike_match(td_str_ptr(s), td_str_len(s), pat_str, pat_len) ? 1 : 0;
+        }
+    } else {
         memset(dst, 0, (size_t)len);
     }
 
@@ -9732,6 +9919,10 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
 
         case OP_LIKE: {
             return exec_like(g, op);
+        }
+
+        case OP_ILIKE: {
+            return exec_ilike(g, op);
         }
 
         case OP_UPPER: case OP_LOWER: case OP_TRIM: {

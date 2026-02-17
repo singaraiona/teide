@@ -457,6 +457,10 @@ td_op_t* td_like(td_graph_t* g, td_op_t* input, td_op_t* pattern) {
     return make_binary(g, OP_LIKE, input, pattern, TD_BOOL);
 }
 
+td_op_t* td_ilike(td_graph_t* g, td_op_t* input, td_op_t* pattern) {
+    return make_binary(g, OP_ILIKE, input, pattern, TD_BOOL);
+}
+
 /* String ops */
 td_op_t* td_upper(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_UPPER, a, TD_SYM); }
 td_op_t* td_lower(td_graph_t* g, td_op_t* a)   { return make_unary(g, OP_LOWER, a, TD_SYM); }

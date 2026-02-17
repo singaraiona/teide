@@ -400,7 +400,7 @@ impl Context {
     /// Read a CSV file with custom options.
     ///
     /// Pass `col_types: None` to auto-infer types from a sample.
-    /// Pass `col_types: Some(&[TD_I64, TD_F64, TD_ENUM, ...])` to specify exact types.
+    /// Pass `col_types: Some(&[TD_I64, TD_F64, TD_SYM, ...])` to specify exact types.
     pub fn read_csv_opts(
         &self,
         path: &str,
@@ -783,10 +783,7 @@ impl Table {
 
     /// Resolve a logical row in a TD_MAPCOMMON column to its partition index.
     /// MAPCOMMON stores [key_values, row_counts] as two td_t pointers.
-    unsafe fn resolve_mapcommon_part(
-        vec: *mut ffi::td_t,
-        row: usize,
-    ) -> Option<usize> {
+    unsafe fn resolve_mapcommon_part(vec: *mut ffi::td_t, row: usize) -> Option<usize> {
         let ptrs = unsafe { ffi::td_data(vec) as *const *mut ffi::td_t };
         let rc_vec = unsafe { *ptrs.add(1) }; // row_counts
         let n_parts = unsafe { ffi::td_len(rc_vec) } as usize;
@@ -873,7 +870,7 @@ impl Table {
     unsafe fn read_i64_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<i64> {
         let data = unsafe { ffi::td_data(vec) };
         match t {
-            ffi::TD_I64 | ffi::TD_SYM | ffi::TD_TIME | ffi::TD_TIMESTAMP => {
+            ffi::TD_I64 | ffi::TD_TIME | ffi::TD_TIMESTAMP => {
                 let p = data as *const i64;
                 Some(unsafe { *p.add(row) })
             }
@@ -885,9 +882,9 @@ impl Table {
                 let p = data as *const i32;
                 Some(unsafe { *p.add(row) } as i64)
             }
-            ffi::TD_ENUM => {
-                let p = data as *const u32;
-                Some(unsafe { *p.add(row) } as i64)
+            ffi::TD_SYM => {
+                let attrs = unsafe { ffi::td_attrs(vec) };
+                Some(unsafe { ffi::read_sym(data as *const u8, row, t, attrs) })
             }
             _ => None,
         }
@@ -927,7 +924,7 @@ impl Table {
         }
     }
 
-    /// Read a string value from a SYM, ENUM, or MAPCOMMON column at `col`, `row`.
+    /// Read a string value from a SYM or MAPCOMMON column at `col`, `row`.
     pub fn get_str(&self, col: usize, row: usize) -> Option<String> {
         let vec = self.get_col_idx(col as i64)?;
         let t = unsafe { ffi::td_type(vec) };
@@ -939,7 +936,9 @@ impl Table {
             return match kv_type {
                 ffi::TD_SYM => {
                     let atom = unsafe { ffi::td_sym_str(val) };
-                    if atom.is_null() { return None; }
+                    if atom.is_null() {
+                        return None;
+                    }
                     unsafe {
                         let ptr = ffi::td_str_ptr(atom);
                         let slen = ffi::td_str_len(atom);
@@ -966,7 +965,7 @@ impl Table {
         unsafe { Self::read_str_from_vec(vec, t, row) }
     }
 
-    /// Read a string from a flat (non-parted) SYM or ENUM vector.
+    /// Read a string from a flat (non-parted) SYM vector.
     /// Format days since 2000-01-01 as "YYYY-MM-DD" string.
     /// Inverse of Hinnant civil_from_days algorithm.
     pub fn format_date(days_since_2000: i32) -> String {
@@ -986,12 +985,9 @@ impl Table {
     unsafe fn read_str_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<String> {
         let sym_id = match t {
             ffi::TD_SYM => {
-                let data = unsafe { ffi::td_data(vec) as *const i64 };
-                unsafe { *data.add(row) }
-            }
-            ffi::TD_ENUM => {
-                let data = unsafe { ffi::td_data(vec) as *const u32 };
-                (unsafe { *data.add(row) }) as i64
+                let data = unsafe { ffi::td_data(vec) as *const u8 };
+                let attrs = unsafe { ffi::td_attrs(vec) };
+                unsafe { ffi::read_sym(data, row, t, attrs) }
             }
             _ => return None,
         };
@@ -1352,9 +1348,7 @@ impl Graph<'_> {
     /// Distinct — GROUP BY with 0 aggregates, returns unique key combinations.
     pub fn distinct(&mut self, keys: &[Column]) -> Result<Column> {
         let mut key_ptrs: Vec<*mut ffi::td_op_t> = keys.iter().map(|c| c.raw).collect();
-        let raw = unsafe {
-            ffi::td_distinct(self.raw, key_ptrs.as_mut_ptr(), to_u8(keys.len())?)
-        };
+        let raw = unsafe { ffi::td_distinct(self.raw, key_ptrs.as_mut_ptr(), to_u8(keys.len())?) };
         self._pinned.push(Box::new(key_ptrs));
         Self::check_op(raw)
     }
@@ -1793,5 +1787,4 @@ pub mod types {
     pub const TIMESTAMP: i8 = super::ffi::TD_TIMESTAMP;
     pub const TABLE: i8 = super::ffi::TD_TABLE;
     pub const SYM: i8 = super::ffi::TD_SYM;
-    pub const ENUM: i8 = super::ffi::TD_ENUM;
 }

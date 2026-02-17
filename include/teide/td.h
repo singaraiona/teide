@@ -109,13 +109,28 @@ extern "C" {
 #define TD_TIMESTAMP 11
 #define TD_GUID      12
 #define TD_TABLE     13
-#define TD_SYM       14
-#define TD_ENUM      15
 #define TD_SEL       16   /* selection bitmap (lazy filter) */
+
+/* Unified dictionary-encoded string column (adaptive width) */
+#define TD_SYM       20
+
+/* Symbol width encoding (lower 2 bits of attrs when type == TD_SYM) */
+#define TD_SYM_W_MASK   0x03
+#define TD_SYM_W8       0x00   /* uint8_t  indices — dict ≤ 255 entries */
+#define TD_SYM_W16      0x01   /* uint16_t indices — dict ≤ 65,535 */
+#define TD_SYM_W32      0x02   /* uint32_t indices — dict ≤ 4,294,967,295 */
+#define TD_SYM_W64      0x03   /* uint64_t indices — dict > 4B entries */
+
+/* Helper macros */
+#define TD_IS_SYM(t)         ((t) == TD_SYM)
+#define TD_SYM_ELEM(attrs)   (1u << ((attrs) & TD_SYM_W_MASK))  /* 1,2,4,8 */
+
+/* Dictionary metadata key (splay tree) */
+#define TD_META_DICT  0x4449  /* "DI" — per-column dictionary */
 
 /* Parted types: composite of TD_PARTED_BASE + base type */
 #define TD_PARTED_BASE   32
-#define TD_MAPCOMMON     48   /* virtual partition column */
+#define TD_MAPCOMMON     64   /* virtual partition column */
 
 /* MAPCOMMON inferred sub-types (stored in attrs field) */
 #define TD_MC_SYM    0   /* opaque partition key strings */
@@ -139,10 +154,9 @@ extern "C" {
 #define TD_ATOM_TIMESTAMP  (-TD_TIMESTAMP)
 #define TD_ATOM_GUID       (-TD_GUID)
 #define TD_ATOM_SYM        (-TD_SYM)
-#define TD_ATOM_ENUM       (-TD_ENUM)
 
-/* Number of types (positive range) */
-#define TD_TYPE_COUNT 17
+/* Number of types (positive range): must be > max type ID */
+#define TD_TYPE_COUNT 21
 
 /* ===== Attribute Flags ===== */
 
@@ -199,7 +213,7 @@ typedef struct td_t {
     union {
         uint8_t  nullmap[16];
         struct { struct td_t* slice_parent; int64_t slice_offset; };
-        struct { struct td_t* ext_nullmap;  int64_t _reserved; };
+        struct { struct td_t* ext_nullmap;  struct td_t* sym_dict; };
     };
     /* Bytes 16-31: metadata + value */
     uint8_t  mmod;       /* 0=arena, 1=file-mmap, 2=direct-mmap */
@@ -213,7 +227,7 @@ typedef struct td_t {
         char     c8;     /* CHAR atom */
         int16_t  i16;    /* I16 atom */
         int32_t  i32;    /* I32 atom */
-        uint32_t u32;    /* ENUM atom (intern index) */
+        uint32_t u32;
         int64_t  i64;    /* I64/SYMBOL/DATE/TIME/TIMESTAMP atom */
         double   f64;    /* F64 atom */
         struct td_t* obj; /* pointer to child (long strings, GUID) */
@@ -233,6 +247,43 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define td_len(v)        ((v)->len)
 #define td_data(v)       ((void*)((char*)(v) + 32))
 #define td_elem_size(t)  (td_type_sizes[(t)])
+
+/* SYM-aware element size: returns adaptive width for TD_SYM columns */
+static inline uint8_t td_sym_elem_size(int8_t type, uint8_t attrs) {
+    if (type == TD_SYM) return (uint8_t)TD_SYM_ELEM(attrs);
+    return td_elem_size(type);
+}
+
+/* Read a dictionary index from a TD_SYM column (adaptive width) */
+static inline int64_t td_read_sym(const void* data, int64_t row, int8_t type, uint8_t attrs) {
+    (void)type; /* only TD_SYM now */
+    switch (attrs & TD_SYM_W_MASK) {
+        case TD_SYM_W8:  return ((const uint8_t*)data)[row];
+        case TD_SYM_W16: return ((const uint16_t*)data)[row];
+        case TD_SYM_W32: return ((const uint32_t*)data)[row];
+        case TD_SYM_W64: return ((const int64_t*)data)[row];
+    }
+    return 0;
+}
+
+/* Write a dictionary index into a TD_SYM column (adaptive width) */
+static inline void td_write_sym(void* data, int64_t row, uint64_t val, int8_t type, uint8_t attrs) {
+    (void)type; /* only TD_SYM now */
+    switch (attrs & TD_SYM_W_MASK) {
+        case TD_SYM_W8:  ((uint8_t*)data)[row]  = (uint8_t)val;  break;
+        case TD_SYM_W16: ((uint16_t*)data)[row] = (uint16_t)val; break;
+        case TD_SYM_W32: ((uint32_t*)data)[row] = (uint32_t)val; break;
+        case TD_SYM_W64: ((int64_t*)data)[row]  = (int64_t)val;  break;
+    }
+}
+
+/* Determine optimal SYM width for a given dictionary size */
+static inline uint8_t td_sym_dict_width(int64_t dict_size) {
+    if (dict_size <= 255)        return TD_SYM_W8;
+    if (dict_size <= 65535)      return TD_SYM_W16;
+    if (dict_size <= 4294967295) return TD_SYM_W32;
+    return TD_SYM_W64;
+}
 
 /* ===== Operation Graph ===== */
 
@@ -581,7 +632,6 @@ td_t* td_i64(int64_t val);
 td_t* td_f64(double val);
 td_t* td_str(const char* s, size_t len);
 td_t* td_sym(int64_t id);
-td_t* td_enum_atom(uint32_t idx);
 td_t* td_date(int64_t val);
 td_t* td_time(int64_t val);
 td_t* td_timestamp(int64_t val);
@@ -597,6 +647,7 @@ void  td_sel_recompute(td_t* sel);             /* rebuild seg_flags + popcounts 
 /* ===== Vector API ===== */
 
 td_t* td_vec_new(int8_t type, int64_t capacity);
+td_t* td_sym_vec_new(uint8_t sym_width, int64_t capacity);  /* TD_SYM with adaptive width */
 td_t* td_vec_append(td_t* vec, const void* elem);
 td_t* td_vec_set(td_t* vec, int64_t idx, const void* elem);
 void* td_vec_get(td_t* vec, int64_t idx);

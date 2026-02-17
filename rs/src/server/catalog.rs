@@ -138,9 +138,7 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
         || lower.starts_with("close ")
         || lower.starts_with("discard ")
     {
-        return Some(Ok(vec![Response::Execution(
-            Tag::new("OK").with_rows(0),
-        )]));
+        return Some(Ok(vec![Response::Execution(Tag::new("OK").with_rows(0))]));
     }
 
     // SHOW commands
@@ -158,7 +156,10 @@ pub fn handle_catalog_query(sql: &str, meta: &SessionMeta) -> Option<PgWireResul
     }
     if lower.starts_with("show ") {
         // Generic SHOW fallback — return empty string
-        let param = lower.trim_start_matches("show ").trim_end_matches(';').trim();
+        let param = lower
+            .trim_start_matches("show ")
+            .trim_end_matches(';')
+            .trim();
         return Some(single_text_result(param, &[""]));
     }
 
@@ -622,8 +623,8 @@ fn extract_catalog_table_names(lower: &str) -> Vec<String> {
     // Pattern: attrelid = '<name>' or relname='<name>' (with or without spaces around =)
     for base in ["attrelid", "relname"] {
         for marker in [
-            &format!("{base} = '"),   // with spaces
-            &format!("{base}='"),     // no spaces (psycopg2 client-side binding)
+            &format!("{base} = '"), // with spaces
+            &format!("{base}='"),   // no spaces (psycopg2 client-side binding)
         ] {
             if let Some(start) = lower.find(marker.as_str()) {
                 let rest = &lower[start + marker.len()..];
@@ -679,13 +680,7 @@ fn handle_pg_attribute(
             Type::VARCHAR,
             FieldFormat::Text,
         ),
-        FieldInfo::new(
-            "not_null".into(),
-            None,
-            None,
-            Type::BOOL,
-            FieldFormat::Text,
-        ),
+        FieldInfo::new("not_null".into(), None, None, Type::BOOL, FieldFormat::Text),
     ];
 
     if is_sa2 {
@@ -780,9 +775,7 @@ fn handle_pg_attribute(
     ))])
 }
 
-// Note: handle_fk_constraints and handle_check_constraints removed.
 // Teide has no constraints; pg_constraint always returns empty results.
-// This avoids column-count mismatches between SA 1.4 (3 cols) and SA 2.x (5 cols).
 
 /// OID lookup for specific table(s). SA 1.4's `get_table_oid()` sends:
 ///   SELECT c.oid FROM pg_class c ... WHERE c.relname = 'xxx'
@@ -852,7 +845,13 @@ fn handle_pg_class(meta: &SessionMeta) -> PgWireResult<Vec<Response>> {
 fn handle_pg_type() -> PgWireResult<Vec<Response>> {
     let schema = Arc::new(vec![
         FieldInfo::new("oid".into(), None, None, Type::INT4, FieldFormat::Text),
-        FieldInfo::new("typname".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new(
+            "typname".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        ),
         FieldInfo::new(
             "typnamespace".into(),
             None,
@@ -995,13 +994,7 @@ fn handle_pg_roles() -> PgWireResult<Vec<Response>> {
             Type::VARCHAR,
             FieldFormat::Text,
         ),
-        FieldInfo::new(
-            "rolsuper".into(),
-            None,
-            None,
-            Type::BOOL,
-            FieldFormat::Text,
-        ),
+        FieldInfo::new("rolsuper".into(), None, None, Type::BOOL, FieldFormat::Text),
         FieldInfo::new(
             "rolcreatedb".into(),
             None,

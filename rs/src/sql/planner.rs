@@ -24,9 +24,9 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
-    BinaryOperator, ColumnDef, DataType, Distinct, Expr, FunctionArg, FunctionArgExpr,
-    GroupByExpr, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value, Values,
+    BinaryOperator, ColumnDef, DataType, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
+    Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType, Query, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value, Values,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -404,20 +404,12 @@ fn append_value_to_vec(
             check_vec_append(next)
         }
 
-        ffi::TD_SYM | ffi::TD_ENUM => {
+        ffi::TD_SYM => {
             let s = eval_str_literal(expr)
                 .map_err(|e| SqlError::Plan(format!("column '{}': {e}", col_names[col_idx])))?;
             let sym_id = crate::sym_intern(&s)?;
-            if typ == ffi::TD_SYM {
-                let next =
-                    unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
-                check_vec_append(next)
-            } else {
-                // ENUM uses u32 indices
-                let idx = sym_id as u32;
-                let next = unsafe { ffi::td_vec_append(vec, &idx as *const u32 as *const c_void) };
-                check_vec_append(next)
-            }
+            let next = unsafe { ffi::td_vec_append(vec, &sym_id as *const i64 as *const c_void) };
+            check_vec_append(next)
         }
 
         _ => Err(SqlError::Plan(format!(
@@ -567,7 +559,7 @@ fn reorder_insert_columns(
 }
 
 // ---------------------------------------------------------------------------
-// Stateless entry point (backwards-compatible)
+// Stateless entry point
 // ---------------------------------------------------------------------------
 
 /// Parse, plan, and execute a SQL query.
@@ -937,18 +929,17 @@ fn plan_query(
     // Stage 2: GROUP BY / aggregation / DISTINCT
     // Fuse LIMIT into GROUP BY graph when safe (no ORDER BY, no HAVING).
     // The C engine uses HEAD(GROUP) to short-circuit per-partition loops.
-    let group_limit = if (has_group_by || has_aggregates)
-        && order_by_exprs.is_empty()
-        && select.having.is_none()
-    {
-        match (offset_val, limit_val) {
-            (Some(off), Some(lim)) => Some(off.saturating_add(lim)),
-            (None, Some(lim)) => Some(lim),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let group_limit =
+        if (has_group_by || has_aggregates) && order_by_exprs.is_empty() && select.having.is_none()
+        {
+            match (offset_val, limit_val) {
+                (Some(off), Some(lim)) => Some(off.saturating_add(lim)),
+                (None, Some(lim)) => Some(lim),
+                _ => None,
+            }
+        } else {
+            None
+        };
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
         plan_group_select(
             ctx,
@@ -1090,9 +1081,9 @@ fn extract_string_arg(arg: &FunctionArg) -> Result<String, SqlError> {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(Value::SingleQuotedString(s)))) => {
             Ok(s.clone())
         }
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-            Value::DoubleQuotedString(s),
-        ))) => Ok(s.clone()),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(Value::DoubleQuotedString(s)))) => {
+            Ok(s.clone())
+        }
         _ => Err(SqlError::Plan(format!(
             "Expected a string literal argument, got: {arg}"
         ))),
@@ -1130,7 +1121,7 @@ fn resolve_table_function(
             }
         }
         "read_splayed" => {
-            if args.len() < 1 || args.len() > 2 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(SqlError::Plan(
                     "read_splayed() requires 1-2 arguments: read_splayed('/path/to/dir' [, '/path/to/sym'])".into(),
                 ));
@@ -1152,8 +1143,9 @@ fn resolve_table_function(
             }
             let db_root = extract_string_arg(&args[0])?;
             let table_name = extract_string_arg(&args[1])?;
-            ctx.read_parted(&db_root, &table_name)
-                .map_err(|e| SqlError::Plan(format!("read_parted('{db_root}', '{table_name}'): {e}")))
+            ctx.read_parted(&db_root, &table_name).map_err(|e| {
+                SqlError::Plan(format!("read_parted('{db_root}', '{table_name}'): {e}"))
+            })
         }
         _ => Err(SqlError::Plan(format!(
             "Unknown table function '{name}'. Supported: read_csv(), read_splayed(), read_parted()"
@@ -1445,6 +1437,7 @@ fn build_result_schema(table: &Table, aliases: &[String]) -> HashMap<String, usi
 /// - Expressions as aggregate inputs: SUM(v1 + v2)
 /// - Post-aggregation arithmetic: SUM(v1) * 2, SUM(v1) / COUNT(v1)
 /// - Mixed expressions in SELECT
+#[allow(clippy::too_many_arguments)]
 fn plan_group_select(
     ctx: &Context,
     working_table: &Table,
@@ -1641,15 +1634,18 @@ fn plan_group_select(
         for (i, agg) in all_aggs.iter().enumerate() {
             let idx = key_names.len() + i;
             // Predict C engine native name (e.g. "v1_sum")
-            let native = predict_c_agg_name(&agg.func, schema)
-                .unwrap_or_else(|| agg.alias.clone());
+            let native = predict_c_agg_name(&agg.func, schema).unwrap_or_else(|| agg.alias.clone());
             predicted_schema.insert(native.clone(), idx);
             // Also register the format_agg_name alias (e.g. "sum(v1)")
             predicted_schema.entry(agg.alias.clone()).or_insert(idx);
             predicted_names.push(native);
         }
         let having_pred = plan_having_expr(
-            &mut g, having_expr, &predicted_schema, schema, &predicted_names,
+            &mut g,
+            having_expr,
+            &predicted_schema,
+            schema,
+            &predicted_names,
         )?;
         exec_root = g.filter(exec_root, having_pred)?;
     }
@@ -1706,7 +1702,8 @@ fn plan_group_select(
             }
         }
         let pick_refs: Vec<&str> = pick_names.iter().map(|s| s.as_str()).collect();
-        let result = group_result.pick_columns(&pick_refs)
+        let result = group_result
+            .pick_columns(&pick_refs)
             .map_err(|e| SqlError::Plan(format!("column projection failed: {e}")))?;
         return Ok((result, final_aliases));
     }
@@ -2345,18 +2342,33 @@ fn ensure_vector_columns(table: &Table, op: &str) -> Result<Table, SqlError> {
     Ok(table.clone_ref())
 }
 
-fn vec_elem_size(col_type: i8, op: &str) -> Result<usize, SqlError> {
-    if col_type <= 0 {
-        return Err(SqlError::Plan(format!(
-            "{op}: expected vector column, got type {col_type}"
-        )));
+/// Create a new vector matching the type and width of a source column.
+/// For TD_SYM, uses `td_sym_vec_new` to preserve the adaptive width.
+fn col_vec_new(src: *const crate::td_t, capacity: i64) -> *mut crate::td_t {
+    let col_type = unsafe { (*src).type_ };
+    if col_type == crate::ffi::TD_SYM {
+        let attrs = unsafe { (*src).attrs };
+        unsafe { crate::ffi::td_sym_vec_new(attrs & crate::ffi::TD_SYM_W_MASK, capacity) }
+    } else {
+        unsafe { crate::raw::td_vec_new(col_type, capacity) }
     }
-    let sizes = unsafe { &crate::raw::td_type_sizes };
-    sizes
-        .get(col_type as usize)
-        .copied()
-        .map(|v| v as usize)
-        .ok_or_else(|| SqlError::Plan(format!("{op}: unsupported column type {col_type}")))
+}
+
+/// Element size for a column pointer, handling TD_SYM adaptive width.
+fn col_elem_size(col: *const crate::td_t) -> usize {
+    let col_type = unsafe { (*col).type_ };
+    if col_type == crate::ffi::TD_SYM {
+        let attrs = unsafe { (*col).attrs };
+        match attrs & crate::ffi::TD_SYM_W_MASK {
+            crate::ffi::TD_SYM_W8 => 1,
+            crate::ffi::TD_SYM_W16 => 2,
+            crate::ffi::TD_SYM_W32 => 4,
+            _ => 8,
+        }
+    } else {
+        let sizes = unsafe { &crate::raw::td_type_sizes };
+        sizes.get(col_type as usize).copied().unwrap_or(0) as usize
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,9 +2448,8 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
             .get_col_idx(c)
             .ok_or_else(|| SqlError::Plan("CROSS JOIN: left column missing".into()))?;
         let name_id = left.col_name(c);
-        let col_type = unsafe { crate::raw::td_type(col) };
-        let esz = vec_elem_size(col_type, "CROSS JOIN")?;
-        let new_col = unsafe { crate::raw::td_vec_new(col_type, out_nrows as i64) };
+        let esz = col_elem_size(col);
+        let new_col = col_vec_new(col, out_nrows as i64);
         if new_col.is_null() {
             return Err(SqlError::Engine(crate::Error::Oom));
         }
@@ -2467,9 +2478,8 @@ fn exec_cross_join(ctx: &Context, left: &Table, right: &Table) -> Result<Table, 
             .get_col_idx(c)
             .ok_or_else(|| SqlError::Plan("CROSS JOIN: right column missing".into()))?;
         let name_id = right.col_name(c);
-        let col_type = unsafe { crate::raw::td_type(col) };
-        let esz = vec_elem_size(col_type, "CROSS JOIN")?;
-        let new_col = unsafe { crate::raw::td_vec_new(col_type, out_nrows as i64) };
+        let esz = col_elem_size(col);
+        let new_col = col_vec_new(col, out_nrows as i64);
         if new_col.is_null() {
             return Err(SqlError::Engine(crate::Error::Oom));
         }
@@ -2560,9 +2570,8 @@ fn exec_set_operation(
             .get_col_idx(c)
             .ok_or_else(|| SqlError::Plan("SET operation: column missing".into()))?;
         let name_id = left.col_name(c);
-        let col_type = unsafe { crate::raw::td_type(col) };
-        let esz = vec_elem_size(col_type, "SET operation")?;
-        let new_col = unsafe { crate::raw::td_vec_new(col_type, out_nrows as i64) };
+        let esz = col_elem_size(col);
+        let new_col = col_vec_new(col, out_nrows as i64);
         if new_col.is_null() {
             return Err(SqlError::Engine(crate::Error::Oom));
         }
@@ -2601,7 +2610,7 @@ fn collect_setop_columns(table: &Table, ncols: i64) -> Result<Vec<SetOpCol>, Sql
             .get_col_idx(c)
             .ok_or_else(|| SqlError::Plan("SET operation: column missing".into()))?;
         let col_type = unsafe { crate::raw::td_type(col) };
-        let elem_size = vec_elem_size(col_type, "SET operation")?;
+        let elem_size = col_elem_size(col);
         let len = unsafe { crate::ffi::td_len(col as *const crate::td_t) } as usize;
         let data = unsafe { crate::raw::td_data(col) } as *const u8;
         cols.push(SetOpCol {
@@ -2909,7 +2918,7 @@ fn scalar_value_from_table(table: &Table, col: usize, row: usize) -> Result<Expr
             Some(v) => Ok(Expr::Value(Value::Number(v.to_string(), false))),
             None => Ok(Expr::Value(Value::Null)),
         },
-        crate::types::SYM | crate::types::ENUM => {
+        crate::types::SYM => {
             let v = table.get_str(col, row).unwrap_or_default();
             Ok(Expr::Value(Value::SingleQuotedString(v)))
         }

@@ -75,6 +75,87 @@ static inline void scratch_free(td_t* hdr) {
 }
 
 /* --------------------------------------------------------------------------
+ * Unified column read/write helpers
+ *
+ * Read any integer-representable column value as int64_t.
+ * TD_SYM dispatches on attrs for adaptive width (W8/W16/W32/W64).
+ * F64 is NOT handled — caller must check for F64 separately.
+ * -------------------------------------------------------------------------- */
+
+static inline int64_t read_col_i64(const void* data, int64_t row,
+                                    int8_t type, uint8_t attrs) {
+    switch (type) {
+    case TD_I64: case TD_TIMESTAMP:
+        return ((const int64_t*)data)[row];
+    case TD_SYM:
+        switch (attrs & TD_SYM_W_MASK) {
+        case TD_SYM_W8:  return (int64_t)((const uint8_t*)data)[row];
+        case TD_SYM_W16: return (int64_t)((const uint16_t*)data)[row];
+        case TD_SYM_W32: return (int64_t)((const uint32_t*)data)[row];
+        default:         return ((const int64_t*)data)[row];
+        }
+    case TD_I32: case TD_DATE: case TD_TIME:
+        return (int64_t)((const int32_t*)data)[row];
+    case TD_I16:
+        return (int64_t)((const int16_t*)data)[row];
+    default: /* TD_BOOL, TD_U8 */
+        return (int64_t)((const uint8_t*)data)[row];
+    }
+}
+
+static inline void write_col_i64(void* data, int64_t row, int64_t val,
+                                  int8_t type, uint8_t attrs) {
+    switch (type) {
+    case TD_I64: case TD_TIMESTAMP:
+        ((int64_t*)data)[row] = val; return;
+    case TD_SYM:
+        td_write_sym(data, row, (uint64_t)val, type, attrs); return;
+    case TD_I32: case TD_DATE: case TD_TIME:
+        ((int32_t*)data)[row] = (int32_t)val; return;
+    case TD_I16:
+        ((int16_t*)data)[row] = (int16_t)val; return;
+    default: /* TD_BOOL, TD_U8 */
+        ((uint8_t*)data)[row] = (uint8_t)val; return;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * TD_SYM-aware column helpers
+ *
+ * col_esz():      element size respecting TD_SYM adaptive width
+ * col_vec_new():  create vector matching source column's type + width
+ * -------------------------------------------------------------------------- */
+
+static inline uint8_t col_esz(const td_t* col) {
+    return td_sym_elem_size(col->type, col->attrs);
+}
+
+/* Fast key reader for DA/sort hot loops: elem_size is pre-computed and
+ * loop-invariant, so the switch is always perfectly predicted.  Avoids the
+ * td_read_sym → type dispatch chain (3+ branches per element). */
+static inline int64_t read_by_esz(const void* data, int64_t row, uint8_t esz) {
+    switch (esz) {
+    case 1:  return (int64_t)((const uint8_t*)data)[row];
+    case 2:  return (int64_t)((const uint16_t*)data)[row];
+    case 4:  return (int64_t)((const uint32_t*)data)[row];
+    default: return ((const int64_t*)data)[row];
+    }
+}
+
+static inline td_t* col_vec_new(const td_t* src, int64_t cap) {
+    if (src->type == TD_SYM)
+        return td_sym_vec_new(src->attrs & TD_SYM_W_MASK, cap);
+    return td_vec_new(src->type, cap);
+}
+
+/* Same but from explicit type + attrs (for parted base type, etc.) */
+static inline td_t* typed_vec_new(int8_t type, uint8_t attrs, int64_t cap) {
+    if (type == TD_SYM)
+        return td_sym_vec_new(attrs & TD_SYM_W_MASK, cap);
+    return td_vec_new(type, cap);
+}
+
+/* --------------------------------------------------------------------------
  * Cancellation check: returns true if the current query was cancelled.
  * Uses relaxed load — zero cost on x86 (piggybacks on existing cache line).
  * -------------------------------------------------------------------------- */
@@ -118,7 +199,7 @@ static td_t* materialize_mapcommon(td_t* mc) {
     td_t* rc = mc_ptrs[1];   /* row_counts: TD_I64 vec of n_parts */
     int64_t n_parts = kv->len;
     int8_t kv_type = kv->type;
-    size_t esz = (size_t)td_elem_size(kv_type);
+    size_t esz = (size_t)td_sym_elem_size(kv_type, kv->attrs);
     const char* kdata = (const char*)td_data(kv);
     const int64_t* counts = (const int64_t*)td_data(rc);
 
@@ -161,7 +242,7 @@ static td_t* materialize_mapcommon_head(td_t* mc, int64_t n) {
     td_t* rc = mc_ptrs[1];
     int64_t n_parts = kv->len;
     int8_t kv_type = kv->type;
-    size_t esz = (size_t)td_elem_size(kv_type);
+    size_t esz = (size_t)td_sym_elem_size(kv_type, kv->attrs);
     const char* kdata = (const char*)td_data(kv);
     const int64_t* counts = (const int64_t*)td_data(rc);
 
@@ -200,7 +281,7 @@ static td_t* materialize_mapcommon_filter(td_t* mc, td_t* pred, int64_t pass_cou
     td_t* rc = mc_ptrs[1];
     int64_t n_parts = kv->len;
     int8_t kv_type = kv->type;
-    size_t esz = (size_t)td_elem_size(kv_type);
+    size_t esz = (size_t)td_sym_elem_size(kv_type, kv->attrs);
     const char* kdata = (const char*)td_data(kv);
     const int64_t* counts = (const int64_t*)td_data(rc);
 
@@ -286,11 +367,6 @@ static bool atom_to_numeric(td_t* atom, double* out_f, int64_t* out_i, bool* out
         case TD_ATOM_BOOL:
             *out_i = (int64_t)atom->u8;
             *out_f = (double)atom->u8;
-            *out_is_f64 = false;
-            return true;
-        case TD_ATOM_ENUM:
-            *out_i = (int64_t)atom->u32;
-            *out_f = (double)atom->u32;
             *out_is_f64 = false;
             return true;
         default:
@@ -400,9 +476,9 @@ static bool const_expr_to_i64(td_graph_t* g, td_op_t* op, int64_t* out) {
 }
 
 static inline bool type_is_linear_i64_col(int8_t t) {
-    return t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP ||
+    return t == TD_I64 || t == TD_TIMESTAMP ||
            t == TD_I32 || t == TD_DATE || t == TD_TIME || t == TD_I16 ||
-           t == TD_U8 || t == TD_BOOL || t == TD_ENUM;
+           t == TD_U8 || t == TD_BOOL || TD_IS_SYM(t);
 }
 
 static bool linear_expr_add_term(linear_expr_i64_t* e, int64_t sym, int64_t coeff) {
@@ -589,9 +665,9 @@ static bool try_affine_sumavg_input(td_graph_t* g, td_t* tbl, td_op_t* input_op,
         return true;
     }
 
-    if (bt == TD_I64 || bt == TD_SYM || bt == TD_TIMESTAMP ||
+    if (bt == TD_I64 || bt == TD_TIMESTAMP ||
         bt == TD_I32 || bt == TD_I16 || bt == TD_U8 || bt == TD_BOOL ||
-        bt == TD_ENUM) {
+        TD_IS_SYM(bt)) {
         int64_t c = 0;
         if (c_is_f64) {
             if (!isfinite(c_f)) return false;
@@ -644,6 +720,7 @@ typedef struct {
         uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
         int8_t      type;       /* computational type: TD_F64 / TD_I64 / TD_BOOL */
         int8_t      col_type;   /* original column type (REG_SCAN only) */
+        uint8_t     col_attrs;  /* column attrs — TD_SYM width (REG_SCAN only) */
         bool        is_parted;  /* true if this SCAN refs a parted column */
         const void* data;       /* column data pointer (REG_SCAN only) */
         td_t*       parted_col; /* parted wrapper (is_parted only) */
@@ -730,6 +807,7 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
                     out->has_parted = true;
                 } else {
                     out->regs[r].col_type = col->type;
+                    out->regs[r].col_attrs = col->attrs;
                     out->regs[r].data = td_data(col);
                     out->regs[r].is_parted = false;
                     out->regs[r].parted_col = NULL;
@@ -741,7 +819,7 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
                 double cf; int64_t ci; bool is_f64;
                 if (!atom_to_numeric(ext->literal, &cf, &ci, &is_f64)) {
                     /* Try resolving string constant to symbol intern ID —
-                     * enables fused evaluation of ENUM column comparisons
+                     * enables fused evaluation of SYM column comparisons
                      * (e.g. id2 = 'id080' compiles to integer EQ). */
                     if (ext->literal->type == TD_ATOM_STR) {
                         const char* s = td_str_ptr(ext->literal);
@@ -838,17 +916,17 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
 
 /* Load SCAN column data into i64 scratch buffer with type conversion */
 static void expr_load_i64(int64_t* dst, const void* data, int8_t col_type,
-                          int64_t start, int64_t n) {
+                          uint8_t col_attrs, int64_t start, int64_t n) {
     switch (col_type) {
-        case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+        case TD_I64: case TD_TIMESTAMP:
             memcpy(dst, (const int64_t*)data + start, (size_t)n * 8);
             break;
+        case TD_SYM: {
+            for (int64_t j = 0; j < n; j++)
+                dst[j] = td_read_sym(data, start + j, col_type, col_attrs);
+        } break;
         case TD_I32: case TD_DATE: case TD_TIME: {
             const int32_t* s = (const int32_t*)data + start;
-            for (int64_t j = 0; j < n; j++) dst[j] = s[j];
-        } break;
-        case TD_ENUM: {
-            const uint32_t* s = (const uint32_t*)data + start;
             for (int64_t j = 0; j < n; j++) dst[j] = s[j];
         } break;
         case TD_U8: case TD_BOOL: {
@@ -865,21 +943,21 @@ static void expr_load_i64(int64_t* dst, const void* data, int8_t col_type,
 
 /* Load SCAN column data into f64 scratch buffer with type conversion */
 static void expr_load_f64(double* dst, const void* data, int8_t col_type,
-                          int64_t start, int64_t n) {
+                          uint8_t col_attrs, int64_t start, int64_t n) {
     switch (col_type) {
         case TD_F64:
             memcpy(dst, (const double*)data + start, (size_t)n * 8);
             break;
-        case TD_I64: case TD_SYM: case TD_TIMESTAMP: {
+        case TD_I64: case TD_TIMESTAMP: {
             const int64_t* s = (const int64_t*)data + start;
             for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
         } break;
+        case TD_SYM: {
+            for (int64_t j = 0; j < n; j++)
+                dst[j] = (double)td_read_sym(data, start + j, col_type, col_attrs);
+        } break;
         case TD_I32: case TD_DATE: case TD_TIME: {
             const int32_t* s = (const int32_t*)data + start;
-            for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
-        } break;
-        case TD_ENUM: {
-            const uint32_t* s = (const uint32_t*)data + start;
             for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
         } break;
         case TD_U8: case TD_BOOL: {
@@ -1028,20 +1106,24 @@ static void* expr_eval_morsel(const td_expr_t* expr, void** scratch,
         int8_t rt = expr->regs[r].type;
         int8_t ct = expr->regs[r].col_type;
         switch (expr->regs[r].kind) {
-            case REG_SCAN:
+            case REG_SCAN: {
                 /* Direct pointer if native type matches, else convert */
+                uint8_t ca = expr->regs[r].col_attrs;
                 if (rt == TD_F64 && ct == TD_F64) {
                     rptrs[r] = (double*)expr->regs[r].data + start;
-                } else if (rt == TD_I64 && (ct == TD_I64 || ct == TD_SYM ||
-                           ct == TD_TIMESTAMP)) {
+                } else if (rt == TD_I64 && (ct == TD_I64 || ct == TD_TIMESTAMP)) {
+                    rptrs[r] = (int64_t*)expr->regs[r].data + start;
+                } else if (rt == TD_I64 && ct == TD_SYM &&
+                           (ca & TD_SYM_W_MASK) == TD_SYM_W64) {
                     rptrs[r] = (int64_t*)expr->regs[r].data + start;
                 } else {
                     rptrs[r] = scratch[r];
                     if (rt == TD_F64)
-                        expr_load_f64(scratch[r], expr->regs[r].data, ct, start, n);
+                        expr_load_f64(scratch[r], expr->regs[r].data, ct, ca, start, n);
                     else
-                        expr_load_i64(scratch[r], expr->regs[r].data, ct, start, n);
+                        expr_load_i64(scratch[r], expr->regs[r].data, ct, ca, start, n);
                 }
+            }
                 break;
             case REG_CONST:
                 rptrs[r] = scratch[r];
@@ -1282,21 +1364,32 @@ static void binary_range(td_op_t* op, int8_t out_type,
     int32_t* lp_i32 = NULL; uint32_t* lp_u32 = NULL; int16_t* lp_i16 = NULL;
     int32_t* rp_i32 = NULL; uint32_t* rp_u32 = NULL; int16_t* rp_i16 = NULL;
 
+    int64_t lsym_buf[n], rsym_buf[n]; /* stack VLA for narrow TD_SYM (n<=1024) */
     if (!l_scalar) {
-        void* lbase = (char*)td_data(lhs) + start * td_elem_size(lhs->type);
+        void* lbase = (char*)td_data(lhs) + start * td_sym_elem_size(lhs->type, lhs->attrs);
         if (lhs->type == TD_F64) lp_f64 = (double*)lbase;
-        else if (lhs->type == TD_I64 || lhs->type == TD_SYM || lhs->type == TD_TIMESTAMP) lp_i64 = (int64_t*)lbase;
+        else if (lhs->type == TD_I64 || lhs->type == TD_TIMESTAMP) lp_i64 = (int64_t*)lbase;
+        else if (TD_IS_SYM(lhs->type)) {
+            uint8_t w = lhs->attrs & TD_SYM_W_MASK;
+            if (w == TD_SYM_W64) lp_i64 = (int64_t*)lbase;
+            else if (w == TD_SYM_W32) lp_u32 = (uint32_t*)lbase;
+            else { for (int64_t j = 0; j < n; j++) lsym_buf[j] = td_read_sym(td_data(lhs), start+j, lhs->type, lhs->attrs); lp_i64 = lsym_buf; }
+        }
         else if (lhs->type == TD_I32 || lhs->type == TD_DATE || lhs->type == TD_TIME) lp_i32 = (int32_t*)lbase;
-        else if (lhs->type == TD_ENUM) lp_u32 = (uint32_t*)lbase;
         else if (lhs->type == TD_I16) lp_i16 = (int16_t*)lbase;
         else if (lhs->type == TD_BOOL || lhs->type == TD_U8) lp_bool = (uint8_t*)lbase;
     }
     if (!r_scalar) {
-        void* rbase = (char*)td_data(rhs) + start * td_elem_size(rhs->type);
+        void* rbase = (char*)td_data(rhs) + start * td_sym_elem_size(rhs->type, rhs->attrs);
         if (rhs->type == TD_F64) rp_f64 = (double*)rbase;
-        else if (rhs->type == TD_I64 || rhs->type == TD_SYM || rhs->type == TD_TIMESTAMP) rp_i64 = (int64_t*)rbase;
+        else if (rhs->type == TD_I64 || rhs->type == TD_TIMESTAMP) rp_i64 = (int64_t*)rbase;
+        else if (TD_IS_SYM(rhs->type)) {
+            uint8_t w = rhs->attrs & TD_SYM_W_MASK;
+            if (w == TD_SYM_W64) rp_i64 = (int64_t*)rbase;
+            else if (w == TD_SYM_W32) rp_u32 = (uint32_t*)rbase;
+            else { for (int64_t j = 0; j < n; j++) rsym_buf[j] = td_read_sym(td_data(rhs), start+j, rhs->type, rhs->attrs); rp_i64 = rsym_buf; }
+        }
         else if (rhs->type == TD_I32 || rhs->type == TD_DATE || rhs->type == TD_TIME) rp_i32 = (int32_t*)rbase;
-        else if (rhs->type == TD_ENUM) rp_u32 = (uint32_t*)rbase;
         else if (rhs->type == TD_I16) rp_i16 = (int16_t*)rbase;
         else if (rhs->type == TD_BOOL || rhs->type == TD_U8) rp_bool = (uint8_t*)rbase;
     }
@@ -1412,19 +1505,19 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
     if (!result || TD_IS_ERR(result)) return result;
     result->len = len;
 
-    /* ENUM/SYM vs STR comparison: resolve string constant to intern ID so we
-       can compare numerically against ENUM uint32_t intern indices.
+    /* SYM vs STR comparison: resolve string constant to intern ID so we
+       can compare numerically against SYM intern indices.
        td_sym_find returns -1 if string not in table → no match. */
     bool str_resolved = false;
     int64_t resolved_sym_id = 0;
     if (r_scalar && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR) &&
-        (lhs->type == TD_ENUM || lhs->type == TD_SYM)) {
+        TD_IS_SYM(lhs->type)) {
         const char* s = td_str_ptr(rhs);
         size_t slen = td_str_len(rhs);
         resolved_sym_id = td_sym_find(s, slen);
         str_resolved = true;
     } else if (l_scalar && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR) &&
-               (rhs->type == TD_ENUM || rhs->type == TD_SYM)) {
+               TD_IS_SYM(rhs->type)) {
         const char* s = td_str_ptr(lhs);
         size_t slen = td_str_len(lhs);
         resolved_sym_id = td_sym_find(s, slen);
@@ -1442,16 +1535,7 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
         } else {
             int8_t t = lhs->type;
             if (t == TD_F64) l_f64_val = ((double*)td_data(lhs))[0];
-            else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-                l_i64_val = ((int64_t*)td_data(lhs))[0];
-            else if (t == TD_I32 || t == TD_DATE || t == TD_TIME)
-                l_i64_val = (int64_t)((int32_t*)td_data(lhs))[0];
-            else if (t == TD_I16)
-                l_i64_val = (int64_t)((int16_t*)td_data(lhs))[0];
-            else if (t == TD_ENUM)
-                l_i64_val = (int64_t)((uint32_t*)td_data(lhs))[0];
-            else
-                l_i64_val = (int64_t)((uint8_t*)td_data(lhs))[0];
+            else l_i64_val = read_col_i64(td_data(lhs), 0, t, lhs->attrs);
         }
     }
     if (r_scalar) {
@@ -1463,16 +1547,7 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
         } else {
             int8_t t = rhs->type;
             if (t == TD_F64) r_f64_val = ((double*)td_data(rhs))[0];
-            else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-                r_i64_val = ((int64_t*)td_data(rhs))[0];
-            else if (t == TD_I32 || t == TD_DATE || t == TD_TIME)
-                r_i64_val = (int64_t)((int32_t*)td_data(rhs))[0];
-            else if (t == TD_I16)
-                r_i64_val = (int64_t)((int16_t*)td_data(rhs))[0];
-            else if (t == TD_ENUM)
-                r_i64_val = (int64_t)((uint32_t*)td_data(rhs))[0];
-            else
-                r_i64_val = (int64_t)((uint8_t*)td_data(rhs))[0];
+            else r_i64_val = read_col_i64(td_data(rhs), 0, t, rhs->attrs);
         }
     }
 
@@ -1531,23 +1606,7 @@ static void reduce_range(td_t* input, int64_t start, int64_t end, reduce_acc_t* 
             if (!acc->has_first) { acc->first_f = v; acc->has_first = true; }
             acc->last_f = v;
         } else {
-            int64_t v;
-            if (in_type == TD_I64 || in_type == TD_SYM)
-                v = ((int64_t*)base)[row];
-            else if (in_type == TD_I32)
-                v = ((int32_t*)base)[row];
-            else if (in_type == TD_I16)
-                v = ((int16_t*)base)[row];
-            else if (in_type == TD_BOOL || in_type == TD_U8)
-                v = ((uint8_t*)base)[row];
-            else if (in_type == TD_ENUM)
-                v = (int64_t)((uint32_t*)base)[row];
-            else if (in_type == TD_DATE || in_type == TD_TIME)
-                v = (int64_t)((int32_t*)base)[row];
-            else if (in_type == TD_TIMESTAMP)
-                v = ((int64_t*)base)[row];
-            else
-                v = ((int64_t*)base)[row];
+            int64_t v = read_col_i64(base, row, in_type, input->attrs);
             acc->sum_i += v;
             acc->sum_sq_i += v * v;
             acc->prod_i *= v;
@@ -1809,7 +1868,9 @@ static void parted_gather_col(td_t* parted_col, const int64_t* match_idx,
     int64_t n_segs = parted_col->len;
     td_t** segs = (td_t**)td_data(parted_col);
     int8_t base = (int8_t)TD_PARTED_BASETYPE(parted_col->type);
-    uint8_t esz = td_elem_size(base);
+    uint8_t base_attrs = (base == TD_SYM && n_segs > 0 && segs[0])
+                       ? segs[0]->attrs : 0;
+    uint8_t esz = td_sym_elem_size(base, base_attrs);
     char* dst = (char*)td_data(dst_col);
 
     /* Build prefix-sum segment end table */
@@ -1834,8 +1895,8 @@ static void parted_gather_col(td_t* parted_col, const int64_t* match_idx,
 
 /* Filter a single vector by boolean predicate. */
 static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
-    uint8_t esz = td_elem_size(input->type);
-    td_t* result = td_vec_new(input->type, pass_count);
+    uint8_t esz = col_esz(input);
+    td_t* result = col_vec_new(input, pass_count);
     if (!result || TD_IS_ERR(result)) return result;
     result->len = pass_count;
 
@@ -1863,8 +1924,11 @@ static td_t* exec_filter_vec(td_t* input, td_t* pred, int64_t pass_count) {
 static td_t* exec_filter_parted_vec(td_t* parted_col, td_t* pred,
                                      int64_t pass_count) {
     int8_t base = (int8_t)TD_PARTED_BASETYPE(parted_col->type);
-    uint8_t esz = td_elem_size(base);
-    td_t* result = td_vec_new(base, pass_count);
+    td_t** segs_peek = (td_t**)td_data(parted_col);
+    uint8_t base_attrs = (base == TD_SYM && parted_col->len > 0 && segs_peek[0])
+                       ? segs_peek[0]->attrs : 0;
+    uint8_t esz = td_sym_elem_size(base, base_attrs);
+    td_t* result = typed_vec_new(base, base_attrs, pass_count);
     if (!result || TD_IS_ERR(result)) return result;
     result->len = pass_count;
 
@@ -1996,8 +2060,17 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
         int8_t out_type = TD_IS_PARTED(col->type)
                         ? (int8_t)TD_PARTED_BASETYPE(col->type)
                         : col->type;
+        uint8_t out_attrs = 0;
+        if (out_type == TD_SYM) {
+            if (TD_IS_PARTED(col->type)) {
+                td_t** sp = (td_t**)td_data(col);
+                if (col->len > 0 && sp[0]) out_attrs = sp[0]->attrs;
+            } else {
+                out_attrs = col->attrs;
+            }
+        }
         if (TD_IS_PARTED(col->type)) has_parted_cols = true;
-        td_t* nc = td_vec_new(out_type, pass_count);
+        td_t* nc = typed_vec_new(out_type, out_attrs, pass_count);
         if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
@@ -2014,7 +2087,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
             if (TD_IS_PARTED(col->type)) {
                 parted_gather_col(col, match_idx, pass_count, new_cols[c]);
             } else {
-                uint8_t esz = td_elem_size(col->type);
+                uint8_t esz = col_esz(col);
                 char* src = (char*)td_data(col);
                 char* dst = (char*)td_data(new_cols[c]);
                 for (int64_t i = 0; i < pass_count; i++)
@@ -2031,7 +2104,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)td_data(col);
             mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
-            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.esz[ci]  = col_esz(col);
             mgctx.ncols++;
         }
         td_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
@@ -2042,7 +2115,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
             if (!col || !new_cols[c]) continue;
             gather_ctx_t gctx = {
                 .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
-                .esz = td_elem_size(col->type), .nullable = false,
+                .esz = col_esz(col), .nullable = false,
             };
             td_pool_dispatch(pool, gather_fn, &gctx, pass_count);
         }
@@ -2051,7 +2124,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
         for (int64_t c = 0; c < ncols; c++) {
             td_t* col = td_table_get_col_idx(input, c);
             if (!col || !new_cols[c]) continue;
-            uint8_t esz = td_elem_size(col->type);
+            uint8_t esz = col_esz(col);
             char* src = (char*)td_data(col);
             char* dst = (char*)td_data(new_cols[c]);
             for (int64_t i = 0; i < pass_count; i++)
@@ -2120,8 +2193,15 @@ static td_t* exec_filter_head(td_t* input, td_t* pred, int64_t limit) {
         int8_t out_type = TD_IS_PARTED(col->type)
                         ? (int8_t)TD_PARTED_BASETYPE(col->type) : col->type;
         if (out_type == TD_MAPCOMMON) continue;
-        uint8_t esz = td_elem_size(out_type);
-        td_t* new_col = td_vec_new(out_type, found);
+        uint8_t out_attrs = 0;
+        if (out_type == TD_SYM) {
+            if (TD_IS_PARTED(col->type)) {
+                td_t** sp = (td_t**)td_data(col);
+                if (col->len > 0 && sp[0]) out_attrs = sp[0]->attrs;
+            } else out_attrs = col->attrs;
+        }
+        uint8_t esz = td_sym_elem_size(out_type, out_attrs);
+        td_t* new_col = typed_vec_new(out_type, out_attrs, found);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = found;
         char* dst = (char*)td_data(new_col);
@@ -2245,8 +2325,15 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
         if (!col || TD_IS_ERR(col)) { new_cols[c] = NULL; continue; }
         int8_t ct = TD_IS_PARTED(col->type)
                   ? (int8_t)TD_PARTED_BASETYPE(col->type) : col->type;
+        uint8_t ca = 0;
+        if (ct == TD_SYM) {
+            if (TD_IS_PARTED(col->type)) {
+                td_t** sp = (td_t**)td_data(col);
+                if (col->len > 0 && sp[0]) ca = sp[0]->attrs;
+            } else ca = col->attrs;
+        }
         if (TD_IS_PARTED(col->type)) has_parted = true;
-        td_t* nc = td_vec_new(ct, pass_count);
+        td_t* nc = typed_vec_new(ct, ca, pass_count);
         if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
@@ -2260,7 +2347,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
             if (TD_IS_PARTED(col->type)) {
                 parted_gather_col(col, match_idx, pass_count, new_cols[c]);
             } else {
-                uint8_t esz = td_elem_size(col->type);
+                uint8_t esz = col_esz(col);
                 char* src = (char*)td_data(col);
                 char* dst = (char*)td_data(new_cols[c]);
                 for (int64_t i = 0; i < pass_count; i++)
@@ -2275,7 +2362,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)td_data(col);
             mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
-            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.esz[ci]  = col_esz(col);
             mgctx.ncols++;
         }
         td_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
@@ -2285,7 +2372,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
             if (!col || !new_cols[c]) continue;
             gather_ctx_t gctx = {
                 .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
-                .esz = td_elem_size(col->type), .nullable = false,
+                .esz = col_esz(col), .nullable = false,
             };
             td_pool_dispatch(pool, gather_fn, &gctx, pass_count);
         }
@@ -2293,7 +2380,7 @@ static td_t* sel_compact(td_graph_t* g, td_t* tbl, td_t* sel) {
         for (int64_t c = 0; c < ncols; c++) {
             td_t* col = td_table_get_col_idx(tbl, c);
             if (!col || !new_cols[c]) continue;
-            uint8_t esz = td_elem_size(col->type);
+            uint8_t esz = col_esz(col);
             char* src = (char*)td_data(col);
             char* dst = (char*)td_data(new_cols[c]);
             for (int64_t i = 0; i < pass_count; i++)
@@ -2351,7 +2438,7 @@ static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
             else if (b_null) { cmp = nf ? 1 : -1; null_cmp = 1; }
             else if (va < vb) cmp = -1;
             else if (va > vb) cmp = 1;
-        } else if (col->type == TD_I64 || col->type == TD_SYM || col->type == TD_TIMESTAMP) {
+        } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
             int64_t va = ((int64_t*)td_data(col))[a];
             int64_t vb = ((int64_t*)td_data(col))[b];
             if (va < vb) cmp = -1;
@@ -2361,11 +2448,11 @@ static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
             int32_t vb = ((int32_t*)td_data(col))[b];
             if (va < vb) cmp = -1;
             else if (va > vb) cmp = 1;
-        } else if (col->type == TD_ENUM) {
-            uint32_t va = ((uint32_t*)td_data(col))[a];
-            uint32_t vb = ((uint32_t*)td_data(col))[b];
-            td_t* sa = td_sym_str((int64_t)va);
-            td_t* sb = td_sym_str((int64_t)vb);
+        } else if (TD_IS_SYM(col->type)) {
+            int64_t va = td_read_sym(td_data(col), a, col->type, col->attrs);
+            int64_t vb = td_read_sym(td_data(col), b, col->type, col->attrs);
+            td_t* sa = td_sym_str(va);
+            td_t* sb = td_sym_str(vb);
             if (sa && sb) cmp = td_str_cmp(sa, sb);
         } else if (col->type == TD_I16) {
             int16_t va = ((int16_t*)td_data(col))[a];
@@ -2393,7 +2480,7 @@ static int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
 /* --------------------------------------------------------------------------
  * Parallel LSB radix sort (8-bit digits, 256 buckets)
  *
- * Used for single-key sorts on I64/F64/I32/ENUM/TIMESTAMP columns,
+ * Used for single-key sorts on I64/F64/I32/SYM/TIMESTAMP columns,
  * and composite-key sorts where all keys are integer types with total
  * bit width <= 64.
  *
@@ -2553,9 +2640,10 @@ typedef struct {
     /* Single-key fields: */
     const void*     data;      /* raw column data */
     int8_t          type;      /* column type */
+    uint8_t         col_attrs; /* TD_SYM width attrs */
     bool            desc;
     bool            nulls_first; /* for single-key F64: 1=nulls first */
-    /* ENUM rank mapping (NULL if not ENUM): */
+    /* SYM rank mapping (NULL if not sym): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */
     uint8_t         n_keys;
@@ -2574,7 +2662,7 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
     if (c->n_keys <= 1) {
         /* Single-key fast path */
         switch (c->type) {
-        case TD_I64: case TD_SYM: case TD_TIMESTAMP: {
+        case TD_I64: case TD_TIMESTAMP: {
             const int64_t* d = (const int64_t*)c->data;
             if (c->desc) {
                 for (int64_t i = start; i < end; i++)
@@ -2622,15 +2710,18 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
             }
             break;
         }
-        case TD_ENUM: {
-            const uint32_t* d = (const uint32_t*)c->data;
+        case TD_SYM: {
             const uint32_t* rank = c->enum_rank;
             if (c->desc) {
-                for (int64_t i = start; i < end; i++)
-                    c->keys[i] = ~(uint64_t)rank[d[i]];
+                for (int64_t i = start; i < end; i++) {
+                    uint32_t raw = (uint32_t)td_read_sym(c->data, i, c->type, c->col_attrs);
+                    c->keys[i] = ~(uint64_t)rank[raw];
+                }
             } else {
-                for (int64_t i = start; i < end; i++)
-                    c->keys[i] = (uint64_t)rank[d[i]];
+                for (int64_t i = start; i < end; i++) {
+                    uint32_t raw = (uint32_t)td_read_sym(c->data, i, c->type, c->col_attrs);
+                    c->keys[i] = (uint64_t)rank[raw];
+                }
             }
             break;
         }
@@ -2654,10 +2745,9 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
                 td_t* col = c->vecs[k];
                 int64_t val;
                 if (c->enum_ranks[k]) {
-                    uint32_t raw = ((const uint32_t*)td_data(col))[i];
+                    uint32_t raw = (uint32_t)td_read_sym(td_data(col), i, col->type, col->attrs);
                     val = (int64_t)c->enum_ranks[k][raw];
-                } else if (col->type == TD_I64 || col->type == TD_SYM ||
-                           col->type == TD_TIMESTAMP) {
+                } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
                     val = ((const int64_t*)td_data(col))[i];
                 } else if (col->type == TD_F64) {
                     uint64_t bits;
@@ -2680,27 +2770,32 @@ static void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end)
     }
 }
 
-/* Build ENUM rank mapping: intern_id → sorted rank by string value.
+/* Build SYM rank mapping: intern_id → sorted rank by string value.
  * Caller must scratch_free(*hdr_out) when done.
  * Returns pointer to rank array of size (max_id + 1), or NULL on error. */
 /* Parallel max_id scan context */
 typedef struct {
-    const uint32_t* data;
-    uint32_t*       pw_max;  /* per-worker max */
+    const void* data;
+    int8_t      type;
+    uint8_t     attrs;
+    uint32_t*   pw_max;  /* per-worker max */
 } enum_max_ctx_t;
 
 static void enum_max_fn(void* arg, uint32_t wid,
                          int64_t start, int64_t end) {
     enum_max_ctx_t* c = (enum_max_ctx_t*)arg;
     uint32_t local_max = c->pw_max[wid];
-    const uint32_t* d = c->data;
-    for (int64_t i = start; i < end; i++)
-        if (d[i] > local_max) local_max = d[i];
+    for (int64_t i = start; i < end; i++) {
+        uint32_t v = (uint32_t)td_read_sym(c->data, i, c->type, c->attrs);
+        if (v > local_max) local_max = v;
+    }
     c->pw_max[wid] = local_max;
 }
 
 static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
-    const uint32_t* data = (const uint32_t*)td_data(col);
+    const void* data = td_data(col);
+    int8_t type = col->type;
+    uint8_t attrs = col->attrs;
 
     /* Find max intern ID (parallel for large columns) */
     uint32_t max_id = 0;
@@ -2709,13 +2804,15 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
         uint32_t nw = td_pool_total_workers(pool);
         uint32_t pw_max[nw];
         memset(pw_max, 0, nw * sizeof(uint32_t));
-        enum_max_ctx_t ectx = { .data = data, .pw_max = pw_max };
+        enum_max_ctx_t ectx = { .data = data, .type = type, .attrs = attrs, .pw_max = pw_max };
         td_pool_dispatch(pool, enum_max_fn, &ectx, nrows);
         for (uint32_t w = 0; w < nw; w++)
             if (pw_max[w] > max_id) max_id = pw_max[w];
     } else {
-        for (int64_t i = 0; i < nrows; i++)
-            if (data[i] > max_id) max_id = data[i];
+        for (int64_t i = 0; i < nrows; i++) {
+            uint32_t v = (uint32_t)td_read_sym(data, i, type, attrs);
+            if (v > max_id) max_id = v;
+        }
     }
 
     if (max_id >= UINT32_MAX - 1) { *hdr_out = NULL; return NULL; }
@@ -2751,7 +2848,7 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
         }
     }
 
-    /* Merge sort intern IDs by full string comparison.  For ≤100K ENUM
+    /* Merge sort intern IDs by full string comparison.  For ≤100K SYM
      * values this completes in <1ms and correctly handles strings that
      * share long common prefixes (e.g. "id000000001"–"id000099999"). */
     {
@@ -2947,15 +3044,17 @@ static void mk_prescan_fn(void* arg, uint32_t wid,
         int64_t kmin = my_mins[k], kmax = my_maxs[k];
 
         if (c->enum_ranks[k]) {
-            const uint32_t* d = (const uint32_t*)td_data(col);
+            const void* cdata = td_data(col);
+            int8_t ctype = col->type;
+            uint8_t cattrs = col->attrs;
             const uint32_t* ranks = c->enum_ranks[k];
             for (int64_t i = start; i < end; i++) {
-                int64_t v = (int64_t)ranks[d[i]];
+                uint32_t raw = (uint32_t)td_read_sym(cdata, i, ctype, cattrs);
+                int64_t v = (int64_t)ranks[raw];
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
-        } else if (col->type == TD_I64 || col->type == TD_SYM ||
-                   col->type == TD_TIMESTAMP) {
+        } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
             const int64_t* d = (const int64_t*)td_data(col);
             for (int64_t i = start; i < end; i++) {
                 if (d[i] < kmin) kmin = d[i];
@@ -3044,10 +3143,9 @@ static void fused_topn_fn(void* arg, uint32_t wid,
             td_t* col = c->vecs[k];
             int64_t val;
             if (c->enum_ranks[k]) {
-                uint32_t raw = ((const uint32_t*)td_data(col))[i];
+                uint32_t raw = (uint32_t)td_read_sym(td_data(col), i, col->type, col->attrs);
                 val = (int64_t)c->enum_ranks[k][raw];
-            } else if (col->type == TD_I64 || col->type == TD_SYM ||
-                       col->type == TD_TIMESTAMP) {
+            } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
                 val = ((const int64_t*)td_data(col))[i];
             } else if (col->type == TD_F64) {
                 uint64_t bits;
@@ -3247,7 +3345,8 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
             if (!sort_vecs[k]) { can_radix = false; break; }
             int8_t t = sort_vecs[k]->type;
             if (t != TD_I64 && t != TD_F64 && t != TD_I32 && t != TD_DATE &&
-                t != TD_ENUM && t != TD_TIME && t != TD_TIMESTAMP) {
+                t != TD_SYM &&
+                t != TD_TIME && t != TD_TIMESTAMP) {
                 can_radix = false; break;
             }
         }
@@ -3255,11 +3354,11 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
         if (can_radix) {
             td_pool_t* pool = td_pool_get();
 
-            /* Build ENUM rank mappings (intern_id → sorted rank by string) */
+            /* Build SYM rank mappings (intern_id → sorted rank by string) */
             uint32_t* enum_ranks[n_sort];
             memset(enum_ranks, 0, n_sort * sizeof(uint32_t*));
             for (uint8_t k = 0; k < n_sort; k++) {
-                if (sort_vecs[k]->type == TD_ENUM) {
+                if (TD_IS_SYM(sort_vecs[k]->type)) {
                     enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
                                                      &enum_rank_hdrs[k]);
                     if (!enum_ranks[k]) { can_radix = false; break; }
@@ -3281,7 +3380,9 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                     bool nf = ext->sort.nulls_first ? ext->sort.nulls_first[0] : desc;
                     radix_encode_ctx_t enc = {
                         .keys = keys, .data = td_data(sort_vecs[0]),
-                        .type = sort_vecs[0]->type, .desc = desc,
+                        .type = sort_vecs[0]->type,
+                        .col_attrs = sort_vecs[0]->attrs,
+                        .desc = desc,
                         .nulls_first = nf,
                         .enum_rank = enum_ranks[0], .n_keys = 1,
                     };
@@ -3386,14 +3487,16 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
 
                         if (enum_ranks[k]) {
-                            const uint32_t* d = (const uint32_t*)td_data(col);
+                            const void* cdata = td_data(col);
+                            int8_t ctype = col->type;
+                            uint8_t cattrs = col->attrs;
                             for (int64_t i = 0; i < nrows; i++) {
-                                int64_t v = (int64_t)enum_ranks[k][d[i]];
+                                uint32_t raw = (uint32_t)td_read_sym(cdata, i, ctype, cattrs);
+                                int64_t v = (int64_t)enum_ranks[k][raw];
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == TD_I64 || col->type == TD_SYM ||
-                                   col->type == TD_TIMESTAMP) {
+                        } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)td_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];
@@ -3613,7 +3716,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
         td_t* col = td_table_get_col_idx(tbl, c);
         col_names[c] = td_table_col_name(tbl, c);
         if (!col) { new_cols[c] = NULL; continue; }
-        td_t* nc = td_vec_new(col->type, gather_rows);
+        td_t* nc = col_vec_new(col, gather_rows);
         if (!nc || TD_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = gather_rows;
         new_cols[c] = nc;
@@ -3629,7 +3732,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)td_data(col);
             mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
-            mgctx.esz[ci]  = td_elem_size(col->type);
+            mgctx.esz[ci]  = col_esz(col);
             mgctx.ncols++;
         }
         td_pool_dispatch(gather_pool, multi_gather_fn, &mgctx, gather_rows);
@@ -3641,11 +3744,11 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
             if (gather_pool) {
                 gather_ctx_t gctx = {
                     .idx = sorted_idx, .src_col = col, .dst_col = new_cols[c],
-                    .esz = td_elem_size(col->type), .nullable = false,
+                    .esz = col_esz(col), .nullable = false,
                 };
                 td_pool_dispatch(gather_pool, gather_fn, &gctx, gather_rows);
             } else {
-                uint8_t esz = td_elem_size(col->type);
+                uint8_t esz = col_esz(col);
                 char* src_p = (char*)td_data(col);
                 char* dst_p = (char*)td_data(new_cols[c]);
                 for (int64_t i = 0; i < gather_rows; i++)
@@ -3660,7 +3763,7 @@ static td_t* exec_sort(td_graph_t* g, td_op_t* op, td_t* tbl, int64_t limit) {
         td_release(new_cols[c]);
     }
 
-    /* Free expression-evaluated sort keys and ENUM rank mappings */
+    /* Free expression-evaluated sort keys and SYM rank mappings */
     for (uint8_t k = 0; k < n_sort; k++) {
         if (sort_owned[k] && sort_vecs[k] && !TD_IS_ERR(sort_vecs[k]))
             td_release(sort_vecs[k]);
@@ -3683,20 +3786,10 @@ static uint64_t hash_row_keys(td_t** key_vecs, uint8_t n_keys, int64_t row) {
         td_t* col = key_vecs[k];
         if (!col) continue;
         uint64_t kh;
-        if (col->type == TD_I64 || col->type == TD_SYM || col->type == TD_TIMESTAMP)
-            kh = td_hash_i64(((int64_t*)td_data(col))[row]);
-        else if (col->type == TD_F64)
+        if (col->type == TD_F64)
             kh = td_hash_f64(((double*)td_data(col))[row]);
-        else if (col->type == TD_I32 || col->type == TD_DATE || col->type == TD_TIME)
-            kh = td_hash_i64((int64_t)((int32_t*)td_data(col))[row]);
-        else if (col->type == TD_ENUM)
-            kh = td_hash_i64((int64_t)((uint32_t*)td_data(col))[row]);
-        else if (col->type == TD_BOOL || col->type == TD_U8)
-            kh = td_hash_i64((int64_t)((uint8_t*)td_data(col))[row]);
-        else if (col->type == TD_I16)
-            kh = td_hash_i64((int64_t)((int16_t*)td_data(col))[row]);
         else
-            kh = 0;
+            kh = td_hash_i64(read_col_i64(td_data(col), row, col->type, col->attrs));
         h = (k == 0) ? kh : td_hash_combine(h, kh);
     }
     return h;
@@ -3996,7 +4089,8 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
 #define GROUP_PREFETCH_BATCH 16
 
 static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
-                              td_t** agg_vecs, int64_t start, int64_t end) {
+                              uint8_t* key_attrs, td_t** agg_vecs,
+                              int64_t start, int64_t end) {
     const ght_layout_t* ly = &ht->layout;
     uint8_t nk = ly->n_keys;
     uint8_t na = ly->n_aggs;
@@ -4010,20 +4104,10 @@ static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         for (uint8_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             int64_t kv;
-            if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-                kv = ((int64_t*)key_data[k])[row];
-            else if (t == TD_F64)
+            if (t == TD_F64)
                 memcpy(&kv, &((double*)key_data[k])[row], 8);
-            else if (t == TD_I32 || t == TD_DATE || t == TD_TIME)
-                kv = (int64_t)((int32_t*)key_data[k])[row];
-            else if (t == TD_ENUM)
-                kv = (int64_t)((uint32_t*)key_data[k])[row];
-            else if (t == TD_BOOL || t == TD_U8)
-                kv = (int64_t)((uint8_t*)key_data[k])[row];
-            else if (t == TD_I16)
-                kv = (int64_t)((int16_t*)key_data[k])[row];
             else
-                kv = 0;
+                kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
             ek[k] = kv;
             uint64_t kh = (t == TD_F64) ? td_hash_f64(((double*)key_data[k])[row])
                                         : td_hash_i64(kv);
@@ -4038,17 +4122,8 @@ static void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             if (!ac) continue;
             if (ac->type == TD_F64)
                 memcpy(&ev[vi], &((double*)td_data(ac))[row], 8);
-            else if (ac->type == TD_I64 || ac->type == TD_SYM ||
-                     ac->type == TD_TIMESTAMP)
-                ev[vi] = ((int64_t*)td_data(ac))[row];
-            else if (ac->type == TD_I32 || ac->type == TD_DATE || ac->type == TD_TIME)
-                ev[vi] = (int64_t)((int32_t*)td_data(ac))[row];
-            else if (ac->type == TD_ENUM)
-                ev[vi] = (int64_t)((uint32_t*)td_data(ac))[row];
-            else if (ac->type == TD_I16)
-                ev[vi] = (int64_t)((int16_t*)td_data(ac))[row];
-            else /* TD_BOOL, TD_U8 */
-                ev[vi] = (int64_t)((uint8_t*)td_data(ac))[row];
+            else
+                ev[vi] = read_col_i64(td_data(ac), row, ac->type, ac->attrs);
             vi++;
         }
 
@@ -4105,6 +4180,7 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
 typedef struct {
     void**       key_data;
     int8_t*      key_types;
+    uint8_t*     key_attrs;
     td_t**       agg_vecs;
     uint32_t     n_workers;
     radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
@@ -4141,20 +4217,10 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         for (uint8_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             int64_t kv;
-            if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-                kv = ((int64_t*)c->key_data[k])[row];
-            else if (t == TD_F64)
+            if (t == TD_F64)
                 memcpy(&kv, &((double*)c->key_data[k])[row], 8);
-            else if (t == TD_I32 || t == TD_DATE || t == TD_TIME)
-                kv = (int64_t)((int32_t*)c->key_data[k])[row];
-            else if (t == TD_ENUM)
-                kv = (int64_t)((uint32_t*)c->key_data[k])[row];
-            else if (t == TD_BOOL || t == TD_U8)
-                kv = (int64_t)((uint8_t*)c->key_data[k])[row];
-            else if (t == TD_I16)
-                kv = (int64_t)((int16_t*)c->key_data[k])[row];
             else
-                kv = 0;
+                kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
             keys[k] = kv;
             uint64_t kh = (t == TD_F64) ? td_hash_f64(((double*)c->key_data[k])[row])
                                         : td_hash_i64(kv);
@@ -4167,17 +4233,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (!ac) continue;
             if (ac->type == TD_F64)
                 memcpy(&agg_vals[vi], &((double*)td_data(ac))[row], 8);
-            else if (ac->type == TD_I64 || ac->type == TD_SYM ||
-                     ac->type == TD_TIMESTAMP)
-                agg_vals[vi] = ((int64_t*)td_data(ac))[row];
-            else if (ac->type == TD_I32 || ac->type == TD_DATE || ac->type == TD_TIME)
-                agg_vals[vi] = (int64_t)((int32_t*)td_data(ac))[row];
-            else if (ac->type == TD_ENUM)
-                agg_vals[vi] = (int64_t)((uint32_t*)td_data(ac))[row];
-            else if (ac->type == TD_I16)
-                agg_vals[vi] = (int64_t)((int16_t*)td_data(ac))[row];
-            else /* TD_BOOL, TD_U8 */
-                agg_vals[vi] = (int64_t)((uint8_t*)td_data(ac))[row];
+            else
+                agg_vals[vi] = read_col_i64(td_data(ac), row, ac->type, ac->attrs);
             vi++;
         }
 
@@ -4229,6 +4286,7 @@ typedef struct {
     uint32_t*     part_offsets;
     char**        key_dsts;
     int8_t*       key_types;
+    uint8_t*      key_attrs;
     uint8_t*      key_esizes;
     uint8_t       n_keys;
     agg_out_t*    agg_outs;
@@ -4264,18 +4322,10 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 char* dst = c->key_dsts[k];
                 uint8_t esz = c->key_esizes[k];
                 size_t doff = (size_t)di * esz;
-                if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                    *(int64_t*)(void*)(dst + doff) = kv;
-                else if (kt == TD_F64)
+                if (kt == TD_F64)
                     memcpy(dst + doff, &kv, 8);
-                else if (kt == TD_ENUM)
-                    *(uint32_t*)(void*)(dst + doff) = (uint32_t)kv;
-                else if (kt == TD_I32 || kt == TD_DATE || kt == TD_TIME)
-                    *(int32_t*)(void*)(dst + doff) = (int32_t)kv;
-                else if (kt == TD_I16)
-                    *(int16_t*)(void*)(dst + doff) = (int16_t)kv;
-                else /* TD_BOOL, TD_U8 */
-                    *(uint8_t*)(dst + doff) = (uint8_t)kv;
+                else
+                    write_col_i64(dst, di, kv, kt, c->key_attrs[k]);
             }
 
             /* Scatter agg results to result columns */
@@ -4398,6 +4448,7 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 typedef struct {
     const void* key_data;
     int8_t      key_type;
+    uint8_t     key_attrs;
     int64_t*    per_worker_min;  /* [n_workers] */
     int64_t*    per_worker_max;  /* [n_workers] */
     uint32_t    n_workers;
@@ -4444,10 +4495,15 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
             } \
         } while (0)
 
-    if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
+    if (t == TD_I64 || t == TD_TIMESTAMP)
         MINMAX_SEG_LOOP(int64_t, );
-    else if (t == TD_ENUM)
-        MINMAX_SEG_LOOP(uint32_t, );
+    else if (TD_IS_SYM(t)) {
+        uint8_t w = c->key_attrs & TD_SYM_W_MASK;
+        if (w == TD_SYM_W64) MINMAX_SEG_LOOP(int64_t, );
+        else if (w == TD_SYM_W32) MINMAX_SEG_LOOP(uint32_t, );
+        else if (w == TD_SYM_W16) MINMAX_SEG_LOOP(uint16_t, );
+        else MINMAX_SEG_LOOP(uint8_t, );
+    }
     else if (t == TD_BOOL || t == TD_U8)
         MINMAX_SEG_LOOP(uint8_t, );
     else if (t == TD_I16)
@@ -4643,6 +4699,8 @@ typedef struct {
     uint32_t       n_accums;     /* number of accumulator sets (may < pool workers) */
     void**         key_ptrs;     /* key data pointers [n_keys] */
     int8_t*        key_types;    /* key type codes [n_keys] */
+    uint8_t*       key_attrs;    /* key attrs for TD_SYM width [n_keys] */
+    uint8_t*       key_esz;      /* pre-computed per-key elem size [n_keys] */
     int64_t*       key_mins;     /* per-key minimum [n_keys] */
     int64_t*       key_strides;  /* per-key stride [n_keys] */
     uint8_t        n_keys;
@@ -4661,40 +4719,35 @@ typedef struct {
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
     for (uint8_t k = 0; k < c->n_keys; k++) {
-        int64_t val;
-        int8_t t = c->key_types[k];
-        if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP)
-            val = ((const int64_t*)c->key_ptrs[k])[r];
-        else if (t == TD_ENUM)
-            val = (int64_t)((const uint32_t*)c->key_ptrs[k])[r];
-        else if (t == TD_BOOL || t == TD_U8)
-            val = (int64_t)((const uint8_t*)c->key_ptrs[k])[r];
-        else /* TD_I32, TD_DATE, TD_TIME */
-            val = (int64_t)((const int32_t*)c->key_ptrs[k])[r];
+        int64_t val = read_by_esz(c->key_ptrs[k], r, c->key_esz[k]);
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
     }
     return gid;
 }
 
-static inline void da_read_val(const void* ptr, int8_t type, int64_t r,
-                               double* out_f64, int64_t* out_i64) {
+/* Typed composite GID: eliminates per-element switch when all keys share width */
+#define DEFINE_DA_COMPOSITE_GID_TYPED(SUFFIX, KTYPE) \
+static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
+    int32_t gid = 0; \
+    for (uint8_t k = 0; k < c->n_keys; k++) { \
+        int64_t val = (int64_t)((const KTYPE*)c->key_ptrs[k])[r]; \
+        gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]); \
+    } \
+    return gid; \
+}
+DEFINE_DA_COMPOSITE_GID_TYPED(u8,  uint8_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(u16, uint16_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(u32, uint32_t)
+DEFINE_DA_COMPOSITE_GID_TYPED(i64, int64_t)
+#undef DEFINE_DA_COMPOSITE_GID_TYPED
+
+static inline void da_read_val(const void* ptr, int8_t type, uint8_t attrs,
+                               int64_t r, double* out_f64, int64_t* out_i64) {
     if (type == TD_F64) {
         *out_f64 = ((const double*)ptr)[r];
         *out_i64 = (int64_t)*out_f64;
-    } else if (type == TD_I64 || type == TD_SYM || type == TD_TIMESTAMP) {
-        *out_i64 = ((const int64_t*)ptr)[r];
-        *out_f64 = (double)*out_i64;
-    } else if (type == TD_ENUM) {
-        *out_i64 = (int64_t)((const uint32_t*)ptr)[r];
-        *out_f64 = (double)*out_i64;
-    } else if (type == TD_I32 || type == TD_DATE || type == TD_TIME) {
-        *out_i64 = (int64_t)((const int32_t*)ptr)[r];
-        *out_f64 = (double)*out_i64;
-    } else if (type == TD_I16) {
-        *out_i64 = (int64_t)((const int16_t*)ptr)[r];
-        *out_f64 = (double)*out_i64;
-    } else { /* TD_BOOL, TD_U8 */
-        *out_i64 = (int64_t)((const uint8_t*)ptr)[r];
+    } else {
+        *out_i64 = read_col_i64(ptr, r, type, attrs);
         *out_f64 = (double)*out_i64;
     }
 }
@@ -4713,7 +4766,7 @@ static td_t* materialize_broadcast_input(td_t* src, int64_t nrows) {
     if (nrows == 0) return out;
 
     if (!td_is_atom(src)) {
-        uint8_t esz = td_elem_size(src->type);
+        uint8_t esz = col_esz(src);
         const char* s = (const char*)td_data(src);
         char* d = (char*)td_data(out);
         for (int64_t i = 0; i < nrows; i++)
@@ -4756,11 +4809,6 @@ static td_t* materialize_broadcast_input(td_t* src, int64_t nrows) {
             for (int64_t i = 0; i < nrows; i++) ((uint8_t*)td_data(out))[i] = v;
             return out;
         }
-        case TD_ATOM_ENUM: {
-            uint32_t v = src->u32;
-            for (int64_t i = 0; i < nrows; i++) ((uint32_t*)td_data(out))[i] = v;
-            return out;
-        }
         default:
             td_release(out);
             return NULL;
@@ -4783,15 +4831,7 @@ typedef struct {
 } scalar_ctx_t;
 
 static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
-    if (type == TD_I64 || type == TD_SYM || type == TD_TIMESTAMP)
-        return ((const int64_t*)ptr)[r];
-    if (type == TD_I32 || type == TD_DATE || type == TD_TIME)
-        return (int64_t)((const int32_t*)ptr)[r];
-    if (type == TD_I16)
-        return (int64_t)((const int16_t*)ptr)[r];
-    if (type == TD_ENUM)
-        return (int64_t)((const uint32_t*)ptr)[r];
-    return (int64_t)((const uint8_t*)ptr)[r];
+    return read_col_i64(ptr, r, type, 0);  /* attrs=0: agg columns are numeric, never SYM */
 }
 
 /* Tight SIMD-friendly loop for single SUM/AVG on i64 (no mask).
@@ -4859,7 +4899,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             fv = (double)iv;
         } else {
             if (!c->agg_ptrs[a]) continue;
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
         }
         uint16_t op = c->agg_ops[a];
         bool is_f = (c->agg_types[a] == TD_F64);
@@ -4920,7 +4960,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         if (!c->agg_ptrs[a]) continue;
         size_t idx = base + a;
         double fv; int64_t iv;
-        da_read_val(c->agg_ptrs[a], c->agg_types[a], r, &fv, &iv);
+        da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
         uint16_t op = c->agg_ops[a];
         if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
             if (c->agg_types[a] == TD_F64) acc->sum[idx].f += fv;
@@ -4958,95 +4998,128 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
     const uint64_t* mask = c->mask;
     const uint8_t* sel_flags = c->sel_flags;
 
-    /* Fast path: single key — avoid composite GID loop overhead */
+    /* Fast path: single key — avoid composite GID loop overhead.
+     * Templated by key element size: the entire loop is stamped out per width
+     * so the compiler generates direct movzbl/movzwl/movl/movq — zero dispatch. */
+    #define DA_PF_DIST 8
+    #define DA_SINGLE_KEY_LOOP(KTYPE, KCAST) \
+    do { \
+        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        int64_t kmin = c->key_mins[0]; \
+        bool da_pf = c->n_slots >= 4096; \
+        for (int64_t r = start; r < end; ) { \
+            if (sel_flags) { \
+                uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS); \
+                int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS; \
+                if (seg_end > end) seg_end = end; \
+                if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; } \
+                bool need_bit = (sel_flags[seg] == TD_SEL_MIX); \
+                for (; r < seg_end; r++) { \
+                    if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue; \
+                    if (da_pf && TD_LIKELY(r + DA_PF_DIST < end)) { \
+                        int64_t pfk = (int64_t)KCAST kp[r + DA_PF_DIST]; \
+                        __builtin_prefetch(&acc->count[(int32_t)(pfk - kmin)], 1, 1); \
+                        if (acc->sum) __builtin_prefetch( \
+                            &acc->sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+                    } \
+                    int64_t kv = (int64_t)KCAST kp[r]; \
+                    da_accum_row(c, acc, (int32_t)(kv - kmin), r); \
+                } \
+                continue; \
+            } \
+            if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; } \
+            if (da_pf && TD_LIKELY(r + DA_PF_DIST < end)) { \
+                int64_t pfk = (int64_t)KCAST kp[r + DA_PF_DIST]; \
+                __builtin_prefetch(&acc->count[(int32_t)(pfk - kmin)], 1, 1); \
+                if (acc->sum) __builtin_prefetch( \
+                    &acc->sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+            } \
+            int64_t kv = (int64_t)KCAST kp[r]; \
+            da_accum_row(c, acc, (int32_t)(kv - kmin), r); \
+            r++; \
+        } \
+    } while (0)
+
     if (n_keys == 1) {
-        const void* kptr = c->key_ptrs[0];
-        int8_t kt = c->key_types[0];
-        int64_t kmin = c->key_mins[0];
-        #define DA_PF_DIST 8
-        /* Key read macro: typed load to int64_t */
-        #define DA_READ_KEY(ptr, row) \
-            ((kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP) \
-                ? ((const int64_t*)(ptr))[(row)] \
-            : (kt == TD_ENUM) \
-                ? (int64_t)((const uint32_t*)(ptr))[(row)] \
-            : (kt == TD_BOOL || kt == TD_U8) \
-                ? (int64_t)((const uint8_t*)(ptr))[(row)] \
-            : (kt == TD_I16) \
-                ? (int64_t)((const int16_t*)(ptr))[(row)] \
-            :   (int64_t)((const int32_t*)(ptr))[(row)])
-        bool da_prefetch = c->n_slots >= 4096;
-
-        for (int64_t r = start; r < end; ) {
-            /* Segment-level skip */
-            if (sel_flags) {
-                uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS);
-                int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
-                if (seg_end > end) seg_end = end;
-                if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; }
-                bool need_bit = (sel_flags[seg] == TD_SEL_MIX);
-
-                for (; r < seg_end; r++) {
-                    if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
-                    if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
-                        int64_t pf_kv = DA_READ_KEY(kptr, r + DA_PF_DIST);
-                        size_t pf_base = (size_t)(int32_t)(pf_kv - kmin) * n_aggs;
-                        __builtin_prefetch(&acc->count[(int32_t)(pf_kv - kmin)], 1, 1);
-                        if (acc->sum) __builtin_prefetch(&acc->sum[pf_base], 1, 1);
-                    }
-                    int64_t kv = DA_READ_KEY(kptr, r);
-                    da_accum_row(c, acc, (int32_t)(kv - kmin), r);
-                }
-                continue;
-            }
-
-            /* No sel_flags: original per-row mask check */
-            if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
-            if (da_prefetch && TD_LIKELY(r + DA_PF_DIST < end)) {
-                int64_t pf_kv = DA_READ_KEY(kptr, r + DA_PF_DIST);
-                size_t pf_base = (size_t)(int32_t)(pf_kv - kmin) * n_aggs;
-                __builtin_prefetch(&acc->count[(int32_t)(pf_kv - kmin)], 1, 1);
-                if (acc->sum) __builtin_prefetch(&acc->sum[pf_base], 1, 1);
-            }
-            int64_t kv = DA_READ_KEY(kptr, r);
-            da_accum_row(c, acc, (int32_t)(kv - kmin), r);
-            r++;
+        switch (c->key_esz[0]) {
+        case 1: DA_SINGLE_KEY_LOOP(uint8_t, ); break;
+        case 2: DA_SINGLE_KEY_LOOP(uint16_t, ); break;
+        case 4: DA_SINGLE_KEY_LOOP(uint32_t, (int64_t)); break;
+        default: DA_SINGLE_KEY_LOOP(int64_t, ); break;
         }
+        #undef DA_SINGLE_KEY_LOOP
         return;
     }
 
-    /* Multi-key composite GID path (with stride-ahead prefetch) */
-    bool da_prefetch_mk = c->n_slots >= 4096;
-    for (int64_t r = start; r < end; ) {
-        /* Segment-level skip */
-        if (sel_flags) {
-            uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS);
-            int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS;
-            if (seg_end > end) seg_end = end;
-            if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; }
-            bool need_bit = (sel_flags[seg] == TD_SEL_MIX);
+    /* Multi-key composite GID — typed inner loop eliminates read_by_esz switch.
+     * When all keys share the same element size, use da_composite_gid_XX(). */
+    #define DA_MULTI_KEY_LOOP(GID_FN) \
+    do { \
+        bool _da_pf = c->n_slots >= 4096; \
+        for (int64_t r = start; r < end; ) { \
+            if (sel_flags) { \
+                uint32_t seg = (uint32_t)(r / TD_MORSEL_ELEMS); \
+                int64_t seg_end = (int64_t)(seg + 1) * TD_MORSEL_ELEMS; \
+                if (seg_end > end) seg_end = end; \
+                if (sel_flags[seg] == TD_SEL_NONE) { r = seg_end; continue; } \
+                bool need_bit = (sel_flags[seg] == TD_SEL_MIX); \
+                for (; r < seg_end; r++) { \
+                    if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue; \
+                    if (_da_pf && TD_LIKELY(r + DA_PF_DIST < end)) { \
+                        int32_t pf_gid = GID_FN(r + DA_PF_DIST); \
+                        __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
+                        if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
+                    } \
+                    da_accum_row(c, acc, GID_FN(r), r); \
+                } \
+                continue; \
+            } \
+            if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; } \
+            if (_da_pf && TD_LIKELY(r + DA_PF_DIST < end)) { \
+                int32_t pf_gid = GID_FN(r + DA_PF_DIST); \
+                __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
+                if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
+            } \
+            da_accum_row(c, acc, GID_FN(r), r); \
+            r++; \
+        } \
+    } while (0)
 
-            for (; r < seg_end; r++) {
-                if (need_bit && !TD_SEL_BIT_TEST(mask, r)) continue;
-                if (da_prefetch_mk && TD_LIKELY(r + DA_PF_DIST < end)) {
-                    int32_t pf_gid = da_composite_gid(c, r + DA_PF_DIST);
-                    __builtin_prefetch(&acc->count[pf_gid], 1, 1);
-                    if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1);
-                }
-                da_accum_row(c, acc, da_composite_gid(c, r), r);
-            }
-            continue;
-        }
+    /* Check if all keys share the same element size */
+    bool uniform_esz = true;
+    for (uint8_t k = 1; k < n_keys; k++)
+        if (c->key_esz[k] != c->key_esz[0]) { uniform_esz = false; break; }
 
-        if (TD_UNLIKELY(mask && !TD_SEL_BIT_TEST(mask, r))) { r++; continue; }
-        if (da_prefetch_mk && TD_LIKELY(r + DA_PF_DIST < end)) {
-            int32_t pf_gid = da_composite_gid(c, r + DA_PF_DIST);
-            __builtin_prefetch(&acc->count[pf_gid], 1, 1);
-            if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1);
+    if (uniform_esz) {
+        switch (c->key_esz[0]) {
+        case 1:
+#define GID_FN(R) da_composite_gid_u8(c, (R))
+            DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            break;
+        case 2:
+#define GID_FN(R) da_composite_gid_u16(c, (R))
+            DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            break;
+        case 4:
+#define GID_FN(R) da_composite_gid_u32(c, (R))
+            DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            break;
+        default:
+#define GID_FN(R) da_composite_gid_i64(c, (R))
+            DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
+            break;
         }
-        da_accum_row(c, acc, da_composite_gid(c, r), r);
-        r++;
+    } else {
+#define GID_FN(R) da_composite_gid(c, (R))
+        DA_MULTI_KEY_LOOP(GID_FN);
+#undef GID_FN
     }
+    #undef DA_MULTI_KEY_LOOP
+    #undef DA_PF_DIST
 }
 
 /* Parallel DA merge: merge per-worker accumulators into accums[0] by
@@ -5205,16 +5278,17 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
             if (!seg0 || seg0->len <= 0) { est_groups = rows_per_part; break; }
             int8_t bt = TD_PARTED_BASETYPE(pcol->type);
             int64_t card;
-            if (bt == TD_ENUM) {
+            if (TD_IS_SYM(bt)) {
                 uint32_t sym_n = td_sym_count();
                 if (sym_n == 0 || sym_n > 4194304) { est_groups = rows_per_part; break; }
                 size_t bwords = ((size_t)sym_n + 63) / 64;
                 td_t* bits_hdr = NULL;
                 uint64_t* bits = (uint64_t*)scratch_calloc(&bits_hdr, bwords * 8);
                 if (!bits) { est_groups = rows_per_part; break; }
-                const uint32_t* ids = (const uint32_t*)td_data(seg0);
-                for (int64_t r = 0; r < seg0->len; r++)
-                    bits[ids[r] / 64] |= 1ULL << (ids[r] % 64);
+                for (int64_t r = 0; r < seg0->len; r++) {
+                    uint32_t id = (uint32_t)td_read_sym(td_data(seg0), r, seg0->type, seg0->attrs);
+                    bits[id / 64] |= 1ULL << (id % 64);
+                }
                 card = 0;
                 for (size_t i = 0; i < bwords; i++)
                     card += __builtin_popcountll(bits[i]);
@@ -5318,15 +5392,17 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
             }
 
             int8_t base_type = (int8_t)TD_PARTED_BASETYPE(col->type);
-            td_t* flat = td_vec_new(base_type, total_rows);
+            td_t** segs = (td_t**)td_data(col);
+            uint8_t base_attrs = (base_type == TD_SYM && col->len > 0 && segs[0])
+                               ? segs[0]->attrs : 0;
+            td_t* flat = typed_vec_new(base_type, base_attrs, total_rows);
             if (!flat || TD_IS_ERR(flat)) {
                 td_release(flat_tbl);
                 return TD_ERR_PTR(TD_ERR_OOM);
             }
             flat->len = total_rows;
 
-            td_t** segs = (td_t**)td_data(col);
-            size_t elem_size = (size_t)td_elem_size(base_type);
+            size_t elem_size = (size_t)td_sym_elem_size(base_type, base_attrs);
             int64_t offset = 0;
             for (int32_t p = 0; p < n_parts; p++) {
                 td_t* seg = segs[p];
@@ -5492,13 +5568,16 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
     /* Pre-compute key metadata (VLA — n_keys ≤ 8) */
     void* key_data[n_keys];
     int8_t key_types[n_keys];
+    uint8_t key_attrs[n_keys];
     for (uint8_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = td_data(key_vecs[k]);
             key_types[k] = key_vecs[k]->type;
+            key_attrs[k] = key_vecs[k]->attrs;
         } else {
             key_data[k]  = NULL;
             key_types[k] = 0;
+            key_attrs[k] = 0;
         }
     }
 
@@ -5695,10 +5774,11 @@ da_path:;
         for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
-            if (t != TD_I64 && t != TD_SYM && t != TD_I32 && t != TD_ENUM
+            if (t != TD_I64 && t != TD_SYM && t != TD_I32
                 && t != TD_TIMESTAMP && t != TD_DATE && t != TD_TIME
-                && t != TD_BOOL && t != TD_U8 && t != TD_I16)
+                && t != TD_BOOL && t != TD_U8 && t != TD_I16) {
                 da_eligible = false;
+            }
         }
 
         int64_t da_key_min[8], da_key_range[8], da_key_stride[8];
@@ -5722,6 +5802,7 @@ da_path:;
                 minmax_ctx_t mm_ctx = {
                     .key_data       = key_data[k],
                     .key_type       = key_types[k],
+                    .key_attrs      = key_attrs[k],
                     .per_worker_min = mm_mins,
                     .per_worker_max = mm_maxs,
                     .n_workers      = mm_n,
@@ -5881,11 +5962,18 @@ da_path:;
             }
 
 
+            /* Pre-compute per-key element sizes for fast DA reads */
+            uint8_t da_key_esz[n_keys];
+            for (uint8_t k = 0; k < n_keys; k++)
+                da_key_esz[k] = td_sym_elem_size(key_types[k], key_attrs[k]);
+
             da_ctx_t da_ctx = {
                 .accums      = accums,
                 .n_accums    = da_n_workers,
                 .key_ptrs    = key_data,
                 .key_types   = key_types,
+                .key_attrs   = key_attrs,
+                .key_esz     = da_key_esz,
                 .key_mins    = da_key_min,
                 .key_strides = da_key_stride,
                 .n_keys      = n_keys,
@@ -5903,7 +5991,6 @@ da_path:;
                 td_pool_dispatch(da_pool, da_accum_fn, &da_ctx, nrows);
             else
                 da_accum_fn(&da_ctx, 0, 0, nrows);
-
 
             /* Merge target is always accums[0] */
             da_accum_t* merged = &accums[0];
@@ -6040,6 +6127,7 @@ da_path:;
             }
 
 
+
             for (uint32_t w = 1; w < da_n_workers; w++)
                 da_accum_free(&accums[w]);
 
@@ -6064,7 +6152,7 @@ da_path:;
             for (uint8_t k = 0; k < n_keys; k++) {
                 td_t* src_col = key_vecs[k];
                 if (!src_col) continue;
-                td_t* key_col = td_vec_new(src_col->type, (int64_t)grp_count);
+                td_t* key_col = col_vec_new(src_col, (int64_t)grp_count);
                 if (!key_col || TD_IS_ERR(key_col)) continue;
                 key_col->len = (int64_t)grp_count;
                 uint32_t gi = 0;
@@ -6072,13 +6160,7 @@ da_path:;
                     if (da_count[s] == 0) continue;
                     int64_t offset = ((int64_t)s / da_key_stride[k]) % da_key_range[k];
                     int64_t key_val = da_key_min[k] + offset;
-                    if (src_col->type == TD_I32 || src_col->type == TD_DATE ||
-                        src_col->type == TD_TIME)
-                        ((int32_t*)td_data(key_col))[gi] = (int32_t)key_val;
-                    else if (src_col->type == TD_ENUM)
-                        ((uint32_t*)td_data(key_col))[gi] = (uint32_t)key_val;
-                    else
-                        ((int64_t*)td_data(key_col))[gi] = key_val;
+                    write_col_i64(td_data(key_col), gi, key_val, src_col->type, key_col->attrs);
                     gi++;
                 }
                 td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
@@ -6191,6 +6273,7 @@ ht_path:;
         radix_phase1_ctx_t p1ctx = {
             .key_data  = key_data,
             .key_types = key_types,
+            .key_attrs = key_attrs,
             .agg_vecs  = agg_vecs,
             .n_workers = n_total,
             .bufs      = radix_bufs,
@@ -6260,8 +6343,12 @@ ht_path:;
             key_out_types[k] = 0;
             key_esizes[k] = 0;
             if (!src_col) continue;
-            uint8_t esz = td_elem_size(src_col->type);
-            td_t* new_col = td_vec_new(src_col->type, (int64_t)total_grps);
+            uint8_t esz = td_sym_elem_size(src_col->type, src_col->attrs);
+            td_t* new_col;
+            if (src_col->type == TD_SYM)
+                new_col = td_sym_vec_new(src_col->attrs & TD_SYM_W_MASK, (int64_t)total_grps);
+            else
+                new_col = td_vec_new(src_col->type, (int64_t)total_grps);
             if (!new_col || TD_IS_ERR(new_col)) continue;
             new_col->len = (int64_t)total_grps;
             key_cols[k] = new_col;
@@ -6310,6 +6397,7 @@ ht_path:;
                 .part_offsets = part_offsets,
                 .key_dsts     = key_dsts,
                 .key_types    = key_out_types,
+                .key_attrs    = key_attrs,
                 .key_esizes   = key_esizes,
                 .n_keys       = n_keys,
                 .agg_outs     = agg_outs,
@@ -6383,7 +6471,7 @@ sequential_fallback:;
     /* Sequential path using row-layout HT */
     if (!group_ht_init(&single_ht, ht_cap, &ght_layout))
         return TD_ERR_PTR(TD_ERR_OOM);
-    group_rows_range(&single_ht, key_data, key_types, agg_vecs, 0, nrows);
+    group_rows_range(&single_ht, key_data, key_types, key_attrs, agg_vecs, 0, nrows);
 
     final_ht = &single_ht;
 
@@ -6399,29 +6487,21 @@ sequential_fallback:;
     for (uint8_t k = 0; k < n_keys; k++) {
         td_t* src_col = key_vecs[k];
         if (!src_col) continue;
-        uint8_t esz = td_elem_size(src_col->type);
+        uint8_t esz = col_esz(src_col);
         int8_t kt = src_col->type;
 
-        td_t* new_col = td_vec_new(kt, (int64_t)grp_count);
+        td_t* new_col = col_vec_new(src_col, (int64_t)grp_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = (int64_t)grp_count;
 
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             int64_t kv = ((const int64_t*)(row + 8))[k];
-            char* dst = (char*)td_data(new_col) + (size_t)gi * esz;
-            if (kt == TD_I64 || kt == TD_SYM || kt == TD_TIMESTAMP)
-                *(int64_t*)dst = kv;
-            else if (kt == TD_F64)
+            if (kt == TD_F64) {
+                char* dst = (char*)td_data(new_col) + (size_t)gi * esz;
                 memcpy(dst, &kv, 8);
-            else if (kt == TD_ENUM)
-                *(uint32_t*)dst = (uint32_t)kv;
-            else if (kt == TD_I32 || kt == TD_DATE || kt == TD_TIME)
-                *(int32_t*)dst = (int32_t)kv;
-            else if (kt == TD_I16)
-                *(int16_t*)dst = (int16_t)kv;
-            else /* TD_BOOL, TD_U8 */
-                *(uint8_t*)dst = (uint8_t)kv;
+            } else
+                write_col_i64(td_data(new_col), gi, kv, kt, new_col->attrs);
         }
 
         td_op_ext_t* key_ext = find_ext(g, ext->keys[k]->id);
@@ -6813,10 +6893,9 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
     for (int64_t c = 0; c < merge_ncols; c++) {
         td_t* first_col = td_table_get_col_idx(partials[0], c);
         int64_t name_id = td_table_col_name(partials[0], c);
-        int8_t ctype = first_col->type;
-        size_t esz = (size_t)td_elem_size(ctype);
+        size_t esz = (size_t)col_esz(first_col);
 
-        td_t* flat = td_vec_new(ctype, merge_rows);
+        td_t* flat = col_vec_new(first_col, merge_rows);
         if (!flat || TD_IS_ERR(flat)) {
             td_release(merge_tbl);
             for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
@@ -6848,11 +6927,10 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
             td_t* mc_col = td_table_get_col(parted_tbl, mc_sym_ids[m]);
             td_t** mc_ptrs = (td_t**)td_data(mc_col);
             td_t* mc_kv = mc_ptrs[0];
-            int8_t kv_type = mc_kv->type;
-            size_t esz = (size_t)td_elem_size(kv_type);
+            size_t esz = (size_t)col_esz(mc_kv);
             const char* kdata = (const char*)td_data(mc_kv);
 
-            td_t* mc_flat = td_vec_new(kv_type, merge_rows);
+            td_t* mc_flat = col_vec_new(mc_kv, merge_rows);
             if (!mc_flat || TD_IS_ERR(mc_flat)) {
                 td_release(merge_tbl);
                 for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
@@ -7081,18 +7159,11 @@ static inline bool join_keys_eq(td_t* const* l_vecs, td_t* const* r_vecs, uint8_
         td_t* lc = l_vecs[k];
         td_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
-        if (lc->type == TD_I64 || lc->type == TD_SYM || lc->type == TD_TIMESTAMP) {
-            if (((int64_t*)td_data(lc))[l] != ((int64_t*)td_data(rc))[r]) return false;
-        } else if (lc->type == TD_F64) {
+        if (lc->type == TD_F64) {
             if (((double*)td_data(lc))[l] != ((double*)td_data(rc))[r]) return false;
-        } else if (lc->type == TD_I32 || lc->type == TD_DATE || lc->type == TD_TIME) {
-            if (((int32_t*)td_data(lc))[l] != ((int32_t*)td_data(rc))[r]) return false;
-        } else if (lc->type == TD_ENUM) {
-            if (((uint32_t*)td_data(lc))[l] != ((uint32_t*)td_data(rc))[r]) return false;
-        } else if (lc->type == TD_BOOL || lc->type == TD_U8) {
-            if (((uint8_t*)td_data(lc))[l] != ((uint8_t*)td_data(rc))[r]) return false;
-        } else if (lc->type == TD_I16) {
-            if (((int16_t*)td_data(lc))[l] != ((int16_t*)td_data(rc))[r]) return false;
+        } else {
+            if (read_col_i64(td_data(lc), l, lc->type, lc->attrs) !=
+                read_col_i64(td_data(rc), r, rc->type, rc->attrs)) return false;
         }
     }
     return true;
@@ -7442,7 +7513,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     for (int64_t c = 0; c < left_ncols && l_out_count < MGATHER_MAX_COLS; c++) {
         td_t* col = td_table_get_col_idx(left_table, c);
         if (!col) continue;
-        td_t* new_col = td_vec_new(col->type, pair_count);
+        td_t* new_col = col_vec_new(col, pair_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
         l_out_cols[l_out_count] = new_col;
@@ -7467,7 +7538,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
         }
         if (is_key) continue;
         if (r_out_count >= MGATHER_MAX_COLS) continue;
-        td_t* new_col = td_vec_new(col->type, pair_count);
+        td_t* new_col = col_vec_new(col, pair_count);
         if (!new_col || TD_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
         r_out_cols[r_out_count] = new_col;
@@ -7486,7 +7557,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
                     /* find col with name l_out_names[i] */
                     i < left_ncols ? i : 0));
                 mgctx.dsts[i] = (char*)td_data(l_out_cols[i]);
-                mgctx.esz[i] = td_elem_size(l_out_cols[i]->type);
+                mgctx.esz[i] = col_esz(l_out_cols[i]);
             }
             /* Rebuild srcs correctly by matching original column order */
             int64_t si = 0;
@@ -7494,7 +7565,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
                 td_t* col = td_table_get_col_idx(left_table, c);
                 if (!col) continue;
                 mgctx.srcs[si] = (char*)td_data(col);
-                mgctx.esz[si] = td_elem_size(col->type);
+                mgctx.esz[si] = col_esz(col);
                 si++;
             }
             if (pool && pair_count > TD_PARALLEL_THRESHOLD)
@@ -7509,7 +7580,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
                 if (!col) continue;
                 gather_ctx_t gctx = {
                     .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
-                    .esz = td_elem_size(col->type), .nullable = l_nullable,
+                    .esz = col_esz(col), .nullable = l_nullable,
                 };
                 if (pool && pair_count > TD_PARALLEL_THRESHOLD)
                     td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
@@ -7526,7 +7597,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             for (int64_t i = 0; i < r_out_count; i++) {
                 mgctx.srcs[i] = (char*)td_data(r_src_cols[i]);
                 mgctx.dsts[i] = (char*)td_data(r_out_cols[i]);
-                mgctx.esz[i] = td_elem_size(r_out_cols[i]->type);
+                mgctx.esz[i] = col_esz(r_out_cols[i]);
             }
             if (pool && pair_count > TD_PARALLEL_THRESHOLD)
                 td_pool_dispatch(pool, multi_gather_fn, &mgctx, pair_count);
@@ -7536,7 +7607,7 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
             for (int64_t i = 0; i < r_out_count; i++) {
                 gather_ctx_t gctx = {
                     .idx = r_idx, .src_col = r_src_cols[i], .dst_col = r_out_cols[i],
-                    .esz = td_elem_size(r_src_cols[i]->type), .nullable = r_nullable,
+                    .esz = col_esz(r_src_cols[i]), .nullable = r_nullable,
                 };
                 if (pool && pair_count > TD_PARALLEL_THRESHOLD)
                     td_pool_dispatch(pool, gather_fn, &gctx, pair_count);
@@ -7652,15 +7723,17 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
         for (int64_t i = 0; i < len; i++)
             dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
                                : (e_arr ? e_arr[i] : e_scalar);
-    } else if (out_type == TD_ENUM) {
-        uint32_t t_scalar = then_scalar ? then_v->u32 : 0;
-        uint32_t e_scalar = else_scalar ? else_v->u32 : 0;
-        uint32_t* t_arr = then_scalar ? NULL : (uint32_t*)td_data(then_v);
-        uint32_t* e_arr = else_scalar ? NULL : (uint32_t*)td_data(else_v);
-        uint32_t* dst = (uint32_t*)td_data(result);
-        for (int64_t i = 0; i < len; i++)
-            dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
-                               : (e_arr ? e_arr[i] : e_scalar);
+    } else if (out_type == TD_SYM) {
+        int64_t t_scalar = then_scalar ? then_v->i64 : 0;
+        int64_t e_scalar = else_scalar ? else_v->i64 : 0;
+        int64_t* dst = (int64_t*)td_data(result);
+        for (int64_t i = 0; i < len; i++) {
+            int64_t tv = then_scalar ? t_scalar
+                : td_read_sym(td_data(then_v), i, then_v->type, then_v->attrs);
+            int64_t ev = else_scalar ? e_scalar
+                : td_read_sym(td_data(else_v), i, else_v->type, else_v->attrs);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
     } else if (out_type == TD_BOOL || out_type == TD_U8) {
         uint8_t t_scalar = then_scalar ? then_v->b8 : 0;
         uint8_t e_scalar = else_scalar ? else_v->b8 : 0;
@@ -7707,7 +7780,7 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
- * OP_LIKE: SQL LIKE pattern matching on SYM/ENUM columns
+ * OP_LIKE: SQL LIKE pattern matching on SYM columns
  * ============================================================================ */
 
 /* Simple SQL LIKE matcher: % = any (including empty), _ = single char.
@@ -7754,26 +7827,17 @@ static td_t* exec_like(td_graph_t* g, td_op_t* op) {
     uint8_t* dst = (uint8_t*)td_data(result);
 
     int8_t in_type = input->type;
-    if (in_type == TD_ENUM) {
-        uint32_t* data = (uint32_t*)td_data(input);
+    if (TD_IS_SYM(in_type)) {
+        const void* base = td_data(input);
         for (int64_t i = 0; i < len; i++) {
-            td_t* s = td_sym_str((int64_t)data[i]);
-            if (!s) { dst[i] = 0; continue; }
-            const char* sp = td_str_ptr(s);
-            size_t sl = td_str_len(s);
-            dst[i] = like_match(sp, sl, pat_str, pat_len) ? 1 : 0;
-        }
-    } else if (in_type == TD_SYM) {
-        int64_t* data = (int64_t*)td_data(input);
-        for (int64_t i = 0; i < len; i++) {
-            td_t* s = td_sym_str(data[i]);
+            int64_t sym_id = td_read_sym(base, i, in_type, input->attrs);
+            td_t* s = td_sym_str(sym_id);
             if (!s) { dst[i] = 0; continue; }
             const char* sp = td_str_ptr(s);
             size_t sl = td_str_len(s);
             dst[i] = like_match(sp, sl, pat_str, pat_len) ? 1 : 0;
         }
     } else {
-        /* Non-string type: all false */
         memset(dst, 0, (size_t)len);
     }
 
@@ -7828,17 +7892,11 @@ static td_t* exec_ilike(td_graph_t* g, td_op_t* op) {
     uint8_t* dst = (uint8_t*)td_data(result);
 
     int8_t in_type = input->type;
-    if (in_type == TD_ENUM) {
-        uint32_t* data = (uint32_t*)td_data(input);
+    if (TD_IS_SYM(in_type)) {
+        const void* base = td_data(input);
         for (int64_t i = 0; i < len; i++) {
-            td_t* s = td_sym_str((int64_t)data[i]);
-            if (!s) { dst[i] = 0; continue; }
-            dst[i] = ilike_match(td_str_ptr(s), td_str_len(s), pat_str, pat_len) ? 1 : 0;
-        }
-    } else if (in_type == TD_SYM) {
-        int64_t* data = (int64_t*)td_data(input);
-        for (int64_t i = 0; i < len; i++) {
-            td_t* s = td_sym_str(data[i]);
+            int64_t sym_id = td_read_sym(base, i, in_type, input->attrs);
+            td_t* s = td_sym_str(sym_id);
             if (!s) { dst[i] = 0; continue; }
             dst[i] = ilike_match(td_str_ptr(s), td_str_len(s), pat_str, pat_len) ? 1 : 0;
         }
@@ -7861,18 +7919,14 @@ static td_t* exec_ilike(td_graph_t* g, td_op_t* op) {
 /* Helper: resolve sym/enum element to string */
 static inline void sym_elem(const td_t* input, int64_t i,
                             const char** out_str, size_t* out_len) {
-    int64_t sym_id;
-    if (input->type == TD_ENUM)
-        sym_id = (int64_t)((const uint32_t*)td_data((td_t*)input))[i];
-    else
-        sym_id = ((const int64_t*)td_data((td_t*)input))[i];
+    int64_t sym_id = td_read_sym(td_data((td_t*)input), i, input->type, input->attrs);
     td_t* atom = td_sym_str(sym_id);
     if (!atom) { *out_str = ""; *out_len = 0; return; }
     *out_str = td_str_ptr(atom);
     *out_len = td_str_len(atom);
 }
 
-/* UPPER / LOWER / TRIM — unary SYM/ENUM → SYM */
+/* UPPER / LOWER / TRIM — unary SYM → SYM */
 static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
     td_t* input = exec_node(g, op->inputs[0]);
     if (!input || TD_IS_ERR(input)) return input;
@@ -7914,7 +7968,7 @@ static td_t* exec_string_unary(td_graph_t* g, td_op_t* op) {
     return result;
 }
 
-/* LENGTH — SYM/ENUM → I64 */
+/* LENGTH — SYM → I64 */
 static td_t* exec_strlen(td_graph_t* g, td_op_t* op) {
     td_t* input = exec_node(g, op->inputs[0]);
     if (!input || TD_IS_ERR(input)) return input;
@@ -8103,7 +8157,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     int64_t nrows = 1;
     for (int a = 0; a < n_args; a++) {
         int8_t at = args[a]->type;
-        if (at == TD_SYM || at == TD_ENUM) { nrows = args[a]->len; break; }
+        if (TD_IS_SYM(at)) { nrows = args[a]->len; break; }
         if (!td_is_atom(args[a]) && at != TD_STR) { nrows = args[a]->len; break; }
     }
     td_t* result = td_vec_new(TD_SYM, nrows);
@@ -8120,7 +8174,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
         size_t total = 0;
         for (int a = 0; a < n_args; a++) {
             int8_t t = args[a]->type;
-            if (t == TD_SYM || t == TD_ENUM) {
+            if (TD_IS_SYM(t)) {
                 const char* sp; size_t sl;
                 sym_elem(args[a], r, &sp, &sl);
                 total += sl;
@@ -8141,7 +8195,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
         size_t bi = 0;
         for (int a = 0; a < n_args; a++) {
             int8_t t = args[a]->type;
-            if (t == TD_SYM || t == TD_ENUM) {
+            if (TD_IS_SYM(t)) {
                 const char* sp; size_t sl;
                 sym_elem(args[a], r, &sp, &sl);
                 if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
@@ -8404,7 +8458,7 @@ static inline bool win_keys_differ(td_t* const* vecs, uint8_t n_keys,
         td_t* col = vecs[k];
         if (!col) continue;
         switch (col->type) {
-        case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+        case TD_I64: case TD_TIMESTAMP:
             if (((const int64_t*)td_data(col))[ra] !=
                 ((const int64_t*)td_data(col))[rb]) return true;
             break;
@@ -8418,9 +8472,9 @@ static inline bool win_keys_differ(td_t* const* vecs, uint8_t n_keys,
             if (((const int32_t*)td_data(col))[ra] !=
                 ((const int32_t*)td_data(col))[rb]) return true;
             break;
-        case TD_ENUM:
-            if (((const uint32_t*)td_data(col))[ra] !=
-                ((const uint32_t*)td_data(col))[rb]) return true;
+        case TD_SYM:
+            if (td_read_sym(td_data(col), ra, col->type, col->attrs) !=
+                td_read_sym(td_data(col), rb, col->type, col->attrs)) return true;
             break;
         case TD_I16:
             if (((const int16_t*)td_data(col))[ra] !=
@@ -8439,11 +8493,12 @@ static inline bool win_keys_differ(td_t* const* vecs, uint8_t n_keys,
 static inline double win_read_f64(td_t* col, int64_t row) {
     switch (col->type) {
     case TD_F64: return ((const double*)td_data(col))[row];
-    case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+    case TD_I64: case TD_TIMESTAMP:
         return (double)((const int64_t*)td_data(col))[row];
     case TD_I32: case TD_DATE: case TD_TIME:
         return (double)((const int32_t*)td_data(col))[row];
-    case TD_ENUM: return (double)((const uint32_t*)td_data(col))[row];
+    case TD_SYM:
+        return (double)td_read_sym(td_data(col), row, col->type, col->attrs);
     case TD_I16: return (double)((const int16_t*)td_data(col))[row];
     case TD_BOOL: case TD_U8: return (double)((const uint8_t*)td_data(col))[row];
     default: return 0.0;
@@ -8452,11 +8507,12 @@ static inline double win_read_f64(td_t* col, int64_t row) {
 
 static inline int64_t win_read_i64(td_t* col, int64_t row) {
     switch (col->type) {
-    case TD_I64: case TD_SYM: case TD_TIMESTAMP:
+    case TD_I64: case TD_TIMESTAMP:
         return ((const int64_t*)td_data(col))[row];
     case TD_I32: case TD_DATE: case TD_TIME:
         return (int64_t)((const int32_t*)td_data(col))[row];
-    case TD_ENUM: return (int64_t)((const uint32_t*)td_data(col))[row];
+    case TD_SYM:
+        return td_read_sym(td_data(col), row, col->type, col->attrs);
     case TD_F64: return (int64_t)((const double*)td_data(col))[row];
     case TD_I16: return (int64_t)((const int16_t*)td_data(col))[row];
     case TD_BOOL: case TD_U8: return (int64_t)((const uint8_t*)td_data(col))[row];
@@ -8839,10 +8895,9 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
     if (ctx->n_part == 1) {
         td_t* pk = ctx->sort_vecs[0];
         const void* pkd = td_data(pk);
-        if (pk->type == TD_ENUM) {
-            const uint32_t* src = (const uint32_t*)pkd;
+        if (TD_IS_SYM(pk->type)) {
             for (int64_t i = start; i < end; i++)
-                out[i] = src[sidx[i]];
+                out[i] = (uint64_t)td_read_sym(pkd, sidx[i], pk->type, pk->attrs);
         } else if (pk->type == TD_I32 || pk->type == TD_DATE || pk->type == TD_TIME) {
             const int32_t* src = (const int32_t*)pkd;
             for (int64_t i = start; i < end; i++)
@@ -8859,13 +8914,11 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
             for (uint8_t k = 0; k < ctx->n_part; k++) {
                 td_t* col = ctx->sort_vecs[k];
                 const void* d = td_data(col);
-                if (col->type == TD_ENUM)
-                    key = (key << 32) | ((const uint32_t*)d)[r];
+                if (TD_IS_SYM(col->type))
+                    key = (key << 32) | (uint32_t)td_read_sym(d, r, col->type, col->attrs);
                 else if (col->type == TD_I32 || col->type == TD_DATE || col->type == TD_TIME)
                     key = (key << 32) | (uint32_t)(((const int32_t*)d)[r] - INT32_MIN);
                 else {
-                    /* Unreachable: has_64bit_key guard above forces can_pack=false
-                     * for multi-key with any 64-bit type, so this never truncates. */
                     key = (key << 32) | (uint32_t)((const uint64_t*)d)[r];
                 }
             }
@@ -8955,7 +9008,8 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
             if (!sort_vecs[k]) { can_radix = false; break; }
             int8_t t = sort_vecs[k]->type;
             if (t != TD_I64 && t != TD_F64 && t != TD_I32 && t != TD_DATE &&
-                t != TD_ENUM && t != TD_TIME && t != TD_TIMESTAMP) {
+                t != TD_SYM &&
+                t != TD_TIME && t != TD_TIMESTAMP) {
                 can_radix = false; break;
             }
         }
@@ -8964,11 +9018,11 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
         if (can_radix) {
             td_pool_t* pool = td_pool_get();
 
-            /* Build ENUM rank mappings */
+            /* Build SYM rank mappings */
             uint32_t* enum_ranks[n_sort];
             memset(enum_ranks, 0, n_sort * sizeof(uint32_t*));
             for (uint8_t k = 0; k < n_sort; k++) {
-                if (sort_vecs[k]->type == TD_ENUM) {
+                if (TD_IS_SYM(sort_vecs[k]->type)) {
                     enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
                                                      &win_enum_rank_hdrs[k]);
                     if (!enum_ranks[k]) { can_radix = false; break; }
@@ -8983,7 +9037,9 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
                 if (keys) {
                     radix_encode_ctx_t enc = {
                         .keys = keys, .data = td_data(sort_vecs[0]),
-                        .type = sort_vecs[0]->type, .desc = sort_descs[0],
+                        .type = sort_vecs[0]->type,
+                        .col_attrs = sort_vecs[0]->attrs,
+                        .desc = sort_descs[0],
                         .nulls_first = sort_descs[0], /* default: NULLS FIRST for DESC */
                         .enum_rank = enum_ranks[0], .n_keys = 1,
                     };
@@ -9059,14 +9115,16 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
                         td_t* col = sort_vecs[k];
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
                         if (enum_ranks[k]) {
-                            const uint32_t* d = (const uint32_t*)td_data(col);
+                            const void* cdata = td_data(col);
+                            int8_t ctype = col->type;
+                            uint8_t cattrs = col->attrs;
                             for (int64_t i = 0; i < nrows; i++) {
-                                int64_t v = (int64_t)enum_ranks[k][d[i]];
+                                uint32_t raw = (uint32_t)td_read_sym(cdata, i, ctype, cattrs);
+                                int64_t v = (int64_t)enum_ranks[k][raw];
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == TD_I64 || col->type == TD_SYM ||
-                                   col->type == TD_TIMESTAMP) {
+                        } else if (col->type == TD_I64 || col->type == TD_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)td_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];
@@ -9209,7 +9267,7 @@ static td_t* exec_window(td_graph_t* g, td_op_t* op, td_t* tbl) {
         bool has_64bit_key = false;
         for (uint8_t k = 0; k < n_part; k++) {
             int8_t t = sort_vecs[k]->type;
-            if (t == TD_ENUM || t == TD_I32 || t == TD_DATE || t == TD_TIME) pk_bits += 32;
+            if (TD_IS_SYM(t) || t == TD_I32 || t == TD_DATE || t == TD_TIME) pk_bits += 32;
             else if (t == TD_I64 || t == TD_SYM || t == TD_TIMESTAMP ||
                      t == TD_F64) { pk_bits += 64; has_64bit_key = true; }
             else { can_pack = false; break; }
@@ -9415,12 +9473,15 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             if (TD_IS_PARTED(col->type)) {
                 /* Concat parted segments into flat vector (cold path) */
                 int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
+                td_t** sps = (td_t**)td_data(col);
+                uint8_t sba = (base == TD_SYM && col->len > 0 && sps[0])
+                            ? sps[0]->attrs : 0;
                 int64_t total = td_parted_nrows(col);
-                td_t* flat = td_vec_new(base, total);
+                td_t* flat = typed_vec_new(base, sba, total);
                 if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
                 flat->len = total;
-                td_t** segs = (td_t**)td_data(col);
-                size_t esz = (size_t)td_elem_size(base);
+                td_t** segs = sps;
+                size_t esz = (size_t)td_sym_elem_size(base, sba);
                 int64_t off = 0;
                 for (int64_t s = 0; s < col->len; s++) {
                     if (segs[s] && segs[s]->len > 0) {
@@ -9769,8 +9830,11 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                     if (TD_IS_PARTED(col->type)) {
                         /* Copy first n rows from parted segments */
                         int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
-                        uint8_t esz = td_elem_size(base);
-                        td_t* head_vec = td_vec_new(base, n);
+                        td_t** sp = (td_t**)td_data(col);
+                        uint8_t ba = (base == TD_SYM && col->len > 0 && sp[0])
+                                   ? sp[0]->attrs : 0;
+                        uint8_t esz = td_sym_elem_size(base, ba);
+                        td_t* head_vec = typed_vec_new(base, ba, n);
                         if (head_vec && !TD_IS_ERR(head_vec)) {
                             head_vec->len = n;
                             td_t** segs = (td_t**)td_data(col);
@@ -9789,8 +9853,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                         td_release(head_vec);
                     } else {
                         /* Flat column: direct copy */
-                        uint8_t esz = td_elem_size(col->type);
-                        td_t* head_vec = td_vec_new(col->type, n);
+                        uint8_t esz = col_esz(col);
+                        td_t* head_vec = col_vec_new(col, n);
                         if (head_vec && !TD_IS_ERR(head_vec)) {
                             head_vec->len = n;
                             memcpy(td_data(head_vec), td_data(col),
@@ -9805,8 +9869,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             }
             if (n > input->len) n = input->len;
             /* Materialized copy for vector head */
-            uint8_t esz = td_elem_size(input->type);
-            td_t* result = td_vec_new(input->type, n);
+            uint8_t esz = col_esz(input);
+            td_t* result = col_vec_new(input, n);
             if (result && !TD_IS_ERR(result)) {
                 result->len = n;
                 memcpy(td_data(result), td_data(input), (size_t)n * esz);
@@ -9836,11 +9900,10 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                         td_t* kv = mc_ptrs[0];
                         td_t* rc = mc_ptrs[1];
                         int64_t n_parts = kv->len;
-                        int8_t kv_type = kv->type;
-                        size_t esz = (size_t)td_elem_size(kv_type);
+                        size_t esz = (size_t)col_esz(kv);
                         const char* kdata = (const char*)td_data(kv);
                         const int64_t* counts = (const int64_t*)td_data(rc);
-                        td_t* flat = td_vec_new(kv_type, n);
+                        td_t* flat = col_vec_new(kv, n);
                         if (flat && !TD_IS_ERR(flat)) {
                             flat->len = n;
                             char* out = (char*)td_data(flat);
@@ -9863,8 +9926,11 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                     if (TD_IS_PARTED(col->type)) {
                         /* Copy last N rows from parted segments */
                         int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
-                        uint8_t esz = td_elem_size(base);
-                        td_t* tail_vec = td_vec_new(base, n);
+                        td_t** tsp = (td_t**)td_data(col);
+                        uint8_t tba = (base == TD_SYM && col->len > 0 && tsp[0])
+                                    ? tsp[0]->attrs : 0;
+                        uint8_t esz = td_sym_elem_size(base, tba);
+                        td_t* tail_vec = typed_vec_new(base, tba, n);
                         if (tail_vec && !TD_IS_ERR(tail_vec)) {
                             tail_vec->len = n;
                             td_t** segs = (td_t**)td_data(col);
@@ -9884,8 +9950,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                         td_release(tail_vec);
                     } else {
                         /* Flat column: direct copy */
-                        uint8_t esz = td_elem_size(col->type);
-                        td_t* tail_vec = td_vec_new(col->type, n);
+                        uint8_t esz = col_esz(col);
+                        td_t* tail_vec = col_vec_new(col, n);
                         if (tail_vec && !TD_IS_ERR(tail_vec)) {
                             tail_vec->len = n;
                             memcpy(td_data(tail_vec),
@@ -9901,8 +9967,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             }
             if (n > input->len) n = input->len;
             int64_t skip = input->len - n;
-            uint8_t esz = td_elem_size(input->type);
-            td_t* result = td_vec_new(input->type, n);
+            uint8_t esz = col_esz(input);
+            td_t* result = col_vec_new(input, n);
             if (result && !TD_IS_ERR(result)) {
                 result->len = n;
                 memcpy(td_data(result),

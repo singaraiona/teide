@@ -39,7 +39,11 @@ const uint8_t td_type_sizes[TD_TYPE_COUNT] = {
     /* [TD_TIMESTAMP] = 11 */ 8,
     /* [TD_GUID]      = 12 */ 16,
     /* [TD_TABLE]     = 13 */ 8,   /* pointer-sized (td_t*) */
-    /* [TD_SYM]       = 14 */ 8,
-    /* [TD_ENUM]      = 15 */ 4,
+    /*                = 14 */ 0,
+    /*                = 15 */ 0,
     /* [TD_SEL]       = 16 */ 0,   /* variable-size layout, no elem_size */
+    /*                = 17 */ 0,
+    /*                = 18 */ 0,
+    /*                = 19 */ 0,
+    /* [TD_SYM]       = 20 */ 8,   /* W64 default; narrow widths use td_sym_elem_size */
 };

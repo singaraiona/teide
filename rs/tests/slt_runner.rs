@@ -109,7 +109,7 @@ fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
             }
             None => "NULL".to_string(),
         },
-        14 | 15 => match table.get_str(col, row) {
+        15 | 20 => match table.get_str(col, row) {
             Some(s) => s.to_string(),
             None => "NULL".to_string(),
         },

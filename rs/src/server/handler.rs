@@ -380,13 +380,7 @@ impl TeideHandler {
                     .columns
                     .iter()
                     .map(|(name, _td_type)| {
-                        FieldInfo::new(
-                            name.clone(),
-                            None,
-                            None,
-                            Type::VARCHAR,
-                            FieldFormat::Text,
-                        )
+                        FieldInfo::new(name.clone(), None, None, Type::VARCHAR, FieldFormat::Text)
                     })
                     .collect();
 

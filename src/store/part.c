@@ -479,7 +479,7 @@ td_t* td_read_parted(const char* db_root, const char* table_name) {
             td_retain(seg);
             segs[p] = seg;
             td_vm_advise_willneed(td_data(seg),
-                                  (size_t)seg->len * td_elem_size(first_seg->type));
+                                  (size_t)seg->len * td_sym_elem_size(seg->type, seg->attrs));
         }
 
         result = td_table_add_col(result, name_id, parted);

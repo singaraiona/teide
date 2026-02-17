@@ -35,7 +35,7 @@ pub fn teide_to_pg_type(td_type: i8) -> Type {
         ffi::TD_I32 | ffi::TD_DATE => Type::INT4,
         ffi::TD_I64 | ffi::TD_TIME | ffi::TD_TIMESTAMP => Type::INT8,
         ffi::TD_F64 => Type::FLOAT8,
-        ffi::TD_STR | ffi::TD_SYM | ffi::TD_ENUM => Type::VARCHAR,
+        ffi::TD_STR | ffi::TD_SYM => Type::VARCHAR,
         _ => Type::VARCHAR,
     }
 }
@@ -73,7 +73,7 @@ pub fn format_cell(table: &crate::Table, col: usize, row: usize) -> Option<Strin
                 Some(s.to_string())
             }
         }
-        ffi::TD_SYM | ffi::TD_ENUM => table.get_str(col, row),
+        ffi::TD_SYM => table.get_str(col, row),
         _ => Some("<unsupported>".to_string()),
     }
 }

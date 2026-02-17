@@ -77,8 +77,11 @@ static MunitResult test_elem_size(const void* params, void* fixture) {
     munit_assert_int(td_elem_size(TD_I32),  ==, 4);
     munit_assert_int(td_elem_size(TD_I64),  ==, 8);
     munit_assert_int(td_elem_size(TD_F64),  ==, 8);
-    munit_assert_int(td_elem_size(TD_ENUM), ==, 4);
-    munit_assert_int(td_elem_size(TD_SYM), ==, 8);
+    munit_assert_int(td_elem_size(TD_SYM), ==, 8);  /* W64 default */
+    munit_assert_int(td_sym_elem_size(TD_SYM, TD_SYM_W8),  ==, 1);
+    munit_assert_int(td_sym_elem_size(TD_SYM, TD_SYM_W16), ==, 2);
+    munit_assert_int(td_sym_elem_size(TD_SYM, TD_SYM_W32), ==, 4);
+    munit_assert_int(td_sym_elem_size(TD_SYM, TD_SYM_W64), ==, 8);
     munit_assert_int(td_elem_size(TD_GUID), ==, 16);
 
     return MUNIT_OK;

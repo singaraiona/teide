@@ -35,7 +35,7 @@
 static int64_t vec_capacity(td_t* vec) {
     size_t block_size = (size_t)1 << vec->order;
     size_t data_space = block_size - 32;
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     if (esz == 0) return 0;
     return (int64_t)(data_space / esz);
 }
@@ -47,6 +47,8 @@ static int64_t vec_capacity(td_t* vec) {
 td_t* td_vec_new(int8_t type, int64_t capacity) {
     if (type <= 0 || type >= TD_TYPE_COUNT)
         return TD_ERR_PTR(TD_ERR_TYPE);
+    if (type == TD_SYM)
+        return td_sym_vec_new(TD_SYM_W64, capacity);  /* default: global sym IDs */
     if (capacity < 0) return TD_ERR_PTR(TD_ERR_RANGE);
 
     uint8_t esz = td_elem_size(type);
@@ -66,6 +68,34 @@ td_t* td_vec_new(int8_t type, int64_t capacity) {
 }
 
 /* --------------------------------------------------------------------------
+ * td_sym_vec_new — create a TD_SYM vector with adaptive index width
+ *
+ * sym_width: TD_SYM_W8, TD_SYM_W16, TD_SYM_W32, or TD_SYM_W64
+ * capacity:  number of elements (rows)
+ * -------------------------------------------------------------------------- */
+
+td_t* td_sym_vec_new(uint8_t sym_width, int64_t capacity) {
+    if ((sym_width & ~TD_SYM_W_MASK) != 0)
+        return TD_ERR_PTR(TD_ERR_TYPE);
+    if (capacity < 0) return TD_ERR_PTR(TD_ERR_RANGE);
+
+    uint8_t esz = (uint8_t)TD_SYM_ELEM(sym_width);
+    size_t data_size = (size_t)capacity * esz;
+    if (esz > 1 && data_size / esz != (size_t)capacity)
+        return TD_ERR_PTR(TD_ERR_OOM);
+
+    td_t* v = td_alloc(data_size);
+    if (!v || TD_IS_ERR(v)) return v;
+
+    v->type = TD_SYM;
+    v->len = 0;
+    v->attrs = sym_width;  /* lower 2 bits encode width */
+    memset(v->nullmap, 0, 16);
+
+    return v;
+}
+
+/* --------------------------------------------------------------------------
  * td_vec_append
  * -------------------------------------------------------------------------- */
 
@@ -78,7 +108,7 @@ td_t* td_vec_append(td_t* vec, const void* elem) {
     vec = td_cow(vec);
     if (!vec || TD_IS_ERR(vec)) return vec;
 
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
     /* Grow if needed */
@@ -120,7 +150,7 @@ td_t* td_vec_set(td_t* vec, int64_t idx, const void* elem) {
     vec = td_cow(vec);
     if (!vec || TD_IS_ERR(vec)) return vec;
 
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     char* dst = (char*)td_data(vec) + idx * esz;
     memcpy(dst, elem, esz);
 
@@ -139,12 +169,12 @@ void* td_vec_get(td_t* vec, int64_t idx) {
         td_t* parent = vec->slice_parent;
         int64_t offset = vec->slice_offset;
         if (idx < 0 || idx >= vec->len) return NULL;
-        uint8_t esz = td_elem_size(parent->type);
+        uint8_t esz = td_sym_elem_size(parent->type, parent->attrs);
         return (char*)td_data(parent) + (offset + idx) * esz;
     }
 
     if (idx < 0 || idx >= vec->len) return NULL;
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     return (char*)td_data(vec) + idx * esz;
 }
 
@@ -170,7 +200,7 @@ td_t* td_vec_slice(td_t* vec, int64_t offset, int64_t len) {
     if (!s || TD_IS_ERR(s)) return s;
 
     s->type = parent->type;
-    s->attrs = TD_ATTR_SLICE;
+    s->attrs = TD_ATTR_SLICE | (parent->attrs & TD_SYM_W_MASK);
     s->len = len;
     s->slice_parent = parent;
     s->slice_offset = parent_offset;
@@ -191,7 +221,7 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
     if (a->type != b->type)
         return TD_ERR_PTR(TD_ERR_TYPE);
 
-    uint8_t esz = td_elem_size(a->type);
+    uint8_t esz = td_sym_elem_size(a->type, a->attrs);
     int64_t total_len = a->len + b->len;
     if (total_len < a->len) return TD_ERR_PTR(TD_ERR_OOM); /* overflow */
     size_t data_size = (size_t)total_len * esz;
@@ -203,7 +233,7 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
 
     result->type = a->type;
     result->len = total_len;
-    result->attrs = 0;
+    result->attrs = a->attrs;  /* preserve SYM width attrs */
     memset(result->nullmap, 0, 16);
 
     /* Copy data from a */
@@ -239,7 +269,9 @@ td_t* td_vec_from_raw(int8_t type, const void* data, int64_t count) {
         return TD_ERR_PTR(TD_ERR_TYPE);
     if (count < 0) return TD_ERR_PTR(TD_ERR_RANGE);
 
-    uint8_t esz = td_elem_size(type);
+    /* TD_SYM defaults to W64 (global sym IDs) */
+    uint8_t sym_w = (type == TD_SYM) ? TD_SYM_W64 : 0;
+    uint8_t esz = td_sym_elem_size(type, sym_w);
     size_t data_size = (size_t)count * esz;
 
     td_t* v = td_alloc(data_size);
@@ -247,7 +279,7 @@ td_t* td_vec_from_raw(int8_t type, const void* data, int64_t count) {
 
     v->type = type;
     v->len = count;
-    v->attrs = 0;
+    v->attrs = sym_w;
     memset(v->nullmap, 0, 16);
 
     memcpy(td_data(v), data, data_size);

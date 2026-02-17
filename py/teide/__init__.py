@@ -516,8 +516,8 @@ TD_STR = 8
 TD_DATE = 9
 TD_TIME = 10
 TD_TIMESTAMP = 11
-TD_ENUM = 15
 TD_TABLE = 13
+TD_SYM = 20
 
 # Opcode constants
 OP_SUM = 50

@@ -88,7 +88,9 @@ fn setup_session() -> (Session, tempfile::NamedTempFile) {
     let (file, path) = create_test_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE csv AS SELECT * FROM read_csv('{path}')"))
+        .execute(&format!(
+            "CREATE TABLE csv AS SELECT * FROM read_csv('{path}')"
+        ))
         .unwrap();
     (session, file)
 }
@@ -415,10 +417,14 @@ fn join_inner_sql() {
     let (_right_file, right_path) = create_join_right_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"))
+        .execute(&format!(
+            "CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"
+        ))
         .unwrap();
     session
-        .execute(&format!("CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"))
+        .execute(&format!(
+            "CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"
+        ))
         .unwrap();
 
     let r = unwrap_query(
@@ -436,10 +442,14 @@ fn join_left_sql() {
     let (_right_file, right_path) = create_join_right_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"))
+        .execute(&format!(
+            "CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"
+        ))
         .unwrap();
     session
-        .execute(&format!("CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"))
+        .execute(&format!(
+            "CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"
+        ))
         .unwrap();
 
     let r = unwrap_query(
@@ -457,10 +467,14 @@ fn join_full_outer_sql() {
     let (_right_file, right_path) = create_join_right_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"))
+        .execute(&format!(
+            "CREATE TABLE x AS SELECT * FROM read_csv('{left_path}')"
+        ))
         .unwrap();
     session
-        .execute(&format!("CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"))
+        .execute(&format!(
+            "CREATE TABLE y AS SELECT * FROM read_csv('{right_path}')"
+        ))
         .unwrap();
 
     // Left table (csv): id001(4), id002(4), id003(4), id004(4), id005(4) = 20 rows
@@ -1288,7 +1302,9 @@ fn nulls_first_asc_radix() {
     let (file, path) = create_nulls_sort_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE t AS SELECT * FROM read_csv('{path}')"))
+        .execute(&format!(
+            "CREATE TABLE t AS SELECT * FROM read_csv('{path}')"
+        ))
         .unwrap();
 
     // NULLIF(val, 50.0) → NULL when val=50, else val.  ORDER BY ASC NULLS FIRST.
@@ -1320,7 +1336,9 @@ fn nulls_last_asc_radix() {
     let (file, path) = create_nulls_sort_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE t AS SELECT * FROM read_csv('{path}')"))
+        .execute(&format!(
+            "CREATE TABLE t AS SELECT * FROM read_csv('{path}')"
+        ))
         .unwrap();
 
     // ASC NULLS LAST (default behavior): NULL row should be at the end.
@@ -1351,7 +1369,9 @@ fn nulls_first_desc_radix() {
     let (file, path) = create_nulls_sort_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE t AS SELECT * FROM read_csv('{path}')"))
+        .execute(&format!(
+            "CREATE TABLE t AS SELECT * FROM read_csv('{path}')"
+        ))
         .unwrap();
 
     // DESC NULLS FIRST (default for DESC): NULL row should be first.
@@ -1382,7 +1402,9 @@ fn nulls_last_desc_radix() {
     let (file, path) = create_nulls_sort_csv();
     let mut session = Session::new().unwrap();
     session
-        .execute(&format!("CREATE TABLE t AS SELECT * FROM read_csv('{path}')"))
+        .execute(&format!(
+            "CREATE TABLE t AS SELECT * FROM read_csv('{path}')"
+        ))
         .unwrap();
 
     // DESC NULLS LAST: NULL row should be at the end.
@@ -1724,7 +1746,9 @@ fn parted_sql_count() {
 
     let r = unwrap_query(
         session
-            .execute(&format!("SELECT COUNT(*) as cnt FROM read_parted('{db_root}', 'data')"))
+            .execute(&format!(
+                "SELECT COUNT(*) as cnt FROM read_parted('{db_root}', 'data')"
+            ))
             .unwrap(),
     );
 
@@ -1806,7 +1830,7 @@ fn parted_sql_select_star() {
     assert!(v1_row0.is_some(), "should read v1 from partition 0");
     assert!(v1_row10.is_some(), "should read v1 from partition 1");
 
-    // id1 is ENUM column — verify string access works across partitions
+    // id1 is SYM column — verify string access works across partitions
     let id1_row0 = r.table.get_str(0, 0);
     let id1_row19 = r.table.get_str(0, 19);
     assert!(id1_row0.is_some(), "should read id1 from first row");

@@ -210,10 +210,7 @@ async fn extended_select_count() {
 
     let client = connect(15440).await;
     // query() uses extended protocol (Parse/Bind/Execute)
-    let rows = client
-        .query("SELECT COUNT(*) FROM t", &[])
-        .await
-        .unwrap();
+    let rows = client.query("SELECT COUNT(*) FROM t", &[]).await.unwrap();
     assert_eq!(rows.len(), 1);
     // Extended protocol returns text-format values since we return NoData for Describe
     let count: &str = rows[0].get(0);

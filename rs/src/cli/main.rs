@@ -457,7 +457,7 @@ fn type_name(typ: i8) -> &'static str {
         9 => "date",
         10 => "time",
         11 => "timestamp",
-        14 => "sym",
+        20 => "sym",
         15 => "enum",
         _ => "?",
     }
@@ -763,7 +763,7 @@ fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
             }
             None => "NULL".to_string(),
         },
-        14 | 15 => match table.get_str(col, row) {
+        15 | 20 => match table.get_str(col, row) {
             Some(s) => s.to_string(),
             None => "NULL".to_string(),
         },
@@ -796,7 +796,7 @@ fn format_json_value(table: &teide::Table, col: usize, row: usize) -> String {
             }
             None => "null".to_string(),
         },
-        14 | 15 => match table.get_str(col, row) {
+        15 | 20 => match table.get_str(col, row) {
             Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
             None => "null".to_string(),
         },

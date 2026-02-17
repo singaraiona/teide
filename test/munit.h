@@ -33,16 +33,16 @@ typedef struct {
     MunitTestFunc     test;     /* test function */
     MunitTestSetup*   setup;    /* optional setup (NULL if unused) */
     MunitTestTearDown* tear_down; /* optional teardown (NULL if unused) */
-    unsigned int       options;  /* unused, kept for compat */
-    void*             parameters; /* unused, kept for compat */
+    unsigned int       options;  /* reserved */
+    void*             parameters; /* reserved */
 } MunitTest;
 
 typedef struct MunitSuite {
     const char*          prefix;    /* suite prefix, e.g. "/vec" */
     MunitTest*           tests;     /* NULL-terminated array of tests */
     struct MunitSuite*   suites;    /* NULL-terminated array of child suites */
-    unsigned int          iterations; /* unused, kept for compat */
-    unsigned int          options;    /* unused, kept for compat */
+    unsigned int          iterations; /* reserved */
+    unsigned int          options;    /* reserved */
 } MunitSuite;
 
 /* ---- Suite runner ------------------------------------------------------ */

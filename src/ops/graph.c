@@ -371,7 +371,7 @@ static int8_t promote(int8_t a, int8_t b) {
     if (a == TD_F64 || b == TD_F64) return TD_F64;
     if (a == TD_I64 || b == TD_I64 || a == TD_SYM || b == TD_SYM ||
         a == TD_TIMESTAMP || b == TD_TIMESTAMP) return TD_I64;
-    if (a == TD_I32 || b == TD_I32 || a == TD_ENUM || b == TD_ENUM ||
+    if (a == TD_I32 || b == TD_I32 ||
         a == TD_DATE || b == TD_DATE || a == TD_TIME || b == TD_TIME) return TD_I32;
     if (a == TD_I16 || b == TD_I16) return TD_I16;
     if (a == TD_U8 || b == TD_U8) return TD_U8;
@@ -423,11 +423,11 @@ td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_va
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
     int8_t out_type = promote(then_val->out_type, else_val->out_type);
-    /* For string types, propagate SYM/ENUM/STR → SYM */
-    if (then_val->out_type == TD_SYM || then_val->out_type == TD_ENUM)
-        out_type = then_val->out_type;
-    else if (else_val->out_type == TD_SYM || else_val->out_type == TD_ENUM)
-        out_type = else_val->out_type;
+    /* For string types, propagate SYM/STR → SYM (global sym IDs) */
+    if (then_val->out_type == TD_SYM)
+        out_type = TD_SYM;
+    else if (else_val->out_type == TD_SYM)
+        out_type = TD_SYM;
     else if (then_val->out_type == TD_STR || else_val->out_type == TD_STR)
         out_type = TD_SYM;  /* string constants → intern as SYM */
     uint32_t est = cond->est_rows;

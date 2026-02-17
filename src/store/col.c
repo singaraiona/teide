@@ -40,9 +40,9 @@
 static bool is_serializable_type(int8_t t) {
     switch (t) {
     case TD_BOOL: case TD_U8:   case TD_CHAR:  case TD_I16:
-    case TD_I32:  case TD_I64:  case TD_F64:   case TD_SYM:
+    case TD_I32:  case TD_I64:  case TD_F64:
     case TD_DATE: case TD_TIME: case TD_TIMESTAMP: case TD_GUID:
-    case TD_ENUM:
+    case TD_SYM:
         return true;
     default:
         return false;
@@ -81,7 +81,7 @@ td_err_t td_col_save(td_t* vec, const char* path) {
 
     /* Write data */
     if (vec->len < 0) { fclose(f); return TD_ERR_CORRUPT; }
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     if (esz == 0 && vec->len > 0) { fclose(f); return TD_ERR_TYPE; }
     /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
     if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
@@ -144,7 +144,7 @@ td_t* td_col_load(const char* path) {
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
 
-    uint8_t esz = td_elem_size(tmp->type);
+    uint8_t esz = td_sym_elem_size(tmp->type, tmp->attrs);
     if (esz == 0 && tmp->len > 0) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_TYPE);
@@ -211,7 +211,7 @@ td_t* td_col_mmap(const char* path) {
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
 
-    uint8_t esz = td_elem_size(vec->type);
+    uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
     if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
         td_vm_unmap_file(ptr, mapped_size);

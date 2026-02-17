@@ -38,7 +38,7 @@ Usage:
 """
 
 import ctypes
-from teide import TeideLib, TD_I64, TD_F64, TD_I32, TD_BOOL, TD_ENUM, TD_TABLE, TD_STR
+from teide import TeideLib, TD_I64, TD_F64, TD_I32, TD_BOOL, TD_SYM, TD_TABLE, TD_STR
 from teide import OP_SUM, OP_AVG, OP_MIN, OP_MAX, OP_COUNT, OP_FIRST, OP_LAST
 
 # Opcode constants not in __init__
@@ -46,8 +46,20 @@ OP_PROD = 51
 
 _DTYPE_NAMES = {
     TD_BOOL: "bool", TD_I32: "i32", TD_I64: "i64",
-    TD_F64: "f64", TD_STR: "str", TD_ENUM: "sym",
+    TD_F64: "f64", TD_STR: "str", TD_SYM: "sym",
 }
+
+# TD_SYM width constants (lower 2 bits of attrs)
+_SYM_W_MASK = 0x03
+
+def _sym_elem_size(attrs):
+    """Compute TD_SYM element size from attrs: 1, 2, 4, or 8 bytes."""
+    return 1 << (attrs & _SYM_W_MASK)
+
+def _sym_ctype(attrs):
+    """Return the ctypes type for a TD_SYM column based on attrs width."""
+    w = attrs & _SYM_W_MASK
+    return (ctypes.c_uint8, ctypes.c_uint16, ctypes.c_uint32, ctypes.c_int64)[w]
 
 
 def _format_val(val, dtype):
@@ -162,14 +174,23 @@ class Series:
         ptr_val = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int64))
         return ptr_val[3]  # offset 24 bytes = 3 int64s
 
+    def _attrs(self):
+        """Read the attrs byte from the td_t header (offset 19)."""
+        return ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_uint8))[19]
+
+    def _elem_size(self):
+        """Get element size for this column's type."""
+        if self.dtype == TD_SYM:
+            return _sym_elem_size(self._attrs())
+        return {TD_F64: 8, TD_I64: 8, TD_I32: 4, TD_BOOL: 1}.get(self.dtype, 1)
+
     def _data_ptr(self):
         """Get actual data pointer, resolving slices to parent data."""
-        attrs = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_uint8))[19]
+        attrs = self._attrs()
         if attrs & 0x10:  # TD_ATTR_SLICE
             parent = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_void_p))[0]
             offset = ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_int64))[1]
-            esz = {TD_F64: 8, TD_I64: 8, TD_I32: 4, TD_BOOL: 1, TD_ENUM: 4}.get(self.dtype, 1)
-            return parent + 32 + offset * esz
+            return parent + 32 + offset * self._elem_size()
         return self._ptr + 32
 
     def _get_val(self, i):
@@ -183,8 +204,10 @@ class Series:
             return (ctypes.c_int32 * 1).from_address(data_ptr + i * 4)[0]
         elif self.dtype == TD_BOOL:
             return bool((ctypes.c_uint8 * 1).from_address(data_ptr + i)[0])
-        elif self.dtype == TD_ENUM:
-            sym_id = (ctypes.c_uint32 * 1).from_address(data_ptr + i * 4)[0]
+        elif self.dtype == TD_SYM:
+            ct = _sym_ctype(self._attrs())
+            esz = ctypes.sizeof(ct)
+            sym_id = int((ct * 1).from_address(data_ptr + i * esz)[0])
             sym_ptr = self._lib.sym_str(sym_id)
             if sym_ptr:
                 s = self._lib.str_ptr(sym_ptr)
@@ -208,11 +231,12 @@ class Series:
         elif self.dtype == TD_BOOL:
             arr = (ctypes.c_uint8 * n).from_address(data_ptr)
             return [bool(arr[i]) for i in range(n)]
-        elif self.dtype == TD_ENUM:
-            arr = (ctypes.c_uint32 * n).from_address(data_ptr)
+        elif self.dtype == TD_SYM:
+            ct = _sym_ctype(self._attrs())
+            arr = (ct * n).from_address(data_ptr)
             result = []
             for i in range(n):
-                sym_ptr = self._lib.sym_str(arr[i])
+                sym_ptr = self._lib.sym_str(int(arr[i]))
                 if sym_ptr:
                     s = self._lib.str_ptr(sym_ptr)
                     result.append(s.decode('utf-8') if s else "")

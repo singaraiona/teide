@@ -830,7 +830,7 @@ static void sym_fixup_fn(void* arg, uint32_t worker_id, int64_t start, int64_t e
 static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
                               int n_cols, const csv_type_t* col_types,
                               void** col_data, int64_t n_rows,
-                              td_pool_t* pool) {
+                              td_pool_t* pool, int64_t* col_max_ids) {
     for (int c = 0; c < n_cols; c++) {
         if (col_types[c] != CSV_TYPE_STR) continue;
 
@@ -858,6 +858,15 @@ static void merge_local_syms(local_sym_t* local_syms, uint32_t n_workers,
                 if (mappings[w][i] < 0) mappings[w][i] = 0;
             }
         }
+
+        /* Track max global sym_id for adaptive width narrowing */
+        int64_t max_id = 0;
+        for (uint32_t w = 0; w < n_workers; w++) {
+            for (uint32_t i = 0; i < mapping_counts[w]; i++) {
+                if (mappings[w][i] > max_id) max_id = mappings[w][i];
+            }
+        }
+        if (col_max_ids) col_max_ids[c] = max_id;
 
         /* Fix up column data: parallel unpack (wid, lid) → global sym_id.
          * Mappings are read-only at this point — no contention. */
@@ -1208,7 +1217,7 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
                 case CSV_TYPE_DATE:      resolved_types[c] = TD_DATE;      break;
                 case CSV_TYPE_TIME:      resolved_types[c] = TD_TIME;      break;
                 case CSV_TYPE_TIMESTAMP: resolved_types[c] = TD_TIMESTAMP; break;
-                default:                 resolved_types[c] = TD_ENUM;      break;
+                default:                 resolved_types[c] = TD_SYM;       break;
             }
         }
     } else {
@@ -1222,7 +1231,10 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
 
     for (int c = 0; c < ncols; c++) {
         int8_t type = resolved_types[c];
-        col_vecs[c] = td_vec_new(type, n_rows);
+        /* String columns: allocate TD_SYM at W32 (4B/elem) for PACK_SYM during parse.
+         * After merge, narrow to W8/W16 if max sym ID permits. */
+        col_vecs[c] = (type == TD_SYM) ? td_sym_vec_new(TD_SYM_W32, n_rows)
+                                        : td_vec_new(type, n_rows);
         if (!col_vecs[c] || TD_IS_ERR(col_vecs[c])) {
             for (int j = 0; j < c; j++) td_release(col_vecs[j]);
             goto fail_offsets;
@@ -1248,6 +1260,8 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
     }
 
     /* ---- 9. Parse data ---- */
+    int64_t sym_max_ids[CSV_MAX_COLS];
+    memset(sym_max_ids, 0, (size_t)ncols * sizeof(int64_t));
     {
         /* Check if any string columns exist */
         int has_str_cols = 0;
@@ -1301,7 +1315,8 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
                 /* Merge local sym tables into global (main thread — safe) */
                 if (has_str_cols && local_syms) {
                     merge_local_syms(local_syms, n_workers, ncols,
-                                     parse_types, col_data, n_rows, pool);
+                                     parse_types, col_data, n_rows, pool,
+                                     sym_max_ids);
 
                     for (uint32_t w = 0; w < n_workers; w++) {
                         for (int c = 0; c < ncols; c++) {
@@ -1317,7 +1332,38 @@ td_t* td_read_csv_opts(const char* path, char delimiter, bool header,
         if (!use_parallel) {
             csv_parse_serial(buf, file_size, row_offsets, n_rows,
                              ncols, delimiter, parse_types, col_data);
+            /* Serial path: scan string columns to find max sym ID */
+            for (int c = 0; c < ncols; c++) {
+                if (parse_types[c] != CSV_TYPE_STR) continue;
+                const uint32_t* d = (const uint32_t*)col_data[c];
+                uint32_t mx = 0;
+                for (int64_t r = 0; r < n_rows; r++)
+                    if (d[r] > mx) mx = d[r];
+                sym_max_ids[c] = (int64_t)mx;
+            }
         }
+    }
+
+    /* ---- 10. Narrow sym columns to optimal width ---- */
+    for (int c = 0; c < ncols; c++) {
+        if (resolved_types[c] != TD_SYM) continue;
+        uint8_t new_w = td_sym_dict_width(sym_max_ids[c]);
+        if (new_w >= TD_SYM_W32) continue; /* already at W32, no savings */
+        td_t* narrow = td_sym_vec_new(new_w, n_rows);
+        if (!narrow || TD_IS_ERR(narrow)) continue;
+        narrow->len = n_rows;
+        const uint32_t* src = (const uint32_t*)col_data[c];
+        void* dst = td_data(narrow);
+        if (new_w == TD_SYM_W8) {
+            uint8_t* d = (uint8_t*)dst;
+            for (int64_t r = 0; r < n_rows; r++) d[r] = (uint8_t)src[r];
+        } else { /* TD_SYM_W16 */
+            uint16_t* d = (uint16_t*)dst;
+            for (int64_t r = 0; r < n_rows; r++) d[r] = (uint16_t)src[r];
+        }
+        td_release(col_vecs[c]);
+        col_vecs[c] = narrow;
+        col_data[c] = dst;
     }
 
     /* ---- 11. Build table ---- */
@@ -1439,14 +1485,8 @@ td_err_t td_write_csv(td_t* table, const char* path) {
                 break;
             }
             case TD_SYM: {
-                int64_t sym = ((const int64_t*)td_data(col))[r];
+                int64_t sym = td_read_sym(td_data(col), r, col->type, col->attrs);
                 td_t* s = td_sym_str(sym);
-                if (s) csv_write_str(fp, td_str_ptr(s), td_str_len(s));
-                break;
-            }
-            case TD_ENUM: {
-                uint32_t sym = ((const uint32_t*)td_data(col))[r];
-                td_t* s = td_sym_str((int64_t)sym);
                 if (s) csv_write_str(fp, td_str_ptr(s), td_str_len(s));
                 break;
             }

@@ -1075,7 +1075,10 @@ pub fn plan_having_expr(
 
 /// Predict the C engine's naming convention for an aggregate output column.
 /// SUM(v1) → "v1_sum", COUNT(v1) → "v1_count", AVG(v1) → "v1_mean", etc.
-pub fn predict_c_agg_name(func: &Function, original_schema: &HashMap<String, usize>) -> Option<String> {
+pub fn predict_c_agg_name(
+    func: &Function,
+    original_schema: &HashMap<String, usize>,
+) -> Option<String> {
     let op = func.name.to_string().to_lowercase();
     let suffix = match op.as_str() {
         "sum" => "_sum",

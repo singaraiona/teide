@@ -118,8 +118,8 @@ fn csv_read() {
     assert_eq!(table.col_name_str(6), "v1");
     assert_eq!(table.col_name_str(8), "v3");
 
-    // Column types: id1-id3 are ENUM, id4-id6/v1-v2 are I64, v3 is F64
-    assert_eq!(table.col_type(0), teide::types::ENUM);
+    // Column types: id1-id3 are SYM (CSV now produces TD_SYM), id4-id6/v1-v2 are I64, v3 is F64
+    assert_eq!(table.col_type(0), teide::types::SYM);
     assert_eq!(table.col_type(3), teide::types::I64);
     assert_eq!(table.col_type(6), teide::types::I64);
     assert_eq!(table.col_type(8), teide::types::F64);

@@ -227,21 +227,6 @@ static MunitResult test_atom_sym(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
-/* ---- Enum atom --------------------------------------------------------- */
-
-static MunitResult test_atom_enum(const void* params, void* fixture) {
-    (void)params; (void)fixture;
-
-    td_t* v = td_enum_atom(12345);
-    munit_assert_ptr_not_null(v);
-    munit_assert_true(td_is_atom(v));
-    munit_assert_int(v->type, ==, TD_ATOM_ENUM);
-    munit_assert_uint(v->u32, ==, 12345);
-    td_release(v);
-
-    return MUNIT_OK;
-}
-
 /* ---- Date atom --------------------------------------------------------- */
 
 static MunitResult test_atom_date(const void* params, void* fixture) {
@@ -350,7 +335,6 @@ static MunitTest atom_tests[] = {
     { "/str_sso",   test_atom_str_sso,   atom_setup, atom_teardown, 0, NULL },
     { "/str_long",  test_atom_str_long,  atom_setup, atom_teardown, 0, NULL },
     { "/sym",       test_atom_sym,       atom_setup, atom_teardown, 0, NULL },
-    { "/enum",      test_atom_enum,      atom_setup, atom_teardown, 0, NULL },
     { "/date",      test_atom_date,      atom_setup, atom_teardown, 0, NULL },
     { "/time",      test_atom_time,      atom_setup, atom_teardown, 0, NULL },
     { "/timestamp", test_atom_timestamp, atom_setup, atom_teardown, 0, NULL },

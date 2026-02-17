@@ -42,15 +42,14 @@ pub const TD_TIME: i8 = 10;
 pub const TD_TIMESTAMP: i8 = 11;
 pub const TD_GUID: i8 = 12;
 pub const TD_TABLE: i8 = 13;
-pub const TD_SYM: i8 = 14;
-pub const TD_ENUM: i8 = 15;
 pub const TD_SEL: i8 = 16;
+pub const TD_SYM: i8 = 20;
 
-pub const TD_TYPE_COUNT: usize = 17;
+pub const TD_TYPE_COUNT: usize = 21;
 
 // Parted types
 pub const TD_PARTED_BASE: i8 = 32;
-pub const TD_MAPCOMMON: i8 = 48;
+pub const TD_MAPCOMMON: i8 = 64;
 
 // MAPCOMMON inferred sub-types (stored in attrs field)
 pub const TD_MC_SYM: u8 = 0;
@@ -81,7 +80,32 @@ pub const TD_ATOM_TIME: i8 = -TD_TIME;
 pub const TD_ATOM_TIMESTAMP: i8 = -TD_TIMESTAMP;
 pub const TD_ATOM_GUID: i8 = -TD_GUID;
 pub const TD_ATOM_SYM: i8 = -TD_SYM;
-pub const TD_ATOM_ENUM: i8 = -TD_ENUM;
+
+// ===== Symbol Width Constants =====
+
+pub const TD_SYM_W_MASK: u8 = 0x03;
+pub const TD_SYM_W8: u8 = 0x00;
+pub const TD_SYM_W16: u8 = 0x01;
+pub const TD_SYM_W32: u8 = 0x02;
+pub const TD_SYM_W64: u8 = 0x03;
+
+#[inline]
+pub fn td_is_sym(t: i8) -> bool {
+    t == TD_SYM
+}
+
+/// Read a sym index at the correct width.
+/// # Safety
+/// `data` must point to valid column data, `row` must be in bounds.
+#[inline]
+pub unsafe fn read_sym(data: *const u8, row: usize, _t: i8, attrs: u8) -> i64 {
+    match attrs & TD_SYM_W_MASK {
+        TD_SYM_W8 => (unsafe { *data.add(row) }) as i64,
+        TD_SYM_W16 => (unsafe { *(data as *const u16).add(row) }) as i64,
+        TD_SYM_W32 => (unsafe { *(data as *const u32).add(row) }) as i64,
+        _ => unsafe { *(data as *const i64).add(row) },
+    }
+}
 
 // ===== Attribute Flags =====
 
@@ -399,6 +423,15 @@ pub unsafe fn td_len(v: *const td_t) -> i64 {
     (*v).val.len
 }
 
+/// Get the attrs field of a td_t.
+///
+/// # Safety
+/// `v` must be a valid non-null pointer to a live `td_t`.
+#[inline]
+pub unsafe fn td_attrs(v: *const td_t) -> u8 {
+    (*v).attrs
+}
+
 /// Get pointer to data payload (byte 32 onward).
 ///
 /// # Safety
@@ -592,7 +625,6 @@ extern "C" {
     pub fn td_f64(val: c_double) -> *mut td_t;
     pub fn td_str(s: *const c_char, len: usize) -> *mut td_t;
     pub fn td_sym(id: i64) -> *mut td_t;
-    pub fn td_enum_atom(idx: u32) -> *mut td_t;
     pub fn td_date(val: i64) -> *mut td_t;
     pub fn td_time(val: i64) -> *mut td_t;
     pub fn td_timestamp(val: i64) -> *mut td_t;
@@ -600,6 +632,7 @@ extern "C" {
 
     // --- Vector API ---
     pub fn td_vec_new(type_: i8, capacity: i64) -> *mut td_t;
+    pub fn td_sym_vec_new(sym_width: u8, capacity: i64) -> *mut td_t;
     pub fn td_vec_append(vec: *mut td_t, elem: *const c_void) -> *mut td_t;
     pub fn td_vec_set(vec: *mut td_t, idx: i64, elem: *const c_void) -> *mut td_t;
     pub fn td_vec_get(vec: *mut td_t, idx: i64) -> *mut c_void;
@@ -691,7 +724,8 @@ extern "C" {
         else_val: *mut td_op_t,
     ) -> *mut td_op_t;
     pub fn td_like(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t) -> *mut td_op_t;
-    pub fn td_ilike(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t) -> *mut td_op_t;
+    pub fn td_ilike(g: *mut td_graph_t, input: *mut td_op_t, pattern: *mut td_op_t)
+        -> *mut td_op_t;
     pub fn td_upper(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_lower(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
     pub fn td_strlen(g: *mut td_graph_t, a: *mut td_op_t) -> *mut td_op_t;
@@ -748,11 +782,7 @@ extern "C" {
         n_aggs: u8,
     ) -> *mut td_op_t;
 
-    pub fn td_distinct(
-        g: *mut td_graph_t,
-        keys: *mut *mut td_op_t,
-        n_keys: u8,
-    ) -> *mut td_op_t;
+    pub fn td_distinct(g: *mut td_graph_t, keys: *mut *mut td_op_t, n_keys: u8) -> *mut td_op_t;
 
     pub fn td_join(
         g: *mut td_graph_t,

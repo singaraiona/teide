@@ -679,17 +679,87 @@ impl Table {
 
     /// Type tag of the column at `idx`.
     /// For parted columns, returns the base type (e.g. TD_I64 not TD_PARTED_BASE+TD_I64).
+    /// For MAPCOMMON columns, returns the key_values vector type (DATE/I64/SYM).
     pub fn col_type(&self, idx: usize) -> i8 {
         match self.get_col_idx(idx as i64) {
             Some(col) => {
                 let t = unsafe { ffi::td_type(col) };
-                if ffi::td_is_parted(t) {
+                if t == ffi::TD_MAPCOMMON {
+                    unsafe { Self::mapcommon_kv_type(col) }
+                } else if ffi::td_is_parted(t) {
                     ffi::td_parted_basetype(t)
                 } else {
                     t
                 }
             }
             None => 0,
+        }
+    }
+
+    /// True if column at `idx` is a MAPCOMMON virtual partition column.
+    pub fn is_mapcommon(&self, idx: usize) -> bool {
+        match self.get_col_idx(idx as i64) {
+            Some(col) => {
+                let t = unsafe { ffi::td_type(col) };
+                t == ffi::TD_MAPCOMMON
+            }
+            None => false,
+        }
+    }
+
+    /// Inferred sub-type of a MAPCOMMON column (TD_MC_SYM/DATE/I64).
+    pub fn mapcommon_inferred_type(&self, idx: usize) -> u8 {
+        match self.get_col_idx(idx as i64) {
+            Some(col) => unsafe { (*col).attrs },
+            None => ffi::TD_MC_SYM,
+        }
+    }
+
+    /// Get the type of key_values inside a MAPCOMMON column.
+    unsafe fn mapcommon_kv_type(mc: *mut ffi::td_t) -> i8 {
+        let ptrs = unsafe { ffi::td_data(mc) as *const *mut ffi::td_t };
+        let kv = unsafe { *ptrs.add(0) };
+        unsafe { ffi::td_type(kv) }
+    }
+
+    /// Resolve a logical row in a TD_MAPCOMMON column to its partition index.
+    /// MAPCOMMON stores [key_values, row_counts] as two td_t pointers.
+    unsafe fn resolve_mapcommon_part(
+        vec: *mut ffi::td_t,
+        row: usize,
+    ) -> Option<usize> {
+        let ptrs = unsafe { ffi::td_data(vec) as *const *mut ffi::td_t };
+        let rc_vec = unsafe { *ptrs.add(1) }; // row_counts
+        let n_parts = unsafe { ffi::td_len(rc_vec) } as usize;
+        let counts = unsafe { ffi::td_data(rc_vec) as *const i64 };
+        let mut offset = 0usize;
+        for p in 0..n_parts {
+            let cnt = unsafe { *counts.add(p) } as usize;
+            if row < offset + cnt {
+                return Some(p);
+            }
+            offset += cnt;
+        }
+        None
+    }
+
+    /// Read an i64 value from a MAPCOMMON column (handles DATE/I64/SYM key types).
+    unsafe fn read_mapcommon_i64(vec: *mut ffi::td_t, row: usize) -> Option<i64> {
+        let p = unsafe { Self::resolve_mapcommon_part(vec, row)? };
+        let ptrs = unsafe { ffi::td_data(vec) as *const *mut ffi::td_t };
+        let kv = unsafe { *ptrs.add(0) };
+        let kv_type = unsafe { ffi::td_type(kv) };
+        let data = unsafe { ffi::td_data(kv) };
+        match kv_type {
+            ffi::TD_DATE | ffi::TD_I32 | ffi::TD_TIME => {
+                let ptr = data as *const i32;
+                Some(unsafe { *ptr.add(p) } as i64)
+            }
+            _ => {
+                // TD_I64, TD_SYM, TD_TIMESTAMP
+                let ptr = data as *const i64;
+                Some(unsafe { *ptr.add(p) })
+            }
         }
     }
 
@@ -720,6 +790,11 @@ impl Table {
     pub fn get_i64(&self, col: usize, row: usize) -> Option<i64> {
         let vec = self.get_col_idx(col as i64)?;
         let t = unsafe { ffi::td_type(vec) };
+
+        // Handle MAPCOMMON: return partition key value as i64
+        if t == ffi::TD_MAPCOMMON {
+            return unsafe { Self::read_mapcommon_i64(vec, row) };
+        }
 
         // Handle parted columns: resolve to segment
         if ffi::td_is_parted(t) {
@@ -764,6 +839,11 @@ impl Table {
         let vec = self.get_col_idx(col as i64)?;
         let t = unsafe { ffi::td_type(vec) };
 
+        // MAPCOMMON columns are partition key symbols, not floats
+        if t == ffi::TD_MAPCOMMON {
+            return None;
+        }
+
         // Handle parted columns
         if ffi::td_is_parted(t) {
             let base_t = ffi::td_parted_basetype(t);
@@ -788,10 +868,30 @@ impl Table {
         }
     }
 
-    /// Read a string value from a SYM or ENUM column at `col`, `row`.
+    /// Read a string value from a SYM, ENUM, or MAPCOMMON column at `col`, `row`.
     pub fn get_str(&self, col: usize, row: usize) -> Option<String> {
         let vec = self.get_col_idx(col as i64)?;
         let t = unsafe { ffi::td_type(vec) };
+
+        // Handle MAPCOMMON: resolve partition → typed value → string
+        if t == ffi::TD_MAPCOMMON {
+            let kv_type = unsafe { Self::mapcommon_kv_type(vec) };
+            let val = unsafe { Self::read_mapcommon_i64(vec, row)? };
+            return match kv_type {
+                ffi::TD_SYM => {
+                    let atom = unsafe { ffi::td_sym_str(val) };
+                    if atom.is_null() { return None; }
+                    unsafe {
+                        let ptr = ffi::td_str_ptr(atom);
+                        let slen = ffi::td_str_len(atom);
+                        let slice = std::slice::from_raw_parts(ptr as *const u8, slen);
+                        std::str::from_utf8(slice).ok().map(|s| s.to_owned())
+                    }
+                }
+                ffi::TD_DATE => Some(Self::format_date(val as i32)),
+                _ => Some(format!("{val}")),
+            };
+        }
 
         // Handle parted columns
         if ffi::td_is_parted(t) {
@@ -808,6 +908,22 @@ impl Table {
     }
 
     /// Read a string from a flat (non-parted) SYM or ENUM vector.
+    /// Format days since 2000-01-01 as "YYYY-MM-DD" string.
+    /// Inverse of Hinnant civil_from_days algorithm.
+    pub fn format_date(days_since_2000: i32) -> String {
+        let z = days_since_2000 as i64 + 10957 + 719468; // shift to 0000-03-01 epoch
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
     unsafe fn read_str_from_vec(vec: *mut ffi::td_t, t: i8, row: usize) -> Option<String> {
         let sym_id = match t {
             ffi::TD_SYM => {

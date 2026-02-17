@@ -488,7 +488,7 @@ static MunitResult test_part_open(const void* params, void* fixture) {
     munit_assert_ptr_not_null(parted);
     munit_assert_false(TD_IS_ERR(parted));
 
-    /* Should have 3 columns: a (parted I64), b (parted F64), __part (MAPCOMMON) */
+    /* Should have 3 columns: date (MAPCOMMON), a (parted I64), b (parted F64) */
     int64_t ncols = td_table_ncols(parted);
     munit_assert_int(ncols, ==, 3);
 
@@ -496,8 +496,33 @@ static MunitResult test_part_open(const void* params, void* fixture) {
     int64_t nrows = td_table_nrows(parted);
     munit_assert_int(nrows, ==, 8);
 
-    /* Verify first column is parted I64 */
-    td_t* col_a = td_table_get_col_idx(parted, 0);
+    /* Verify first column is MAPCOMMON (date-inferred) */
+    td_t* mapcommon = td_table_get_col_idx(parted, 0);
+    munit_assert_ptr_not_null(mapcommon);
+    munit_assert_int(mapcommon->type, ==, TD_MAPCOMMON);
+    munit_assert_uint(mapcommon->attrs, ==, TD_MC_DATE);
+
+    /* MAPCOMMON: [key_values (TD_DATE), row_counts (TD_I64)] */
+    td_t** mc_ptrs = (td_t**)td_data(mapcommon);
+    td_t* key_values = mc_ptrs[0];
+    td_t* row_counts = mc_ptrs[1];
+
+    /* key_values should be TD_DATE with parsed days-since-2000 */
+    munit_assert_int(key_values->type, ==, TD_DATE);
+    munit_assert_int(key_values->len, ==, 2);
+    int32_t* kv_data = (int32_t*)td_data(key_values);
+    /* 2024.01.01 = 8766 days since 2000-01-01 */
+    munit_assert_int(kv_data[0], ==, 8766);
+    /* 2024.01.02 = 8767 */
+    munit_assert_int(kv_data[1], ==, 8767);
+
+    munit_assert_int(row_counts->len, ==, 2);
+    int64_t* rc_data = (int64_t*)td_data(row_counts);
+    munit_assert_int(rc_data[0], ==, 3);
+    munit_assert_int(rc_data[1], ==, 5);
+
+    /* Verify second column is parted I64 */
+    td_t* col_a = td_table_get_col_idx(parted, 1);
     munit_assert_ptr_not_null(col_a);
     munit_assert_true(TD_IS_PARTED(col_a->type));
     munit_assert_int(TD_PARTED_BASETYPE(col_a->type), ==, TD_I64);
@@ -515,23 +540,10 @@ static MunitResult test_part_open(const void* params, void* fixture) {
     munit_assert_int(data_a0[0], ==, 10);
     munit_assert_int(data_a0[2], ==, 30);
 
-    /* Verify second column is parted F64 */
-    td_t* col_b = td_table_get_col_idx(parted, 1);
+    /* Verify third column is parted F64 */
+    td_t* col_b = td_table_get_col_idx(parted, 2);
     munit_assert_true(TD_IS_PARTED(col_b->type));
     munit_assert_int(TD_PARTED_BASETYPE(col_b->type), ==, TD_F64);
-
-    /* Verify MAPCOMMON column (last column) */
-    td_t* mapcommon = td_table_get_col_idx(parted, ncols - 1);
-    munit_assert_ptr_not_null(mapcommon);
-    munit_assert_int(mapcommon->type, ==, TD_MAPCOMMON);
-
-    /* MAPCOMMON: [key_values, row_counts] */
-    td_t** mc_ptrs = (td_t**)td_data(mapcommon);
-    td_t* row_counts = mc_ptrs[1];
-    munit_assert_int(row_counts->len, ==, 2);
-    int64_t* rc_data = (int64_t*)td_data(row_counts);
-    munit_assert_int(rc_data[0], ==, 3);
-    munit_assert_int(rc_data[1], ==, 5);
 
     /* Release — should unmap all segments */
     td_release(parted);

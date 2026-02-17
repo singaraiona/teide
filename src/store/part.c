@@ -28,6 +28,67 @@
 #include <stdio.h>
 #include <dirent.h>
 
+/* Validate YYYY.MM.DD format: exactly 10 chars, dots at pos 4/7,
+ * month 01-12, day 01-31. */
+static bool is_date_dir(const char* name) {
+    if (strlen(name) != 10) return false;
+    if (name[4] != '.' || name[7] != '.') return false;
+    for (int i = 0; i < 10; i++) {
+        if (i == 4 || i == 7) continue;
+        if (name[i] < '0' || name[i] > '9') return false;
+    }
+    int month = (name[5] - '0') * 10 + (name[6] - '0');
+    int day   = (name[8] - '0') * 10 + (name[9] - '0');
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+/* Check if string is a pure integer (digits only, possibly with leading minus). */
+static bool is_integer_str(const char* s) {
+    if (!*s) return false;
+    if (*s == '-') s++;
+    if (!*s) return false;
+    for (; *s; s++)
+        if (*s < '0' || *s > '9') return false;
+    return true;
+}
+
+/* Infer MAPCOMMON sub-type from partition directory names. */
+static uint8_t infer_mc_type(char** part_dirs, int64_t part_count) {
+    bool all_date = true, all_int = true;
+    for (int64_t i = 0; i < part_count; i++) {
+        if (all_date && !is_date_dir(part_dirs[i])) all_date = false;
+        if (all_int && !is_integer_str(part_dirs[i])) all_int = false;
+        if (!all_date && !all_int) break;
+    }
+    if (all_date) return TD_MC_DATE;
+    if (all_int) return TD_MC_I64;
+    return TD_MC_SYM;
+}
+
+/* Parse "YYYY.MM.DD" → days since 2000-01-01 (Postgres epoch).
+ * Uses inverse of Hinnant's civil_from_days algorithm (same as exec.c). */
+static int32_t parse_date_dir(const char* name) {
+    int64_t y = (name[0]-'0')*1000 + (name[1]-'0')*100 +
+                (name[2]-'0')*10   + (name[3]-'0');
+    int64_t m = (name[5]-'0')*10 + (name[6]-'0');
+    int64_t d = (name[8]-'0')*10 + (name[9]-'0');
+    y -= (m <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    uint64_t yoe = (uint64_t)(y - era * 400);
+    uint64_t doy = (153 * (m > 2 ? (uint64_t)m-3 : (uint64_t)m+9) + 2)/5 + (uint64_t)d - 1;
+    uint64_t doe = yoe*365 + yoe/4 - yoe/100 + doy;
+    return (int32_t)(era * 146097 + (int64_t)doe - 719468 - 10957);
+}
+
+/* Parse integer string → int64_t. Caller guarantees is_integer_str(). */
+static int64_t parse_int_dir(const char* s) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    int64_t v = 0;
+    for (; *s; s++) v = v * 10 + (*s - '0');
+    return neg ? -v : v;
+}
+
 /* --------------------------------------------------------------------------
  * Partitioned table: date-partitioned directory of splayed tables
  *
@@ -315,17 +376,89 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
     int64_t ncols = td_table_ncols(part_tables[0]);
     if (ncols <= 0) goto fail_tables;
 
-    /* Build result table: ncols data columns + 1 MAPCOMMON */
+    /* Infer MAPCOMMON sub-type from partition directory names */
+    uint8_t mc_type = infer_mc_type(part_dirs, part_count);
+
+    /* Build result table: 1 MAPCOMMON + ncols data columns */
     td_t* result = td_table_new(ncols + 2);
     if (!result || TD_IS_ERR(result)) goto fail_tables;
 
-    /* For each column: build a parted wrapper */
+    /* ---- MAPCOMMON column (first) ---- */
+    {
+        /* key_values type matches inferred partition key type */
+        int8_t kv_type = (mc_type == TD_MC_DATE) ? TD_DATE
+                       : (mc_type == TD_MC_I64)  ? TD_I64
+                       :                           TD_SYM;
+        td_t* key_values = td_vec_new(kv_type, part_count);
+        td_t* row_counts = td_vec_new(TD_I64, part_count);
+        if (!key_values || TD_IS_ERR(key_values) ||
+            !row_counts || TD_IS_ERR(row_counts)) {
+            if (key_values && !TD_IS_ERR(key_values)) td_release(key_values);
+            if (row_counts && !TD_IS_ERR(row_counts)) td_release(row_counts);
+            td_release(result);
+            goto fail_tables;
+        }
+
+        int64_t* rc_data = (int64_t*)td_data(row_counts);
+        if (mc_type == TD_MC_DATE) {
+            int32_t* kv_data = (int32_t*)td_data(key_values);
+            for (int64_t p = 0; p < part_count; p++) {
+                kv_data[p] = parse_date_dir(part_dirs[p]);
+                rc_data[p] = td_table_nrows(part_tables[p]);
+            }
+        } else if (mc_type == TD_MC_I64) {
+            int64_t* kv_data = (int64_t*)td_data(key_values);
+            for (int64_t p = 0; p < part_count; p++) {
+                kv_data[p] = parse_int_dir(part_dirs[p]);
+                rc_data[p] = td_table_nrows(part_tables[p]);
+            }
+        } else {
+            int64_t* kv_data = (int64_t*)td_data(key_values);
+            for (int64_t p = 0; p < part_count; p++) {
+                kv_data[p] = td_sym_intern(part_dirs[p], strlen(part_dirs[p]));
+                rc_data[p] = td_table_nrows(part_tables[p]);
+            }
+        }
+        key_values->len = part_count;
+        row_counts->len = part_count;
+
+        td_t* mapcommon = td_alloc(2 * sizeof(td_t*));
+        if (!mapcommon || TD_IS_ERR(mapcommon)) {
+            td_release(key_values);
+            td_release(row_counts);
+            td_release(result);
+            goto fail_tables;
+        }
+        mapcommon->type = TD_MAPCOMMON;
+        mapcommon->len = 2;
+        mapcommon->attrs = mc_type;
+        memset(mapcommon->nullmap, 0, 16);
+
+        td_t** mc_ptrs = (td_t**)td_data(mapcommon);
+        mc_ptrs[0] = key_values;  td_retain(key_values);
+        mc_ptrs[1] = row_counts;  td_retain(row_counts);
+
+        const char* mc_name = (mc_type == TD_MC_DATE) ? "date" : "part";
+        int64_t part_name_id = td_sym_intern(mc_name, strlen(mc_name));
+        result = td_table_add_col(result, part_name_id, mapcommon);
+        if (!result || TD_IS_ERR(result)) {
+            td_release(mapcommon);
+            td_release(key_values);
+            td_release(row_counts);
+            goto fail_tables;
+        }
+
+        td_release(mapcommon);
+        td_release(key_values);
+        td_release(row_counts);
+    }
+
+    /* ---- Data columns (after MAPCOMMON) ---- */
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = td_table_col_name(part_tables[0], c);
         td_t* first_seg = td_table_get_col_idx(part_tables[0], c);
         if (!first_seg) continue;
 
-        /* Allocate parted wrapper via buddy */
         td_t* parted = td_alloc((size_t)part_count * sizeof(td_t*));
         if (!parted || TD_IS_ERR(parted)) {
             td_release(result);
@@ -340,72 +473,19 @@ td_t* td_part_open(const char* db_root, const char* table_name) {
         for (int64_t p = 0; p < part_count; p++) {
             td_t* seg = td_table_get_col_idx(part_tables[p], c);
             if (!seg) {
-                /* Fill with NULL on schema mismatch — shouldn't happen */
                 segs[p] = NULL;
                 continue;
             }
             td_retain(seg);
             segs[p] = seg;
-            /* Async readahead: pre-fault mmap pages in background */
             td_vm_advise_willneed(td_data(seg),
                                   (size_t)seg->len * td_elem_size(first_seg->type));
         }
 
         result = td_table_add_col(result, name_id, parted);
-        td_release(parted); /* table_add_col retains it */
+        td_release(parted);
         if (!result || TD_IS_ERR(result)) goto fail_tables;
     }
-
-    /* Build MAPCOMMON column: [key_values (SYM), row_counts (I64)] */
-    td_t* key_values = td_vec_new(TD_SYM, part_count);
-    td_t* row_counts = td_vec_new(TD_I64, part_count);
-    if (!key_values || TD_IS_ERR(key_values) ||
-        !row_counts || TD_IS_ERR(row_counts)) {
-        if (key_values && !TD_IS_ERR(key_values)) td_release(key_values);
-        if (row_counts && !TD_IS_ERR(row_counts)) td_release(row_counts);
-        td_release(result);
-        goto fail_tables;
-    }
-
-    int64_t* kv_data = (int64_t*)td_data(key_values);
-    int64_t* rc_data = (int64_t*)td_data(row_counts);
-    for (int64_t p = 0; p < part_count; p++) {
-        kv_data[p] = td_sym_intern(part_dirs[p], strlen(part_dirs[p]));
-        rc_data[p] = td_table_nrows(part_tables[p]);
-    }
-    key_values->len = part_count;
-    row_counts->len = part_count;
-
-    /* Allocate MAPCOMMON wrapper: 2 pointers */
-    td_t* mapcommon = td_alloc(2 * sizeof(td_t*));
-    if (!mapcommon || TD_IS_ERR(mapcommon)) {
-        td_release(key_values);
-        td_release(row_counts);
-        td_release(result);
-        goto fail_tables;
-    }
-    mapcommon->type = TD_MAPCOMMON;
-    mapcommon->len = 2;
-    mapcommon->attrs = 0;
-    memset(mapcommon->nullmap, 0, 16);
-
-    td_t** mc_ptrs = (td_t**)td_data(mapcommon);
-    mc_ptrs[0] = key_values;  td_retain(key_values);
-    mc_ptrs[1] = row_counts;  td_retain(row_counts);
-
-    int64_t part_name_id = td_sym_intern("__part", 6);
-    result = td_table_add_col(result, part_name_id, mapcommon);
-    if (!result || TD_IS_ERR(result)) {
-        td_release(mapcommon);
-        td_release(key_values);
-        td_release(row_counts);
-        goto fail_tables;
-    }
-
-    /* Release our local refs */
-    td_release(mapcommon);
-    td_release(key_values);
-    td_release(row_counts);
 
     /* Release partition sub-tables (segment vectors survive via retain) */
     for (int64_t p = 0; p < part_count; p++) {

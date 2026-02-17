@@ -52,6 +52,11 @@ pub const TD_TYPE_COUNT: usize = 17;
 pub const TD_PARTED_BASE: i8 = 32;
 pub const TD_MAPCOMMON: i8 = 48;
 
+// MAPCOMMON inferred sub-types (stored in attrs field)
+pub const TD_MC_SYM: u8 = 0;
+pub const TD_MC_DATE: u8 = 1;
+pub const TD_MC_I64: u8 = 2;
+
 #[inline]
 pub fn td_is_parted(t: i8) -> bool {
     (TD_PARTED_BASE..TD_MAPCOMMON).contains(&t)

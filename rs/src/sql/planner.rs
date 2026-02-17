@@ -911,6 +911,20 @@ fn plan_query(
     let limit_val = extract_limit(query)?;
 
     // Stage 2: GROUP BY / aggregation / DISTINCT
+    // Fuse LIMIT into GROUP BY graph when safe (no ORDER BY, no HAVING).
+    // The C engine uses HEAD(GROUP) to short-circuit per-partition loops.
+    let group_limit = if (has_group_by || has_aggregates)
+        && order_by_exprs.is_empty()
+        && select.having.is_none()
+    {
+        match (offset_val, limit_val) {
+            (Some(off), Some(lim)) => Some(off.saturating_add(lim)),
+            (None, Some(lim)) => Some(lim),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (result_table, result_aliases) = if has_group_by || has_aggregates {
         plan_group_select(
             ctx,
@@ -920,6 +934,7 @@ fn plan_query(
             &schema,
             &alias_exprs,
             selection,
+            group_limit,
         )?
     } else if is_distinct {
         // DISTINCT without GROUP BY: use GROUP BY on all selected columns
@@ -999,7 +1014,7 @@ fn plan_query(
         };
         (g.execute(root)?, total_limit.is_some())
     } else {
-        (result_table, false)
+        (result_table, group_limit.is_some())
     };
 
     // Stage 4: OFFSET + LIMIT (only parts not already fused)
@@ -1379,6 +1394,7 @@ fn plan_group_select(
     schema: &HashMap<String, usize>,
     alias_exprs: &HashMap<String, Expr>,
     selection: Option<*mut crate::td_t>,
+    group_limit: Option<i64>,
 ) -> Result<(Table, Vec<String>), SqlError> {
     // RAII guard: ensures the selection is released on all exit paths
     // (including early returns). set_selection does its own retain, so the
@@ -1543,7 +1559,13 @@ fn plan_group_select(
             g.set_selection(mask);
         }
     }
-    let group_result = g.execute(group_node)?;
+    // Fuse LIMIT into GROUP BY graph so the C engine can optimize
+    // (e.g. short-circuit per-partition loop for MAPCOMMON-only keys).
+    let exec_root = match group_limit {
+        Some(n) => g.head(group_node, n)?,
+        None => group_node,
+    };
+    let group_result = g.execute(exec_root)?;
 
     // Build result schema from NATIVE column names + our format_agg_name aliases.
     // The C engine names agg columns as "{col}_{suffix}" (e.g., "v1_sum").

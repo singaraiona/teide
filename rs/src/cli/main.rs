@@ -454,6 +454,9 @@ fn type_name(typ: i8) -> &'static str {
         5 => "i32",
         6 => "i64",
         7 => "f64",
+        9 => "date",
+        10 => "time",
+        11 => "timestamp",
         14 => "sym",
         15 => "enum",
         _ => "?",
@@ -730,6 +733,10 @@ fn print_json(result: &teide::sql::SqlResult) {
 fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
+        9 => match table.get_i64(col, row) {
+            Some(d) => teide::Table::format_date(d as i32),
+            None => "NULL".to_string(),
+        },
         4..=6 => match table.get_i64(col, row) {
             Some(v) => format!("{v}"),
             None => "NULL".to_string(),
@@ -767,6 +774,10 @@ fn format_cell(table: &teide::Table, col: usize, row: usize) -> String {
 fn format_json_value(table: &teide::Table, col: usize, row: usize) -> String {
     let typ = table.col_type(col);
     match typ {
+        9 => match table.get_i64(col, row) {
+            Some(d) => format!("\"{}\"", teide::Table::format_date(d as i32)),
+            None => "null".to_string(),
+        },
         4..=6 => match table.get_i64(col, row) {
             Some(v) => format!("{v}"),
             None => "null".to_string(),

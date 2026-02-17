@@ -108,6 +108,103 @@ static td_op_ext_t* find_ext(td_graph_t* g, uint32_t node_id) {
     return NULL;
 }
 
+/* --------------------------------------------------------------------------
+ * Materialize a MAPCOMMON column into a flat TD_SYM vector.
+ * Expands key_values × row_counts into one SYM ID per row.
+ * -------------------------------------------------------------------------- */
+static td_t* materialize_mapcommon(td_t* mc) {
+    td_t** mc_ptrs = (td_t**)td_data(mc);
+    td_t* kv = mc_ptrs[0];   /* key_values: typed vec (DATE/I64/SYM) */
+    td_t* rc = mc_ptrs[1];   /* row_counts: TD_I64 vec of n_parts */
+    int64_t n_parts = kv->len;
+    int8_t kv_type = kv->type;
+    size_t esz = (size_t)td_elem_size(kv_type);
+    const char* kdata = (const char*)td_data(kv);
+    const int64_t* counts = (const int64_t*)td_data(rc);
+
+    int64_t total = 0;
+    for (int64_t p = 0; p < n_parts; p++) total += counts[p];
+
+    td_t* flat = td_vec_new(kv_type, total);
+    if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
+    flat->len = total;
+
+    char* out = (char*)td_data(flat);
+    int64_t off = 0;
+    for (int64_t p = 0; p < n_parts; p++) {
+        int64_t cnt = counts[p];
+        for (int64_t r = 0; r < cnt; r++)
+            memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        off += cnt;
+    }
+    return flat;
+}
+
+/* Materialize first N rows of a MAPCOMMON column into a flat typed vector. */
+static td_t* materialize_mapcommon_head(td_t* mc, int64_t n) {
+    td_t** mc_ptrs = (td_t**)td_data(mc);
+    td_t* kv = mc_ptrs[0];
+    td_t* rc = mc_ptrs[1];
+    int64_t n_parts = kv->len;
+    int8_t kv_type = kv->type;
+    size_t esz = (size_t)td_elem_size(kv_type);
+    const char* kdata = (const char*)td_data(kv);
+    const int64_t* counts = (const int64_t*)td_data(rc);
+
+    td_t* flat = td_vec_new(kv_type, n);
+    if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
+    flat->len = n;
+
+    char* out = (char*)td_data(flat);
+    int64_t off = 0;
+    for (int64_t p = 0; p < n_parts && off < n; p++) {
+        int64_t take = counts[p];
+        if (take > n - off) take = n - off;
+        for (int64_t r = 0; r < take; r++)
+            memcpy(out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+        off += take;
+    }
+    return flat;
+}
+
+/* Materialize MAPCOMMON through a boolean filter predicate. */
+static td_t* materialize_mapcommon_filter(td_t* mc, td_t* pred, int64_t pass_count) {
+    td_t** mc_ptrs = (td_t**)td_data(mc);
+    td_t* kv = mc_ptrs[0];
+    td_t* rc = mc_ptrs[1];
+    int64_t n_parts = kv->len;
+    int8_t kv_type = kv->type;
+    size_t esz = (size_t)td_elem_size(kv_type);
+    const char* kdata = (const char*)td_data(kv);
+    const int64_t* counts = (const int64_t*)td_data(rc);
+
+    td_t* flat = td_vec_new(kv_type, pass_count);
+    if (!flat || TD_IS_ERR(flat)) return TD_ERR_PTR(TD_ERR_OOM);
+    flat->len = pass_count;
+
+    char* out = (char*)td_data(flat);
+    int64_t out_idx = 0;
+    int64_t row = 0;
+    int64_t part_idx = 0;
+    int64_t part_end = counts[0];
+
+    td_morsel_t mp;
+    td_morsel_init(&mp, pred);
+    while (td_morsel_next(&mp)) {
+        const uint8_t* bits = (const uint8_t*)mp.morsel_ptr;
+        for (int64_t i = 0; i < mp.morsel_len; i++, row++) {
+            while (part_idx < n_parts - 1 && row >= part_end) {
+                part_idx++;
+                part_end += counts[part_idx];
+            }
+            if (bits[i])
+                memcpy(out + (size_t)out_idx++ * esz,
+                       kdata + (size_t)part_idx * esz, esz);
+        }
+    }
+    return flat;
+}
+
 typedef struct {
     bool    enabled;
     double  bias_f64;
@@ -595,6 +692,7 @@ static bool expr_compile(td_graph_t* g, td_t* tbl, td_op_t* root, td_expr_t* out
                 if (!ext) return false;
                 td_t* col = td_table_get_col(tbl, ext->sym);
                 if (!col) return false;
+                if (col->type == TD_MAPCOMMON) return false;
                 out->regs[r].kind = REG_SCAN;
                 if (TD_IS_PARTED(col->type)) {
                     int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
@@ -1773,9 +1871,14 @@ static td_t* exec_filter_seq(td_t* input, td_t* pred, int64_t ncols,
     for (int64_t c = 0; c < ncols; c++) {
         td_t* col = td_table_get_col_idx(input, c);
         if (!col || TD_IS_ERR(col)) continue;
-        /* Skip virtual partition column */
-        if (col->type == TD_MAPCOMMON) continue;
         int64_t name_id = td_table_col_name(input, c);
+        if (col->type == TD_MAPCOMMON) {
+            td_t* mc_filt = materialize_mapcommon_filter(col, pred, pass_count);
+            if (!mc_filt || TD_IS_ERR(mc_filt)) { td_release(tbl); return mc_filt; }
+            td_table_add_col(tbl, name_id, mc_filt);
+            td_release(mc_filt);
+            continue;
+        }
         td_t* filtered;
         if (TD_IS_PARTED(col->type))
             filtered = exec_filter_parted_vec(col, pred, pass_count);
@@ -1857,6 +1960,13 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
         td_t* col = td_table_get_col_idx(input, c);
         col_names[c] = td_table_col_name(input, c);
         if (!col || TD_IS_ERR(col)) { new_cols[c] = NULL; continue; }
+        if (col->type == TD_MAPCOMMON) {
+            /* Materialize MAPCOMMON through filter predicate */
+            new_cols[c] = materialize_mapcommon_filter(col, pred, pass_count);
+            if (new_cols[c] && !TD_IS_ERR(new_cols[c])) valid_ncols++;
+            else new_cols[c] = NULL;
+            continue;
+        }
         int8_t out_type = TD_IS_PARTED(col->type)
                         ? (int8_t)TD_PARTED_BASETYPE(col->type)
                         : col->type;
@@ -1874,6 +1984,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
         for (int64_t c = 0; c < ncols; c++) {
             td_t* col = td_table_get_col_idx(input, c);
             if (!col || !new_cols[c]) continue;
+            if (col->type == TD_MAPCOMMON) continue; /* already materialized */
             if (TD_IS_PARTED(col->type)) {
                 parted_gather_col(col, match_idx, pass_count, new_cols[c]);
             } else {
@@ -1890,6 +2001,7 @@ static td_t* exec_filter(td_graph_t* g, td_op_t* op, td_t* input, td_t* pred) {
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
             td_t* col = td_table_get_col_idx(input, c);
+            if (col && col->type == TD_MAPCOMMON) continue; /* already materialized */
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)td_data(col);
             mgctx.dsts[ci] = (char*)td_data(new_cols[c]);
@@ -4897,17 +5009,20 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
  * Partition-aware group-by: detect parted columns, concatenate segments into
  * a flat table, then run standard exec_group once.
  * ============================================================================ */
-static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl); /* forward decl */
+static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
+                        int64_t group_limit); /* forward decl */
 
 /* Forward declaration — defined below exec_group */
 static td_t* exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                                        int32_t n_parts, const int64_t* key_syms,
-                                       const int64_t* agg_syms, int has_avg);
+                                       const int64_t* agg_syms, int has_avg,
+                                       int64_t group_limit);
 
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
  * -------------------------------------------------------------------------- */
-static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
+static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
+                               int64_t group_limit) {
     int64_t ncols = td_table_ncols(parted_tbl);
     if (ncols <= 0) return TD_ERR_PTR(TD_ERR_NYI);
 
@@ -4959,7 +5074,11 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
         int64_t est_groups = 1;
         for (uint8_t k = 0; k < n_keys; k++) {
             td_t* pcol = td_table_get_col(parted_tbl, key_syms[k]);
-            if (!pcol || !TD_IS_PARTED(pcol->type)) { est_groups = rows_per_part; break; }
+            if (!pcol) { est_groups = rows_per_part; break; }
+            /* MAPCOMMON key: constant per partition — excluded from
+             * per-partition sub-GROUP-BY, contributes 0 to cardinality. */
+            if (pcol->type == TD_MAPCOMMON) { continue; }
+            if (!TD_IS_PARTED(pcol->type)) { est_groups = rows_per_part; break; }
             td_t* seg0 = ((td_t**)td_data(pcol))[0];
             if (!seg0 || seg0->len <= 0) { est_groups = rows_per_part; break; }
             int8_t bt = TD_PARTED_BASETYPE(pcol->type);
@@ -5006,7 +5125,8 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
     /* Try per-partition path (separate noinline function to avoid I-cache pressure) */
     if (can_partition) {
         td_t* result = exec_group_per_partition(parted_tbl, ext, n_parts,
-                                                 key_syms, agg_syms, has_avg);
+                                                 key_syms, agg_syms, has_avg,
+                                                 group_limit);
         if (result) return result;
         /* NULL = per-partition failed, fall through to concat */
     }
@@ -5059,7 +5179,14 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
                 name_id = td_table_col_name(parted_tbl, ci);
             }
             if (!col) continue;
-            if (col->type == TD_MAPCOMMON) continue;
+            if (col->type == TD_MAPCOMMON) {
+                td_t* mc_flat = materialize_mapcommon(col);
+                if (mc_flat && !TD_IS_ERR(mc_flat)) {
+                    flat_tbl = td_table_add_col(flat_tbl, name_id, mc_flat);
+                    td_release(mc_flat);
+                }
+                continue;
+            }
 
             if (!TD_IS_PARTED(col->type)) {
                 td_retain(col);
@@ -5093,14 +5220,15 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl) {
 
         td_t* saved = g->table;
         g->table = flat_tbl;
-        td_t* result = exec_group(g, op, flat_tbl);
+        td_t* result = exec_group(g, op, flat_tbl, 0);
         g->table = saved;
         td_release(flat_tbl);
         return result;
     }
 }
 
-static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
+static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl,
+                        int64_t group_limit) {
     if (!tbl || TD_IS_ERR(tbl)) return tbl;
 
     /* Parted dispatch: detect parted input columns */
@@ -5109,7 +5237,7 @@ static td_t* exec_group(td_graph_t* g, td_op_t* op, td_t* tbl) {
         for (int64_t c = 0; c < nc; c++) {
             td_t* col = td_table_get_col_idx(tbl, c);
             if (col && (TD_IS_PARTED(col->type) || col->type == TD_MAPCOMMON)) {
-                return exec_group_parted(g, op, tbl);
+                return exec_group_parted(g, op, tbl, group_limit);
             }
         }
     }
@@ -5821,7 +5949,8 @@ da_path:;
                     if (da_count[s] == 0) continue;
                     int64_t offset = ((int64_t)s / da_key_stride[k]) % da_key_range[k];
                     int64_t key_val = da_key_min[k] + offset;
-                    if (src_col->type == TD_I32)
+                    if (src_col->type == TD_I32 || src_col->type == TD_DATE ||
+                        src_col->type == TD_TIME)
                         ((int32_t*)td_data(key_col))[gi] = (int32_t)key_val;
                     else if (src_col->type == TD_ENUM)
                         ((uint32_t*)td_data(key_col))[gi] = (uint32_t)key_val;
@@ -6361,7 +6490,8 @@ cleanup:
 static td_t* __attribute__((noinline))
 exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                          int32_t n_parts, const int64_t* key_syms,
-                         const int64_t* agg_syms, int has_avg) {
+                         const int64_t* agg_syms, int has_avg,
+                         int64_t group_limit) {
 
     uint8_t n_keys = ext->n_keys;
     uint8_t n_aggs = ext->n_aggs;
@@ -6370,6 +6500,28 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
      * n_aggs + n_avg <= 16 must hold (n_avg <= n_aggs), and n_keys <= 8
      * for avg_idx.  Return NULL to fall through to concat path. */
     if (n_aggs > 8 || n_keys > 8) return NULL;
+
+    /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
+     * within a partition, so they are excluded from per-partition GROUP BY
+     * and reconstructed after concat. */
+    uint8_t  n_mc_keys = 0;
+    int64_t  mc_sym_ids[8];
+    uint8_t  n_part_keys = 0;
+    int64_t  pk_syms[8];       /* non-MAPCOMMON key sym IDs */
+
+    for (uint8_t k = 0; k < n_keys; k++) {
+        td_t* pcol = td_table_get_col(parted_tbl, key_syms[k]);
+        if (pcol && pcol->type == TD_MAPCOMMON) {
+            mc_sym_ids[n_mc_keys++] = key_syms[k];
+        } else {
+            pk_syms[n_part_keys++] = key_syms[k];
+        }
+    }
+
+    /* LIMIT pushdown: when all GROUP BY keys are MAPCOMMON (n_part_keys==0),
+     * each partition produces exactly 1 group.  Limit the partition loop. */
+    if (group_limit > 0 && n_part_keys == 0 && group_limit < n_parts)
+        n_parts = (int32_t)group_limit;
 
     /* AVG decomposition: for merge, AVG(x) becomes SUM(x) + COUNT(x).
      * Build the per-partition agg_ops: replace AVG with SUM, then append
@@ -6428,16 +6580,16 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
             }
         }
 
-        td_t* sub = td_table_new((int64_t)(n_keys + n_unique_agg));
+        td_t* sub = td_table_new((int64_t)(n_part_keys + n_unique_agg));
         if (!sub || TD_IS_ERR(sub)) goto fail;
 
-        for (uint8_t k = 0; k < n_keys; k++) {
-            td_t* pcol = td_table_get_col(parted_tbl, key_syms[k]);
+        for (uint8_t k = 0; k < n_part_keys; k++) {
+            td_t* pcol = td_table_get_col(parted_tbl, pk_syms[k]);
             if (!pcol || !TD_IS_PARTED(pcol->type)) { td_release(sub); goto fail; }
             td_t* seg = ((td_t**)td_data(pcol))[p];
             if (!seg) { td_release(sub); goto fail; }
             td_retain(seg);
-            sub = td_table_add_col(sub, key_syms[k], seg);
+            sub = td_table_add_col(sub, pk_syms[k], seg);
             td_release(seg);
         }
         for (int i = 0; i < n_unique_agg; i++) {
@@ -6455,8 +6607,8 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         if (!pg) { td_release(sub); goto fail; }
 
         td_op_t* pkeys[8];
-        for (uint8_t k = 0; k < n_keys; k++) {
-            td_t* sym_atom = td_sym_str(key_syms[k]);
+        for (uint8_t k = 0; k < n_part_keys; k++) {
+            td_t* sym_atom = td_sym_str(pk_syms[k]);
             pkeys[k] = td_scan(pg, td_str_ptr(sym_atom));
         }
         td_op_t* pagg_ins[16];
@@ -6465,7 +6617,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
             pagg_ins[a] = td_scan(pg, td_str_ptr(sym_atom));
         }
 
-        td_op_t* proot = td_group(pg, pkeys, n_keys, part_ops, pagg_ins, part_n_aggs);
+        td_op_t* proot = td_group(pg, pkeys, n_part_keys, part_ops, pagg_ins, part_n_aggs);
         proot = td_optimize(pg, proot);
         partials[p] = td_execute(pg, proot);
         td_graph_free(pg);
@@ -6516,6 +6668,39 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         merge_tbl = td_table_add_col(merge_tbl, name_id, flat);
         td_release(flat);
     }
+    /* Add MAPCOMMON key columns: replicate each partition's typed value
+     * for that partition's group count in the partial results. */
+    if (n_mc_keys > 0) {
+        int64_t part_nrows[n_parts];
+        for (int32_t p = 0; p < n_parts; p++)
+            part_nrows[p] = td_table_nrows(partials[p]);
+
+        for (uint8_t m = 0; m < n_mc_keys; m++) {
+            td_t* mc_col = td_table_get_col(parted_tbl, mc_sym_ids[m]);
+            td_t** mc_ptrs = (td_t**)td_data(mc_col);
+            td_t* mc_kv = mc_ptrs[0];
+            int8_t kv_type = mc_kv->type;
+            size_t esz = (size_t)td_elem_size(kv_type);
+            const char* kdata = (const char*)td_data(mc_kv);
+
+            td_t* mc_flat = td_vec_new(kv_type, merge_rows);
+            if (!mc_flat || TD_IS_ERR(mc_flat)) {
+                td_release(merge_tbl);
+                for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
+                return NULL;
+            }
+            mc_flat->len = merge_rows;
+            char* mc_out = (char*)td_data(mc_flat);
+            int64_t off = 0;
+            for (int32_t p = 0; p < n_parts; p++) {
+                for (int64_t r = 0; r < part_nrows[p]; r++)
+                    memcpy(mc_out + (off + r) * esz, kdata + (size_t)p * esz, esz);
+                off += part_nrows[p];
+            }
+            merge_tbl = td_table_add_col(merge_tbl, mc_sym_ids[m], mc_flat);
+            td_release(mc_flat);
+        }
+    }
     for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
 
     /* Phase 3: build merge graph and re-aggregate */
@@ -6528,10 +6713,11 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         mkeys[k] = td_scan(mg, td_str_ptr(sym_atom));
     }
 
-    /* Scan partial agg result columns by their output names */
+    /* Scan partial agg result columns by their output names.
+     * Agg columns start at n_part_keys in merge_tbl (MAPCOMMON keys appended after). */
     td_op_t* magg_ins[16];
     for (uint8_t a = 0; a < part_n_aggs; a++) {
-        int64_t agg_name_id = td_table_col_name(merge_tbl, (int64_t)n_keys + a);
+        int64_t agg_name_id = td_table_col_name(merge_tbl, (int64_t)n_part_keys + a);
         td_t* agg_name = td_sym_str(agg_name_id);
         magg_ins[a] = td_scan(mg, td_str_ptr(agg_name));
     }
@@ -6626,9 +6812,10 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
     }
 
     /* Fix result column names: the merge may produce "v1_sum_sum" instead
-     * of "v1_sum". Replace with the original partial result names. */
+     * of "v1_sum". Replace with the original partial result names.
+     * Agg columns in merge_tbl start at n_part_keys (MC keys appended after). */
     for (uint8_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++) {
-        int64_t want_name = td_table_col_name(merge_tbl, (int64_t)n_keys + a);
+        int64_t want_name = td_table_col_name(merge_tbl, (int64_t)n_part_keys + a);
         td_table_set_col_name(result, (int64_t)n_keys + a, want_name);
     }
 
@@ -6856,6 +7043,8 @@ static td_t* exec_join(td_graph_t* g, td_op_t* op, td_t* left_table, td_t* right
     td_t* ht_next_hdr;
     td_t* ht_heads_hdr;
     uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
+    // cppcheck-suppress internalAstError
+    // Valid C11/C17 _Atomic(T)* declaration; cppcheck parser may mis-handle this syntax.
     _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
     if (!ht_next || !ht_heads) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
@@ -8916,6 +9105,8 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
             if (!g->table) return TD_ERR_PTR(TD_ERR_SCHEMA);
             td_t* col = td_table_get_col(g->table, ext->sym);
             if (!col) return TD_ERR_PTR(TD_ERR_SCHEMA);
+            if (col->type == TD_MAPCOMMON)
+                return materialize_mapcommon(col);
             if (TD_IS_PARTED(col->type)) {
                 /* Concat parted segments into flat vector (cold path) */
                 int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);
@@ -9086,7 +9277,7 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                     }
                 }
             }
-            td_t* result = exec_group(g, op, tbl);
+            td_t* result = exec_group(g, op, tbl, 0);
             if (owned_tbl) td_release(owned_tbl);
             return result;
         }
@@ -9152,7 +9343,39 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                 return result;
             }
 
-            td_t* input = exec_node(g, op->inputs[0]);
+            /* HEAD(GROUP) optimization: pass limit hint to exec_group
+             * so it can short-circuit the per-partition loop when all
+             * GROUP BY keys are MAPCOMMON.  The normal HEAD logic below
+             * still trims the result to N rows regardless. */
+            td_t* input;
+            if (child_op && child_op->opcode == OP_GROUP) {
+                td_t* tbl = g->table;
+                if (!tbl || TD_IS_ERR(tbl)) return tbl;
+                td_t* owned_tbl = NULL;
+                if (g->selection && tbl->type == TD_TABLE) {
+                    int needs = 0;
+                    int64_t nc = td_table_ncols(tbl);
+                    for (int64_t c = 0; c < nc; c++) {
+                        td_t* col = td_table_get_col_idx(tbl, c);
+                        if (col && !TD_IS_PARTED(col->type)
+                            && col->type != TD_MAPCOMMON) {
+                            needs = 1; break;
+                        }
+                    }
+                    if (needs) {
+                        td_t* compacted = sel_compact(g, tbl, g->selection);
+                        if (!compacted || TD_IS_ERR(compacted)) return compacted;
+                        td_release(g->selection);
+                        g->selection = NULL;
+                        owned_tbl = compacted;
+                        tbl = compacted;
+                    }
+                }
+                input = exec_group(g, child_op, tbl, n);
+                if (owned_tbl) td_release(owned_tbl);
+            } else {
+                input = exec_node(g, op->inputs[0]);
+            }
             if (!input || TD_IS_ERR(input)) return input;
             if (input->type == TD_TABLE) {
                 int64_t ncols = td_table_ncols(input);
@@ -9163,8 +9386,14 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
                     td_t* col = td_table_get_col_idx(input, c);
                     int64_t name_id = td_table_col_name(input, c);
                     if (!col) continue;
-                    /* Skip virtual partition column (no element data) */
-                    if (col->type == TD_MAPCOMMON) continue;
+                    if (col->type == TD_MAPCOMMON) {
+                        td_t* mc_head = materialize_mapcommon_head(col, n);
+                        if (mc_head && !TD_IS_ERR(mc_head)) {
+                            result = td_table_add_col(result, name_id, mc_head);
+                            td_release(mc_head);
+                        }
+                        continue;
+                    }
                     if (TD_IS_PARTED(col->type)) {
                         /* Copy first n rows from parted segments */
                         int8_t base = (int8_t)TD_PARTED_BASETYPE(col->type);

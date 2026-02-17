@@ -117,6 +117,11 @@ extern "C" {
 #define TD_PARTED_BASE   32
 #define TD_MAPCOMMON     48   /* virtual partition column */
 
+/* MAPCOMMON inferred sub-types (stored in attrs field) */
+#define TD_MC_SYM    0   /* opaque partition key strings */
+#define TD_MC_DATE   1   /* YYYY.MM.DD partition directories */
+#define TD_MC_I64    2   /* pure integer partition keys */
+
 #define TD_IS_PARTED(t)       ((t) >= TD_PARTED_BASE && (t) < TD_MAPCOMMON)
 #define TD_PARTED_BASETYPE(t) ((t) - TD_PARTED_BASE)
 

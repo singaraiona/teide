@@ -1512,12 +1512,14 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
        td_sym_find returns -1 if string not in table → no match. */
     bool str_resolved = false;
     int64_t resolved_sym_id = 0;
-    if (r_scalar && rhs->type == TD_ATOM_STR && TD_IS_SYM(lhs->type)) {
+    if (r_scalar && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR) &&
+        TD_IS_SYM(lhs->type)) {
         const char* s = td_str_ptr(rhs);
         size_t slen = td_str_len(rhs);
         resolved_sym_id = td_sym_find(s, slen);
         str_resolved = true;
-    } else if (l_scalar && lhs->type == TD_ATOM_STR && TD_IS_SYM(rhs->type)) {
+    } else if (l_scalar && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR) &&
+               TD_IS_SYM(rhs->type)) {
         const char* s = td_str_ptr(lhs);
         size_t slen = td_str_len(lhs);
         resolved_sym_id = td_sym_find(s, slen);
@@ -1527,7 +1529,7 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
     double l_f64_val = 0, r_f64_val = 0;
     int64_t l_i64_val = 0, r_i64_val = 0;
     if (l_scalar) {
-        if (str_resolved && lhs->type == TD_ATOM_STR)
+        if (str_resolved && (lhs->type == TD_ATOM_STR || lhs->type == TD_STR))
             l_i64_val = resolved_sym_id;
         else if (td_is_atom(lhs)) {
             if (lhs->type == TD_ATOM_F64 || lhs->type == -TD_F64) l_f64_val = lhs->f64;
@@ -1539,7 +1541,7 @@ static td_t* exec_elementwise_binary(td_graph_t* g, td_op_t* op, td_t* lhs, td_t
         }
     }
     if (r_scalar) {
-        if (str_resolved && rhs->type == TD_ATOM_STR)
+        if (str_resolved && (rhs->type == TD_ATOM_STR || rhs->type == TD_STR))
             r_i64_val = resolved_sym_id;
         else if (td_is_atom(rhs)) {
             if (rhs->type == TD_ATOM_F64 || rhs->type == -TD_F64) r_f64_val = rhs->f64;
@@ -7787,7 +7789,7 @@ static td_t* exec_if(td_graph_t* g, td_op_t* op) {
             dst[i] = cond_p[i] ? (t_arr ? t_arr[i] : t_scalar)
                                : (e_arr ? e_arr[i] : e_scalar);
     } else if (out_type == TD_I64 || out_type == TD_SYM) {
-        /* For SYM output with string scalar constants, intern to get SYM IDs */
+        /* For SYM output with TD_STR scalar constants, intern to get SYM IDs */
         int64_t t_scalar = 0, e_scalar = 0;
         if (then_scalar) {
             if (then_v->type == TD_ATOM_STR) {
@@ -8253,7 +8255,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
     for (int a = 0; a < n_args; a++) {
         int8_t at = args[a]->type;
         if (TD_IS_SYM(at)) { nrows = args[a]->len; break; }
-        if (!td_is_atom(args[a])) { nrows = args[a]->len; break; }
+        if (!td_is_atom(args[a]) && at != TD_STR) { nrows = args[a]->len; break; }
     }
     td_t* result = td_vec_new(TD_SYM, nrows);
     if (!result || TD_IS_ERR(result)) {
@@ -8273,7 +8275,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
                 const char* sp; size_t sl;
                 sym_elem(args[a], r, &sp, &sl);
                 total += sl;
-            } else if (t == TD_ATOM_STR) {
+            } else if (t == TD_STR || t == TD_ATOM_STR) {
                 size_t sl = td_str_len(args[a]);
                 total += sl;
             }
@@ -8294,7 +8296,7 @@ static td_t* exec_concat(td_graph_t* g, td_op_t* op) {
                 const char* sp; size_t sl;
                 sym_elem(args[a], r, &sp, &sl);
                 if (bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }
-            } else if (t == TD_ATOM_STR) {
+            } else if (t == TD_STR || t == TD_ATOM_STR) {
                 const char* sp = td_str_ptr(args[a]);
                 size_t sl = td_str_len(args[a]);
                 if (sp && bi + sl < buf_cap) { memcpy(buf + bi, sp, sl); bi += sl; }

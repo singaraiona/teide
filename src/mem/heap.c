@@ -345,7 +345,7 @@ static void td_release_owned_refs(td_t* v) {
         return;
     }
 
-    if (v->type == TD_LIST) {
+    if (v->type == TD_LIST || v->type == TD_STR) {
         td_t** ptrs = (td_t**)td_data(v);
         for (int64_t i = 0; i < v->len; i++) {
             td_t* child = ptrs[i];
@@ -403,7 +403,7 @@ static void td_retain_owned_refs(td_t* v) {
         return;
     }
 
-    if (v->type == TD_LIST) {
+    if (v->type == TD_LIST || v->type == TD_STR) {
         td_t** ptrs = (td_t**)td_data(v);
         for (int64_t i = 0; i < v->len; i++) {
             td_t* child = ptrs[i];
@@ -454,7 +454,7 @@ static void td_detach_owned_refs(td_t* v) {
         return;
     }
 
-    if (v->type == TD_LIST) {
+    if (v->type == TD_LIST || v->type == TD_STR) {
         v->len = 0;
     }
 }

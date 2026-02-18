@@ -83,7 +83,7 @@ static MunitResult test_atom_char(const void* params, void* fixture) {
     td_t* v = td_char('Z');
     munit_assert_ptr_not_null(v);
     munit_assert_true(td_is_atom(v));
-    munit_assert_int(v->type, ==, TD_ATOM_U8);
+    munit_assert_int(v->type, ==, TD_ATOM_CHAR);
     munit_assert_int(v->c8, ==, 'Z');
     td_release(v);
 
@@ -194,10 +194,10 @@ static MunitResult test_atom_str_long(const void* params, void* fixture) {
     munit_assert_true(td_is_atom(v));
     munit_assert_int(v->type, ==, TD_ATOM_STR);
 
-    /* For long strings, obj points to a U8 byte vector */
+    /* For long strings, obj points to a CHAR vector */
     td_t* chars = v->obj;
     munit_assert_ptr_not_null(chars);
-    munit_assert_int(chars->type, ==, TD_U8);
+    munit_assert_int(chars->type, ==, TD_CHAR);
     munit_assert_int(chars->len, ==, (int64_t)len);
     munit_assert_memory_equal(len, td_data(chars), s);
 

@@ -39,7 +39,7 @@
  * and non-scalar types are excluded. */
 static bool is_serializable_type(int8_t t) {
     switch (t) {
-    case TD_BOOL: case TD_U8:   case TD_I16:
+    case TD_BOOL: case TD_U8:   case TD_CHAR:  case TD_I16:
     case TD_I32:  case TD_I64:  case TD_F64:
     case TD_DATE: case TD_TIME: case TD_TIMESTAMP: case TD_GUID:
     case TD_SYM:

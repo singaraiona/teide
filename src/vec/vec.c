@@ -249,8 +249,8 @@ td_t* td_vec_concat(td_t* a, td_t* b) {
     memcpy((char*)td_data(result) + (size_t)a->len * esz, b_data,
            (size_t)b->len * esz);
 
-    /* LIST/TABLE columns hold child pointers — retain them */
-    if (a->type == TD_LIST || a->type == TD_TABLE) {
+    /* STR/LIST/TABLE columns hold child pointers — retain them */
+    if (a->type == TD_STR || a->type == TD_LIST || a->type == TD_TABLE) {
         td_t** ptrs = (td_t**)td_data(result);
         for (int64_t i = 0; i < total_len; i++) {
             if (ptrs[i]) td_retain(ptrs[i]);
@@ -284,8 +284,8 @@ td_t* td_vec_from_raw(int8_t type, const void* data, int64_t count) {
 
     memcpy(td_data(v), data, data_size);
 
-    /* LIST/TABLE elements are child pointers — retain them */
-    if (type == TD_LIST || type == TD_TABLE) {
+    /* STR/LIST/TABLE elements are child pointers — retain them */
+    if (type == TD_STR || type == TD_LIST || type == TD_TABLE) {
         td_t** ptrs = (td_t**)td_data(v);
         for (int64_t i = 0; i < count; i++) {
             if (ptrs[i]) td_retain(ptrs[i]);

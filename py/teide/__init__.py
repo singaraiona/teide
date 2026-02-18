@@ -507,12 +507,12 @@ class TeideLib:
 TD_LIST = 0
 TD_BOOL = 1
 TD_U8 = 2
-# TD_CHAR (3) removed — use TD_U8
+TD_CHAR = 3
 TD_I16 = 4
 TD_I32 = 5
 TD_I64 = 6
 TD_F64 = 7
-TD_STR = 8  # atom-only (TD_ATOM_STR for string scalars)
+TD_STR = 8
 TD_DATE = 9
 TD_TIME = 10
 TD_TIMESTAMP = 11

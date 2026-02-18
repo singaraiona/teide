@@ -289,7 +289,7 @@ td_op_t* td_const_str(td_graph_t* g, const char* s) {
 
     ext->base.opcode = OP_CONST;
     ext->base.arity = 0;
-    ext->base.out_type = TD_SYM;
+    ext->base.out_type = TD_STR;
     ext->literal = td_str(s, strlen(s));
     /* L4: null/error check on allocation result */
     if (!ext->literal || TD_IS_ERR(ext->literal)) ext->literal = NULL;
@@ -423,9 +423,13 @@ td_op_t* td_if(td_graph_t* g, td_op_t* cond, td_op_t* then_val, td_op_t* else_va
     uint32_t then_id = then_val->id;
     uint32_t else_id = else_val->id;
     int8_t out_type = promote(then_val->out_type, else_val->out_type);
-    /* For string types, propagate SYM → SYM (global sym IDs) */
-    if (then_val->out_type == TD_SYM || else_val->out_type == TD_SYM)
+    /* For string types, propagate SYM/STR → SYM (global sym IDs) */
+    if (then_val->out_type == TD_SYM)
         out_type = TD_SYM;
+    else if (else_val->out_type == TD_SYM)
+        out_type = TD_SYM;
+    else if (then_val->out_type == TD_STR || else_val->out_type == TD_STR)
+        out_type = TD_SYM;  /* string constants → intern as SYM */
     uint32_t est = cond->est_rows;
 
     td_op_ext_t* ext = graph_alloc_ext_node(g);

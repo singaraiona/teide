@@ -35,7 +35,7 @@
 
 static MunitResult test_parallel_sum(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     int64_t n = 100000;
@@ -67,7 +67,7 @@ static MunitResult test_parallel_sum(const void* params, void* data) {
     td_release(tbl);
     td_release(vec);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -77,7 +77,7 @@ static MunitResult test_parallel_sum(const void* params, void* data) {
 
 static MunitResult test_parallel_add(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     int64_t n = 100000;
@@ -120,7 +120,7 @@ static MunitResult test_parallel_add(const void* params, void* data) {
     td_release(a_vec);
     td_release(b_vec);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -130,7 +130,7 @@ static MunitResult test_parallel_add(const void* params, void* data) {
 
 static MunitResult test_parallel_group_sum(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     int64_t n = 100000;
@@ -207,7 +207,7 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
     td_release(id_vec);
     td_release(v_vec);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -217,7 +217,7 @@ static MunitResult test_parallel_group_sum(const void* params, void* data) {
 
 static MunitResult test_parallel_min_max(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     int64_t n = 100000;
@@ -261,7 +261,7 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
     td_release(tbl);
     td_release(vec);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -271,7 +271,7 @@ static MunitResult test_parallel_min_max(const void* params, void* data) {
 
 static MunitResult test_cancel(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     int64_t n = 100000;
@@ -313,7 +313,7 @@ static MunitResult test_cancel(const void* params, void* data) {
     td_release(tbl);
     td_release(vec);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 

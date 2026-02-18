@@ -173,9 +173,9 @@ extern "C" {
 #define TD_SLAB_CACHE_SIZE  64
 #define TD_SLAB_ORDERS      5
 
-/* ===== Buddy Allocator Constants ===== */
+/* ===== Heap Allocator Constants ===== */
 
-#define TD_ORDER_MIN  5
+#define TD_ORDER_MIN  6
 #define TD_ORDER_MAX  30
 
 /* ===== Parallel Threshold ===== */
@@ -206,33 +206,42 @@ typedef enum {
 
 const char* td_err_str(td_err_t e);
 
-/* ===== Core Type: td_t (32-byte block header) ===== */
+/* ===== Core Type: td_t (32-byte block/object header) ===== */
 
-typedef struct td_t {
-    /* Bytes 0-15: nullable bitmask / slice / ext nullmap */
-    union {
-        uint8_t  nullmap[16];
-        struct { struct td_t* slice_parent; int64_t slice_offset; };
-        struct { struct td_t* ext_nullmap;  struct td_t* sym_dict; };
+typedef union td_t {
+    /* Allocated: object header */
+    struct {
+        /* Bytes 0-15: nullable bitmask / slice / ext nullmap */
+        union {
+            uint8_t  nullmap[16];
+            struct { union td_t* slice_parent; int64_t slice_offset; };
+            struct { union td_t* ext_nullmap;  union td_t* sym_dict; };
+        };
+        /* Bytes 16-31: metadata + value */
+        uint8_t  mmod;       /* 0=heap, 1=file-mmap */
+        uint8_t  order;      /* block order (block size = 2^order) */
+        int8_t   type;       /* negative=atom, positive=vector, 0=LIST */
+        uint8_t  attrs;      /* attribute flags */
+        _Atomic(uint32_t) rc; /* reference count (0=free) */
+        union {
+            uint8_t  b8;     /* BOOL atom */
+            uint8_t  u8;     /* U8 atom */
+            char     c8;     /* CHAR atom */
+            int16_t  i16;    /* I16 atom */
+            int32_t  i32;    /* I32 atom */
+            uint32_t u32;
+            int64_t  i64;    /* I64/SYMBOL/DATE/TIME/TIMESTAMP atom */
+            double   f64;    /* F64 atom */
+            union td_t* obj; /* pointer to child (long strings, GUID) */
+            struct { uint8_t slen; char sdata[7]; }; /* SSO string (<=7 bytes) */
+            int64_t  len;    /* vector element count */
+        };
+        uint8_t  data[];     /* element data (flexible array member) */
     };
-    /* Bytes 16-31: metadata + value */
-    uint8_t  mmod;       /* 0=arena, 1=file-mmap, 2=direct-mmap */
-    uint8_t  order;      /* buddy order (block size = 2^order) */
-    int8_t   type;       /* negative=atom, positive=vector, 0=LIST */
-    uint8_t  attrs;      /* attribute flags */
-    _Atomic(uint32_t) rc; /* reference count */
-    union {
-        uint8_t  b8;     /* BOOL atom */
-        uint8_t  u8;     /* U8 atom */
-        char     c8;     /* CHAR atom */
-        int16_t  i16;    /* I16 atom */
-        int32_t  i32;    /* I32 atom */
-        uint32_t u32;
-        int64_t  i64;    /* I64/SYMBOL/DATE/TIME/TIMESTAMP atom */
-        double   f64;    /* F64 atom */
-        struct td_t* obj; /* pointer to child (long strings, GUID) */
-        struct { uint8_t slen; char sdata[7]; }; /* SSO string (<=7 bytes) */
-        int64_t  len;    /* vector element count */
+    /* Free: buddy allocator block (fl_prev/fl_next overlay bytes 0-15) */
+    struct {
+        union td_t* fl_prev;
+        union td_t* fl_next;
     };
 } td_t;
 
@@ -245,7 +254,7 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define td_is_atom(v)    ((v)->type < 0)
 #define td_is_vec(v)     ((v)->type > 0)
 #define td_len(v)        ((v)->len)
-#define td_data(v)       ((void*)((char*)(v) + 32))
+#define td_data(v)       ((void*)(v)->data)
 #define td_elem_size(t)  (td_type_sizes[(t)])
 
 /* SYM-aware element size: returns adaptive width for TD_SYM columns */
@@ -562,7 +571,7 @@ typedef struct {
 
 /* ===== Forward Declarations (internal types) ===== */
 
-typedef struct td_arena     td_arena_t;
+typedef struct td_heap      td_heap_t;
 typedef struct td_sym_table td_sym_table_t;
 typedef struct td_sym_map   td_sym_map_t;
 typedef struct td_pool      td_pool_t;
@@ -588,6 +597,7 @@ void  td_vm_unmap_file(void* ptr, size_t size);
 void  td_vm_advise_seq(void* ptr, size_t size);
 void  td_vm_advise_willneed(void* ptr, size_t size);
 void  td_vm_release(void* ptr, size_t size);
+void* td_vm_alloc_aligned(size_t size, size_t alignment);
 
 /* ===== Threading API ===== */
 
@@ -597,22 +607,33 @@ uint32_t td_thread_count(void);
 
 void td_parallel_begin(void);
 void td_parallel_end(void);
+extern _Atomic(uint32_t) td_parallel_flag;
+
+/* Reclaim fully-free pools by munmapping their regions. Called at
+ * control points (e.g. between queries, end of parallel sections). */
+void td_heap_gc(void);
+
+/* Release physical pages for large free blocks (madvise DONTNEED).
+ * Explicit opt-in — NOT called automatically by td_heap_gc(). Use
+ * after long idle periods to reduce RSS. */
+void td_heap_release_pages(void);
 
 /* ===== Memory Allocator API ===== */
 
 td_t*    td_alloc(size_t data_size);
-/* NOTE: td_free only works correctly when called from the allocating thread.
- * Arena-backed blocks (mmod==0) support cross-thread free via the return queue.
- * Direct-mmap blocks (mmod==2) silently leak if freed from a non-owning thread
- * because the tracker list is per-thread and cannot be traversed cross-thread. */
+/* NOTE: td_free supports cross-thread free via foreign_blocks list.
+ * Blocks freed from a non-owning thread are deferred and coalesced
+ * when the owning heap flushes foreign blocks. */
 void     td_free(td_t* v);
 td_t*    td_alloc_copy(td_t* v);
 td_t*    td_scratch_alloc(size_t data_size);
 td_t*    td_scratch_realloc(td_t* v, size_t new_data_size);
 
-void     td_arena_init(void);
-void     td_arena_destroy_all(void);
+void     td_heap_init(void);
+void     td_heap_destroy(void);
+void     td_heap_merge(td_heap_t* src);
 
+uint8_t  td_order_for_size(size_t data_size);
 void     td_mem_stats(td_mem_stats_t* out);
 
 /* ===== COW / Ref Counting API ===== */

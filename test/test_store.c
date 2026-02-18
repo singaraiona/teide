@@ -36,7 +36,7 @@
 
 static void* store_setup(const void* params, void* user_data) {
     (void)params; (void)user_data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
     return NULL;
 }
@@ -44,7 +44,7 @@ static void* store_setup(const void* params, void* user_data) {
 static void store_teardown(void* fixture) {
     (void)fixture;
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* ---- test_col_mmap_i64 ------------------------------------------------- */

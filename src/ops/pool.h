@@ -29,7 +29,7 @@
  *
  * Workers sleep on a semaphore and wake when td_pool_dispatch() submits tasks.
  * The main thread participates as worker 0 (no thread spawned for it).
- * Each worker initializes its own thread-local arena via td_arena_init().
+ * Each worker initializes its own thread-local heap via td_heap_init().
  */
 
 #include "core/platform.h"

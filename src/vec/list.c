@@ -30,7 +30,7 @@
 
 static int64_t list_capacity(td_t* list) {
     size_t block_size = (size_t)1 << list->order;
-    size_t data_space = block_size - 32;
+    size_t data_space = block_size - 32;  /* 32B td_t header */
     return (int64_t)(data_space / sizeof(td_t*));
 }
 

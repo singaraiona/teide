@@ -29,13 +29,13 @@
 
 static void* str_setup(const void* params, void* user_data) {
     (void)params; (void)user_data;
-    td_arena_init();
+    td_heap_init();
     return NULL;
 }
 
 static void str_teardown(void* fixture) {
     (void)fixture;
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* ---- str_ptr SSO ------------------------------------------------------- */

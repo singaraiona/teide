@@ -64,7 +64,7 @@ static td_t* make_test_table(void) {
 
 static MunitResult test_scan_sum(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
 
     td_t* tbl = make_test_table();
     munit_assert_ptr_not_null(tbl);
@@ -85,7 +85,7 @@ static MunitResult test_scan_sum(const void* params, void* data) {
     td_graph_free(g);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -95,7 +95,7 @@ static MunitResult test_scan_sum(const void* params, void* data) {
 
 static MunitResult test_filter_count(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
 
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
@@ -114,7 +114,7 @@ static MunitResult test_filter_count(const void* params, void* data) {
     td_graph_free(g);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -124,7 +124,7 @@ static MunitResult test_filter_count(const void* params, void* data) {
 
 static MunitResult test_arithmetic(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
 
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
@@ -143,7 +143,7 @@ static MunitResult test_arithmetic(const void* params, void* data) {
     td_graph_free(g);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -153,7 +153,7 @@ static MunitResult test_arithmetic(const void* params, void* data) {
 
 static MunitResult test_group_sum(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
 
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
@@ -196,7 +196,7 @@ static MunitResult test_group_sum(const void* params, void* data) {
     td_graph_free(g);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -206,7 +206,7 @@ static MunitResult test_group_sum(const void* params, void* data) {
 
 static MunitResult test_graph_lifecycle(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
 
     td_t* tbl = make_test_table();
     td_graph_t* g = td_graph_new(tbl);
@@ -221,7 +221,7 @@ static MunitResult test_graph_lifecycle(const void* params, void* data) {
     td_graph_free(g);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -231,7 +231,7 @@ static MunitResult test_graph_lifecycle(const void* params, void* data) {
 
 static MunitResult test_optimizer_constant_fold(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     td_graph_t* g = td_graph_new(NULL);
@@ -275,7 +275,7 @@ static MunitResult test_optimizer_constant_fold(const void* params, void* data) 
     td_graph_free(g);
 
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -285,7 +285,7 @@ static MunitResult test_optimizer_constant_fold(const void* params, void* data) 
 
 static MunitResult test_optimizer_filter_const_predicate(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     td_t* tbl = make_test_table();
@@ -325,7 +325,7 @@ static MunitResult test_optimizer_filter_const_predicate(const void* params, voi
 
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 
@@ -335,7 +335,7 @@ static MunitResult test_optimizer_filter_const_predicate(const void* params, voi
 
 static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     (void)params; (void)data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
 
     td_t* tbl = make_test_table();
@@ -514,7 +514,7 @@ static MunitResult test_group_affine_agg_input(const void* params, void* data) {
     td_graph_free(g_group);
     td_release(tbl);
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
     return MUNIT_OK;
 }
 

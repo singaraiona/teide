@@ -259,7 +259,7 @@ fn check_ptr(ptr: *mut ffi::td_t) -> Result<*mut ffi::td_t> {
 struct EngineGuard {
     pool_inited: bool,
     sym_inited: bool,
-    arena_inited: bool,
+    heap_inited: bool,
 }
 
 impl Drop for EngineGuard {
@@ -268,11 +268,11 @@ impl Drop for EngineGuard {
         // 1. td_pool_destroy() — sets the shutdown flag, signals all workers,
         //    then calls td_thread_join() on each worker thread. This is fully
         //    synchronous: all workers have exited (and destroyed their own
-        //    thread-local arenas) before this call returns.
+        //    thread-local heaps) before this call returns.
         // 2. td_sym_destroy() — tears down the global symbol table. Safe
         //    because no worker threads are running.
-        // 3. td_arena_destroy_all() — tears down the main thread's arena.
-        //    Must come last because sym_destroy may reference arena memory.
+        // 3. td_heap_destroy() — tears down the main thread's heap.
+        //    Must come last because sym_destroy may reference heap memory.
         unsafe {
             if self.pool_inited {
                 ffi::td_pool_destroy();
@@ -280,8 +280,8 @@ impl Drop for EngineGuard {
             if self.sym_inited {
                 ffi::td_sym_destroy();
             }
-            if self.arena_inited {
-                ffi::td_arena_destroy_all();
+            if self.heap_inited {
+                ffi::td_heap_destroy();
             }
         }
     }
@@ -300,12 +300,12 @@ fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
 
     // Hold the lock across init to prevent double-initialization race
     unsafe {
-        ffi::td_arena_init();
+        ffi::td_heap_init();
     }
     let mut guard = EngineGuard {
         pool_inited: false,
         sym_inited: false,
-        arena_inited: true,
+        heap_inited: true,
     };
     unsafe {
         ffi::td_sym_init();
@@ -313,7 +313,7 @@ fn acquire_engine_guard() -> Result<Arc<EngineGuard>> {
     guard.sym_inited = true;
     let err = unsafe { ffi::td_pool_init(0) };
     if err != ffi::td_err_t::TD_OK {
-        // guard will drop, cleaning up arena + sym that were already initialized
+        // guard will drop, cleaning up heap + sym that were already initialized
         drop(guard);
         return Err(Error::from_code(err));
     }
@@ -346,7 +346,7 @@ pub fn cancel() {
 }
 
 // ---------------------------------------------------------------------------
-// Context — manages global engine state (arena, sym table, thread pool)
+// Context — manages global engine state (heap, sym table, thread pool)
 // ---------------------------------------------------------------------------
 
 /// Intern a string into the global symbol table. Returns a stable i64 ID.
@@ -360,7 +360,7 @@ pub fn sym_intern(s: &str) -> Result<i64> {
     Ok(unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) })
 }
 
-/// Engine context. Initializes the arena allocator, symbol table, and thread
+/// Engine context. Initializes the heap allocator, symbol table, and thread
 /// pool on construction. Tears them down in reverse order on drop.
 ///
 /// Only one `Context` should exist at a time. The C engine uses global state.
@@ -369,12 +369,12 @@ pub struct Context {
     /// Cache of opened parted tables, keyed by "db_root/table_name" path.
     /// Avoids re-opening (mmap + sym_load) on every query.
     parted_cache: RefCell<HashMap<String, Table>>,
-    // *mut () makes Context !Send + !Sync (C engine uses thread-local arenas)
+    // *mut () makes Context !Send + !Sync (C engine uses thread-local heaps)
     _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl Context {
-    /// Create a new engine context. Calls `td_arena_init`, `td_sym_init`,
+    /// Create a new engine context. Calls `td_heap_init`, `td_sym_init`,
     /// `td_pool_init(0)` (auto-detect thread count).
     pub fn new() -> Result<Self> {
         let engine = acquire_engine_guard()?;
@@ -1548,6 +1548,8 @@ impl Graph<'_> {
             return Err(Error::Oom);
         }
         let result = unsafe { ffi::td_execute(self.raw, optimized) };
+        // GC: reclaim fully-free pools on the main thread after execution.
+        unsafe { ffi::td_heap_gc() };
         let result = check_ptr(result)?;
         // td_execute returns a freshly allocated td_t* with rc=1 (caller owns it).
         // No td_retain needed — Table::drop will call td_release to free it.

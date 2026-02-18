@@ -47,8 +47,8 @@ static void worker_loop(void* arg) {
 
     td_pool_t* pool = wctx.pool;
 
-    /* Each worker thread gets its own arena */
-    td_arena_init();
+    /* Each worker thread gets its own heap */
+    td_heap_init();
 
     for (;;) {
         td_sem_wait(&pool->work_ready);
@@ -78,9 +78,13 @@ static void worker_loop(void* arg) {
             atomic_fetch_sub_explicit(&pool->pending, 1,
                                       memory_order_acq_rel);
         }
+
+        /* No td_heap_gc() here — removing worker GC between dispatch rounds
+         * ensures main can safely modify worker heaps in td_parallel_end().
+         * Eager madvise in heap_coalesce already releases pages on free. */
     }
 
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* --------------------------------------------------------------------------
@@ -259,6 +263,10 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
+    /* Mark parallel region: workers are about to run, cross-heap
+     * freelist modification is unsafe until spin-wait completes. */
+    atomic_store_explicit(&td_parallel_flag, 1, memory_order_release);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         td_sem_signal(&pool->work_ready);
@@ -295,6 +303,10 @@ void td_pool_dispatch(td_pool_t* pool, td_pool_fn fn, void* ctx,
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
+
+    /* All tasks done, workers heading to sem_wait (no GC in loop).
+     * Safe for main to modify worker heaps between dispatches. */
+    atomic_store_explicit(&td_parallel_flag, 0, memory_order_release);
 }
 
 /* --------------------------------------------------------------------------
@@ -336,6 +348,8 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
     atomic_store_explicit(&pool->task_tail, 0, memory_order_release);
     atomic_store_explicit(&pool->pending, n_tasks, memory_order_release);
 
+    atomic_store_explicit(&td_parallel_flag, 1, memory_order_release);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         td_sem_signal(&pool->work_ready);
@@ -371,6 +385,8 @@ void td_pool_dispatch_n(td_pool_t* pool, td_pool_fn fn, void* ctx,
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
+
+    atomic_store_explicit(&td_parallel_flag, 0, memory_order_release);
 }
 
 /* --------------------------------------------------------------------------

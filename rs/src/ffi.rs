@@ -535,7 +535,7 @@ pub struct td_mem_stats_t {
 // ===== Opaque Forward Declarations =====
 
 #[repr(C)]
-pub struct td_arena_t {
+pub struct td_heap_t {
     _opaque: [u8; 0],
 }
 
@@ -599,6 +599,7 @@ extern "C" {
     pub fn td_thread_count() -> u32;
     pub fn td_parallel_begin();
     pub fn td_parallel_end();
+    pub fn td_heap_gc();
 
     // --- Memory Allocator API ---
     pub fn td_alloc(data_size: usize) -> *mut td_t;
@@ -606,8 +607,9 @@ extern "C" {
     pub fn td_alloc_copy(v: *mut td_t) -> *mut td_t;
     pub fn td_scratch_alloc(data_size: usize) -> *mut td_t;
     pub fn td_scratch_realloc(v: *mut td_t, new_data_size: usize) -> *mut td_t;
-    pub fn td_arena_init();
-    pub fn td_arena_destroy_all();
+    pub fn td_heap_init();
+    pub fn td_heap_destroy();
+    pub fn td_heap_merge(src: *mut td_heap_t);
     pub fn td_mem_stats(out: *mut td_mem_stats_t);
 
     // --- COW / Ref Counting API ---

@@ -100,6 +100,28 @@ void td_vm_release(void* ptr, size_t size) {
 #endif
 }
 
+void* td_vm_alloc_aligned(size_t size, size_t alignment) {
+    size_t total = size + alignment;
+    void* mem = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return NULL;
+
+    uintptr_t addr = (uintptr_t)mem;
+    uintptr_t aligned = (addr + alignment - 1) & ~(alignment - 1);
+
+    /* Trim leading excess */
+    if (aligned > addr)
+        munmap(mem, aligned - addr);
+
+    /* Trim trailing excess */
+    uintptr_t end = addr + total;
+    uintptr_t aligned_end = aligned + size;
+    if (end > aligned_end)
+        munmap((void*)aligned_end, end - aligned_end);
+
+    return (void*)aligned;
+}
+
 /* --------------------------------------------------------------------------
  * Threading
  * -------------------------------------------------------------------------- */
@@ -259,6 +281,16 @@ void td_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
     /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
     DiscardVirtualMemory(ptr, size);
+}
+
+void* td_vm_alloc_aligned(size_t size, size_t alignment) {
+    /* Over-allocate, find aligned offset. Can't trim on Windows, so the
+     * pool header's vm_base field stores the original base for VirtualFree. */
+    void* mem = VirtualAlloc(NULL, size + alignment,
+                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!mem) return NULL;
+    uintptr_t aligned = ((uintptr_t)mem + alignment - 1) & ~(alignment - 1);
+    return (void*)aligned;
 }
 
 /* --------------------------------------------------------------------------

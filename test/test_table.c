@@ -31,7 +31,7 @@
 
 static void* table_setup(const void* params, void* user_data) {
     (void)params; (void)user_data;
-    td_arena_init();
+    td_heap_init();
     td_sym_init();
     return NULL;
 }
@@ -39,7 +39,7 @@ static void* table_setup(const void* params, void* user_data) {
 static void table_teardown(void* fixture) {
     (void)fixture;
     td_sym_destroy();
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* ---- table_new ------------------------------------------------------------ */

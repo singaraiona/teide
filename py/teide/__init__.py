@@ -108,12 +108,12 @@ class TeideLib:
     def _setup_signatures(self):
         lib = self._lib
 
-        # ===== Memory / Arena =====
-        lib.td_arena_init.argtypes = []
-        lib.td_arena_init.restype = None
+        # ===== Memory / Heap =====
+        lib.td_heap_init.argtypes = []
+        lib.td_heap_init.restype = None
 
-        lib.td_arena_destroy_all.argtypes = []
-        lib.td_arena_destroy_all.restype = None
+        lib.td_heap_destroy.argtypes = []
+        lib.td_heap_destroy.restype = None
 
         lib.td_pool_destroy.argtypes = []
         lib.td_pool_destroy.restype = None
@@ -331,10 +331,10 @@ class TeideLib:
         self._lib.td_sym_destroy()
 
     def arena_init(self):
-        self._lib.td_arena_init()
+        self._lib.td_heap_init()
 
     def arena_destroy_all(self):
-        self._lib.td_arena_destroy_all()
+        self._lib.td_heap_destroy()
 
     def pool_destroy(self):
         self._lib.td_pool_destroy()

@@ -24,6 +24,7 @@
 #include "exec.h"
 #include "hash.h"
 #include "pool.h"
+#include "mem/heap.h"
 #include <string.h>
 #include <math.h>
 #include <float.h>
@@ -71,7 +72,8 @@ static inline void* scratch_realloc(td_t** hdr_out, size_t old_bytes, size_t new
 
 /* Free a scratch buffer (NULL-safe). */
 static inline void scratch_free(td_t* hdr) {
-    if (hdr) td_free(hdr);
+    if (!hdr) return;
+    td_free(hdr);
 }
 
 /* --------------------------------------------------------------------------
@@ -2818,24 +2820,23 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
     if (max_id >= UINT32_MAX - 1) { *hdr_out = NULL; return NULL; }
     uint32_t n_ids = max_id + 1;
 
+    /* Arena for temporaries (ids, ptrs, lens, tmp) — single reset at end */
+    td_scratch_arena_t arena;
+    td_scratch_arena_init(&arena);
+
     /* Allocate array of intern IDs to sort */
-    td_t* ids_hdr;
-    uint32_t* ids = (uint32_t*)scratch_alloc(&ids_hdr,
+    uint32_t* ids = (uint32_t*)td_scratch_arena_push(&arena,
                         (size_t)n_ids * sizeof(uint32_t));
-    if (!ids) { *hdr_out = NULL; return NULL; }
+    if (!ids) { td_scratch_arena_reset(&arena); *hdr_out = NULL; return NULL; }
     for (uint32_t i = 0; i < n_ids; i++) ids[i] = i;
 
     /* Pre-cache raw string pointers and lengths for fast comparison */
-    td_t* ptrs_hdr;
-    td_t* lens_hdr;
-    const char** ptrs = (const char**)scratch_alloc(&ptrs_hdr,
+    const char** ptrs = (const char**)td_scratch_arena_push(&arena,
                              (size_t)n_ids * sizeof(const char*));
-    uint32_t* lens = (uint32_t*)scratch_alloc(&lens_hdr,
+    uint32_t* lens = (uint32_t*)td_scratch_arena_push(&arena,
                          (size_t)n_ids * sizeof(uint32_t));
     if (!ptrs || !lens) {
-        if (ptrs) scratch_free(ptrs_hdr);
-        if (lens) scratch_free(lens_hdr);
-        scratch_free(ids_hdr); *hdr_out = NULL; return NULL;
+        td_scratch_arena_reset(&arena); *hdr_out = NULL; return NULL;
     }
     for (uint32_t i = 0; i < n_ids; i++) {
         td_t* s = td_sym_str((int64_t)i);
@@ -2852,11 +2853,10 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
      * values this completes in <1ms and correctly handles strings that
      * share long common prefixes (e.g. "id000000001"–"id000099999"). */
     {
-        td_t* tmp_hdr;
-        uint32_t* tmp = (uint32_t*)scratch_alloc(&tmp_hdr,
+        uint32_t* tmp = (uint32_t*)td_scratch_arena_push(&arena,
                              (size_t)n_ids * sizeof(uint32_t));
-        if (!tmp) { scratch_free(lens_hdr); scratch_free(ptrs_hdr);
-                    scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
+        if (!tmp) { td_scratch_arena_reset(&arena);
+                    *hdr_out = NULL; return NULL; }
 
         /* Bottom-up merge sort */
         for (uint32_t width = 1; width < n_ids; width *= 2) {
@@ -2883,23 +2883,19 @@ static uint32_t* build_enum_rank(td_t* col, int64_t nrows, td_t** hdr_out) {
             }
             /* Swap ids and tmp */
             uint32_t* s = ids; ids = tmp; tmp = s;
-            td_t* sh = ids_hdr; ids_hdr = tmp_hdr; tmp_hdr = sh;
         }
-        scratch_free(tmp_hdr);
     }
-    scratch_free(lens_hdr);
-    scratch_free(ptrs_hdr);
 
-    /* Build rank[intern_id] = sorted position */
+    /* Build rank[intern_id] = sorted position (output — not arena'd) */
     td_t* rank_hdr;
     uint32_t* rank = (uint32_t*)scratch_calloc(&rank_hdr,
                         (size_t)n_ids * sizeof(uint32_t));
-    if (!rank) { scratch_free(ids_hdr); *hdr_out = NULL; return NULL; }
+    if (!rank) { td_scratch_arena_reset(&arena); *hdr_out = NULL; return NULL; }
 
     for (uint32_t i = 0; i < n_ids; i++)
         rank[ids[i]] = i;
 
-    scratch_free(ids_hdr);
+    td_scratch_arena_reset(&arena);  /* free all temporaries at once */
     *hdr_out = rank_hdr;
     return rank;
 }
@@ -5315,7 +5311,13 @@ static td_t* exec_group_parted(td_graph_t* g, td_op_t* op, td_t* parted_tbl,
             est_groups *= card;
             if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
         }
-        if (est_groups * 100 > rows_per_part) can_partition = 0;
+        /* Block per-partition when cardinality is high AND the concat
+         * fallback would fit in memory (< 4 GB estimated).  When concat is
+         * too large, per-partition with batched merge is the only option. */
+        int64_t concat_bytes = total_rows * 8LL * (int64_t)(n_keys + n_aggs);
+        if (est_groups * 100 > rows_per_part &&
+            concat_bytes < 4LL * 1024 * 1024 * 1024)
+            can_partition = 0;
     }
 
     /* Try per-partition path (separate noinline function to avoid I-cache pressure) */
@@ -6257,11 +6259,20 @@ ht_path:;
             n_bufs * sizeof(radix_buf_t));
         if (!radix_bufs) goto sequential_fallback;
 
-        /* Pre-size each buffer: 1.5x expected entries per partition per worker */
+        /* Pre-size each buffer: 1.5x expected, capped so total ≤ 2 GB.
+         * Buffers grow on demand via radix_buf_push doubling. */
         uint32_t buf_init = (uint32_t)((uint64_t)nrows / (RADIX_P * n_total));
         if (buf_init < 64) buf_init = 64;
         buf_init = buf_init + buf_init / 2;  /* 1.5x headroom */
         uint16_t estride = ght_layout.entry_stride;
+        {
+            /* Cap: total pre-alloc ≤ 2 GB */
+            size_t total_pre = (size_t)n_bufs * buf_init * estride;
+            if (total_pre > (size_t)2 << 30) {
+                buf_init = (uint32_t)(((size_t)2 << 30) / ((size_t)n_bufs * estride));
+                if (buf_init < 64) buf_init = 64;
+            }
+        }
         for (size_t i = 0; i < n_bufs; i++) {
             radix_bufs[i].data = (char*)scratch_alloc(
                 &radix_bufs[i]._hdr, (size_t)buf_init * estride);
@@ -6803,179 +6814,275 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
     for (uint8_t i = 0; i < n_std; i++)
         part_agg_syms[std_cnt_slot[i]] = agg_syms[std_idx[i]];
 
-    /* Phase 1: exec_group per partition (zero-copy sub-tables) */
-    td_t* partials[n_parts];
-    memset(partials, 0, (size_t)n_parts * sizeof(td_t*));
+    /* ---- Batched incremental merge ----
+     * Process partitions in batches of MERGE_BATCH.  After each batch:
+     *   Phase 1: exec_group each partition in batch → batch_partials[]
+     *   Phase 2: concat (running + batch_partials + MAPCOMMON) → merge_tbl
+     *   Phase 3: merge GROUP BY → new running
+     * Bounds peak memory to O(MERGE_BATCH × groups_per_partition). */
+#define MERGE_BATCH 8
 
-    for (int32_t p = 0; p < n_parts; p++) {
-        /* Collect unique agg input sym IDs (avoid duplicate columns) */
-        int64_t unique_agg[24];
-        int n_unique_agg = 0;
-        for (uint8_t a = 0; a < part_n_aggs; a++) {
-            int dup = 0;
-            for (int i = 0; i < n_unique_agg; i++)
-                if (unique_agg[i] == part_agg_syms[a]) { dup = 1; break; }
-            if (!dup) {
-                /* Also check it's not already a key column */
-                for (uint8_t k = 0; k < n_keys; k++)
-                    if (key_syms[k] == part_agg_syms[a]) { dup = 1; break; }
-                if (!dup) unique_agg[n_unique_agg++] = part_agg_syms[a];
+    /* Capture agg column name IDs from first partition result */
+    int64_t agg_name_ids[24];
+    int agg_names_captured = 0;
+
+    td_t* running = NULL;
+    td_t* merge_tbl = NULL;      /* last merge table (for column name fixup) */
+
+    for (int32_t batch_start = 0; batch_start < n_parts;
+         batch_start += MERGE_BATCH) {
+
+        int32_t batch_end = batch_start + MERGE_BATCH;
+        if (batch_end > n_parts) batch_end = n_parts;
+        int32_t batch_n = batch_end - batch_start;
+
+        /* Phase 1: exec_group each partition in this batch */
+        td_t* bp[MERGE_BATCH];
+        memset(bp, 0, sizeof(bp));
+
+        for (int32_t bi = 0; bi < batch_n; bi++) {
+            int32_t p = batch_start + bi;
+
+            /* Collect unique agg input sym IDs (avoid duplicate columns) */
+            int64_t unique_agg[24];
+            int n_unique_agg = 0;
+            for (uint8_t a = 0; a < part_n_aggs; a++) {
+                int dup = 0;
+                for (int j = 0; j < n_unique_agg; j++)
+                    if (unique_agg[j] == part_agg_syms[a]) { dup = 1; break; }
+                if (!dup) {
+                    for (uint8_t k = 0; k < n_keys; k++)
+                        if (key_syms[k] == part_agg_syms[a]) { dup = 1; break; }
+                    if (!dup) unique_agg[n_unique_agg++] = part_agg_syms[a];
+                }
+            }
+
+            td_t* sub = td_table_new((int64_t)(n_part_keys + n_unique_agg));
+            if (!sub || TD_IS_ERR(sub)) goto batch_fail;
+
+            for (uint8_t k = 0; k < n_part_keys; k++) {
+                td_t* pcol = td_table_get_col(parted_tbl, pk_syms[k]);
+                if (!pcol || !TD_IS_PARTED(pcol->type)) {
+                    td_release(sub); goto batch_fail;
+                }
+                td_t* seg = ((td_t**)td_data(pcol))[p];
+                if (!seg) { td_release(sub); goto batch_fail; }
+                td_retain(seg);
+                sub = td_table_add_col(sub, pk_syms[k], seg);
+                td_release(seg);
+            }
+            for (int j = 0; j < n_unique_agg; j++) {
+                td_t* pcol = td_table_get_col(parted_tbl, unique_agg[j]);
+                if (!pcol || !TD_IS_PARTED(pcol->type)) {
+                    td_release(sub); goto batch_fail;
+                }
+                td_t* seg = ((td_t**)td_data(pcol))[p];
+                if (!seg) { td_release(sub); goto batch_fail; }
+                td_retain(seg);
+                sub = td_table_add_col(sub, unique_agg[j], seg);
+                td_release(seg);
+            }
+
+            td_graph_t* pg = td_graph_new(sub);
+            if (!pg) { td_release(sub); goto batch_fail; }
+
+            td_op_t* pkeys[8];
+            for (uint8_t k = 0; k < n_part_keys; k++) {
+                td_t* sym_atom = td_sym_str(pk_syms[k]);
+                pkeys[k] = td_scan(pg, td_str_ptr(sym_atom));
+            }
+            td_op_t* pagg_ins[24];
+            for (uint8_t a = 0; a < part_n_aggs; a++) {
+                td_t* sym_atom = td_sym_str(part_agg_syms[a]);
+                pagg_ins[a] = td_scan(pg, td_str_ptr(sym_atom));
+            }
+            for (uint8_t j = 0; j < n_std; j++) {
+                uint8_t sq = std_sq_slot[j];
+                td_op_t* x = pagg_ins[sq];
+                pagg_ins[sq] = td_mul(pg, x, x);
+            }
+
+            td_op_t* proot = td_group(pg, pkeys, n_part_keys,
+                                       part_ops, pagg_ins, part_n_aggs);
+            proot = td_optimize(pg, proot);
+            bp[bi] = td_execute(pg, proot);
+            td_graph_free(pg);
+            td_release(sub);
+
+            if (!bp[bi] || TD_IS_ERR(bp[bi])) goto batch_fail;
+
+            /* Capture agg column name IDs once (all partials share names) */
+            if (!agg_names_captured) {
+                for (uint8_t a = 0; a < part_n_aggs; a++)
+                    agg_name_ids[a] = td_table_col_name(
+                        bp[bi], (int64_t)n_part_keys + a);
+                agg_names_captured = 1;
             }
         }
 
-        td_t* sub = td_table_new((int64_t)(n_part_keys + n_unique_agg));
-        if (!sub || TD_IS_ERR(sub)) goto fail;
+        /* Phase 2: concat (running + batch_partials + MAPCOMMON) */
+        int64_t mrows = running ? td_table_nrows(running) : 0;
+        for (int32_t i = 0; i < batch_n; i++)
+            mrows += td_table_nrows(bp[i]);
 
-        for (uint8_t k = 0; k < n_part_keys; k++) {
-            td_t* pcol = td_table_get_col(parted_tbl, pk_syms[k]);
-            if (!pcol || !TD_IS_PARTED(pcol->type)) { td_release(sub); goto fail; }
-            td_t* seg = ((td_t**)td_data(pcol))[p];
-            if (!seg) { td_release(sub); goto fail; }
-            td_retain(seg);
-            sub = td_table_add_col(sub, pk_syms[k], seg);
-            td_release(seg);
-        }
-        for (int i = 0; i < n_unique_agg; i++) {
-            td_t* pcol = td_table_get_col(parted_tbl, unique_agg[i]);
-            if (!pcol || !TD_IS_PARTED(pcol->type)) { td_release(sub); goto fail; }
-            td_t* seg = ((td_t**)td_data(pcol))[p];
-            if (!seg) { td_release(sub); goto fail; }
-            td_retain(seg);
-            sub = td_table_add_col(sub, unique_agg[i], seg);
-            td_release(seg);
+        if (merge_tbl) { td_release(merge_tbl); merge_tbl = NULL; }
+        merge_tbl = td_table_new((int64_t)(n_keys + part_n_aggs));
+        if (!merge_tbl || TD_IS_ERR(merge_tbl)) {
+            merge_tbl = NULL; goto batch_fail;
         }
 
-        /* Build per-partition graph with the (possibly augmented) agg ops */
-        td_graph_t* pg = td_graph_new(sub);
-        if (!pg) { td_release(sub); goto fail; }
+        /* Key columns */
+        for (uint8_t k = 0; k < n_keys; k++) {
+            int is_mc = 0;
+            for (uint8_t m = 0; m < n_mc_keys; m++)
+                if (mc_sym_ids[m] == key_syms[k]) { is_mc = 1; break; }
 
-        td_op_t* pkeys[8];
-        for (uint8_t k = 0; k < n_part_keys; k++) {
-            td_t* sym_atom = td_sym_str(pk_syms[k]);
-            pkeys[k] = td_scan(pg, td_str_ptr(sym_atom));
+            /* Type reference for column allocation */
+            td_t* tref = NULL;
+            if (running) {
+                tref = td_table_get_col(running, key_syms[k]);
+            } else if (is_mc) {
+                td_t* mc_col = td_table_get_col(parted_tbl, key_syms[k]);
+                tref = ((td_t**)td_data(mc_col))[0];
+            } else {
+                tref = td_table_get_col(bp[0], key_syms[k]);
+            }
+            if (!tref) goto batch_fail;
+
+            size_t esz = (size_t)col_esz(tref);
+            td_t* flat = col_vec_new(tref, mrows);
+            if (!flat || TD_IS_ERR(flat)) goto batch_fail;
+            flat->len = mrows;
+            char* out = (char*)td_data(flat);
+            int64_t off = 0;
+
+            /* Copy from running result */
+            if (running) {
+                td_t* rc = td_table_get_col(running, key_syms[k]);
+                if (rc && rc->len > 0) {
+                    memcpy(out, td_data(rc), (size_t)rc->len * esz);
+                    off = rc->len;
+                }
+            }
+
+            /* Copy from batch partials */
+            for (int32_t i = 0; i < batch_n; i++) {
+                int64_t pnrows = td_table_nrows(bp[i]);
+                if (is_mc) {
+                    /* MAPCOMMON: replicate this partition's key value */
+                    int32_t p = batch_start + i;
+                    td_t* mc_col = td_table_get_col(parted_tbl, key_syms[k]);
+                    td_t* mc_kv = ((td_t**)td_data(mc_col))[0];
+                    const char* kdata = (const char*)td_data(mc_kv);
+                    for (int64_t r = 0; r < pnrows; r++)
+                        memcpy(out + (size_t)(off + r) * esz,
+                               kdata + (size_t)p * esz, esz);
+                    off += pnrows;
+                } else {
+                    td_t* pc = td_table_get_col(bp[i], key_syms[k]);
+                    if (pc && pc->len > 0) {
+                        memcpy(out + (size_t)off * esz,
+                               td_data(pc), (size_t)pc->len * esz);
+                        off += pc->len;
+                    }
+                }
+            }
+
+            merge_tbl = td_table_add_col(merge_tbl, key_syms[k], flat);
+            td_release(flat);
         }
-        td_op_t* pagg_ins[24];
+
+        /* Agg columns */
         for (uint8_t a = 0; a < part_n_aggs; a++) {
-            td_t* sym_atom = td_sym_str(part_agg_syms[a]);
-            pagg_ins[a] = td_scan(pg, td_str_ptr(sym_atom));
-        }
-        /* For SUM(x²) slots: replace scan with td_mul(scan_x, scan_x) */
-        for (uint8_t i = 0; i < n_std; i++) {
-            uint8_t sq = std_sq_slot[i];
-            td_op_t* x = pagg_ins[sq]; /* already a scan for the same column */
-            pagg_ins[sq] = td_mul(pg, x, x);
+            td_t* tref = running
+                ? td_table_get_col_idx(running, (int64_t)n_keys + a)
+                : td_table_get_col_idx(bp[0], (int64_t)n_part_keys + a);
+            if (!tref) goto batch_fail;
+
+            size_t esz = (size_t)col_esz(tref);
+            td_t* flat = col_vec_new(tref, mrows);
+            if (!flat || TD_IS_ERR(flat)) goto batch_fail;
+            flat->len = mrows;
+            char* out = (char*)td_data(flat);
+            int64_t off = 0;
+
+            if (running) {
+                td_t* rc = td_table_get_col_idx(running, (int64_t)n_keys + a);
+                if (rc && rc->len > 0) {
+                    memcpy(out, td_data(rc), (size_t)rc->len * esz);
+                    off = rc->len;
+                }
+            }
+
+            for (int32_t i = 0; i < batch_n; i++) {
+                td_t* pc = td_table_get_col_idx(bp[i],
+                                                 (int64_t)n_part_keys + a);
+                if (pc && pc->len > 0) {
+                    memcpy(out + (size_t)off * esz,
+                           td_data(pc), (size_t)pc->len * esz);
+                    off += pc->len;
+                }
+            }
+
+            merge_tbl = td_table_add_col(merge_tbl, agg_name_ids[a], flat);
+            td_release(flat);
         }
 
-        td_op_t* proot = td_group(pg, pkeys, n_part_keys, part_ops, pagg_ins, part_n_aggs);
-        proot = td_optimize(pg, proot);
-        partials[p] = td_execute(pg, proot);
-        td_graph_free(pg);
-        td_release(sub);
+        /* Free batch partials */
+        for (int32_t i = 0; i < batch_n; i++) {
+            td_release(bp[i]);
+            bp[i] = NULL;
+        }
 
-        if (!partials[p] || TD_IS_ERR(partials[p])) {
-            for (int32_t j = 0; j < p; j++) td_release(partials[j]);
+        /* Phase 3: merge GROUP BY */
+        td_graph_t* mg = td_graph_new(merge_tbl);
+        if (!mg) goto batch_fail;
+
+        td_op_t* mkeys[8];
+        for (uint8_t k = 0; k < n_keys; k++) {
+            td_t* sym_atom = td_sym_str(key_syms[k]);
+            mkeys[k] = td_scan(mg, td_str_ptr(sym_atom));
+        }
+
+        td_op_t* magg_ins[24];
+        for (uint8_t a = 0; a < part_n_aggs; a++) {
+            td_t* agg_name = td_sym_str(agg_name_ids[a]);
+            magg_ins[a] = td_scan(mg, td_str_ptr(agg_name));
+        }
+
+        td_op_t* mroot = td_group(mg, mkeys, n_keys,
+                                   merge_ops, magg_ins, part_n_aggs);
+        mroot = td_optimize(mg, mroot);
+        td_t* new_running = td_execute(mg, mroot);
+        td_graph_free(mg);
+
+        if (running) td_release(running);
+        running = new_running;
+
+        if (!running || TD_IS_ERR(running)) {
+            td_release(merge_tbl);
             return NULL;
         }
-    }
 
-    /* Phase 2: concatenate small partial results into merge table */
-    int64_t merge_rows = 0;
-    for (int32_t p = 0; p < n_parts; p++)
-        merge_rows += td_table_nrows(partials[p]);
+        /* Rename running's agg columns back to the original partial names.
+         * Without this, each merge adds an extra suffix (e.g. v1_sum → v1_sum_sum). */
+        for (uint8_t a = 0; a < part_n_aggs; a++)
+            td_table_set_col_name(running, (int64_t)n_keys + a, agg_name_ids[a]);
 
-    int64_t merge_ncols = td_table_ncols(partials[0]);
-    td_t* merge_tbl = td_table_new(merge_ncols);
-    if (!merge_tbl || TD_IS_ERR(merge_tbl)) {
-        for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
+        continue;
+
+batch_fail:
+        for (int32_t i = 0; i < batch_n; i++)
+            if (bp[i]) td_release(bp[i]);
+        if (running) td_release(running);
+        if (merge_tbl) td_release(merge_tbl);
         return NULL;
     }
 
-    for (int64_t c = 0; c < merge_ncols; c++) {
-        td_t* first_col = td_table_get_col_idx(partials[0], c);
-        int64_t name_id = td_table_col_name(partials[0], c);
-        size_t esz = (size_t)col_esz(first_col);
-
-        td_t* flat = col_vec_new(first_col, merge_rows);
-        if (!flat || TD_IS_ERR(flat)) {
-            td_release(merge_tbl);
-            for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
-            return NULL;
-        }
-        flat->len = merge_rows;
-
-        int64_t off = 0;
-        for (int32_t p = 0; p < n_parts; p++) {
-            td_t* pc = td_table_get_col_idx(partials[p], c);
-            if (pc && pc->len > 0) {
-                memcpy((char*)td_data(flat) + (size_t)off * esz,
-                       td_data(pc), (size_t)pc->len * esz);
-                off += pc->len;
-            }
-        }
-
-        merge_tbl = td_table_add_col(merge_tbl, name_id, flat);
-        td_release(flat);
-    }
-    /* Add MAPCOMMON key columns: replicate each partition's typed value
-     * for that partition's group count in the partial results. */
-    if (n_mc_keys > 0) {
-        int64_t part_nrows[n_parts];
-        for (int32_t p = 0; p < n_parts; p++)
-            part_nrows[p] = td_table_nrows(partials[p]);
-
-        for (uint8_t m = 0; m < n_mc_keys; m++) {
-            td_t* mc_col = td_table_get_col(parted_tbl, mc_sym_ids[m]);
-            td_t** mc_ptrs = (td_t**)td_data(mc_col);
-            td_t* mc_kv = mc_ptrs[0];
-            size_t esz = (size_t)col_esz(mc_kv);
-            const char* kdata = (const char*)td_data(mc_kv);
-
-            td_t* mc_flat = col_vec_new(mc_kv, merge_rows);
-            if (!mc_flat || TD_IS_ERR(mc_flat)) {
-                td_release(merge_tbl);
-                for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
-                return NULL;
-            }
-            mc_flat->len = merge_rows;
-            char* mc_out = (char*)td_data(mc_flat);
-            int64_t off = 0;
-            for (int32_t p = 0; p < n_parts; p++) {
-                for (int64_t r = 0; r < part_nrows[p]; r++)
-                    memcpy(mc_out + (off + r) * esz, kdata + (size_t)p * esz, esz);
-                off += part_nrows[p];
-            }
-            merge_tbl = td_table_add_col(merge_tbl, mc_sym_ids[m], mc_flat);
-            td_release(mc_flat);
-        }
-    }
-    for (int32_t p = 0; p < n_parts; p++) td_release(partials[p]);
-
-    /* Phase 3: build merge graph and re-aggregate */
-    td_graph_t* mg = td_graph_new(merge_tbl);
-    if (!mg) { td_release(merge_tbl); return NULL; }
-
-    td_op_t* mkeys[8];
-    for (uint8_t k = 0; k < n_keys; k++) {
-        td_t* sym_atom = td_sym_str(key_syms[k]);
-        mkeys[k] = td_scan(mg, td_str_ptr(sym_atom));
-    }
-
-    /* Scan partial agg result columns by their output names.
-     * Agg columns start at n_part_keys in merge_tbl (MAPCOMMON keys appended after). */
-    td_op_t* magg_ins[24];
-    for (uint8_t a = 0; a < part_n_aggs; a++) {
-        int64_t agg_name_id = td_table_col_name(merge_tbl, (int64_t)n_part_keys + a);
-        td_t* agg_name = td_sym_str(agg_name_id);
-        magg_ins[a] = td_scan(mg, td_str_ptr(agg_name));
-    }
-
-    td_op_t* mroot = td_group(mg, mkeys, n_keys, merge_ops, magg_ins, part_n_aggs);
-    mroot = td_optimize(mg, mroot);
-    td_t* result = td_execute(mg, mroot);
+    td_t* result = running;
 
     if (!result || TD_IS_ERR(result)) {
-        td_graph_free(mg);
-        td_release(merge_tbl);
+        if (merge_tbl) td_release(merge_tbl);
         return NULL;
     }
 
@@ -6987,8 +7094,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         td_t* trimmed = td_table_new((int64_t)(n_keys + n_aggs));
         if (!trimmed || TD_IS_ERR(trimmed)) {
             td_release(result);
-            td_graph_free(mg);
-            td_release(merge_tbl);
+            if (merge_tbl) td_release(merge_tbl);
             return NULL;
         }
 
@@ -7028,7 +7134,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                 td_t* avg_col = td_vec_new(TD_F64, nrows);
                 if (!avg_col || TD_IS_ERR(avg_col)) {
                     td_release(trimmed); td_release(result);
-                    td_graph_free(mg); td_release(merge_tbl);
+                    if (merge_tbl) td_release(merge_tbl);
                     return NULL;
                 }
                 avg_col->len = nrows;
@@ -7071,7 +7177,7 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
                 td_t* out_col = td_vec_new(TD_F64, nrows);
                 if (!out_col || TD_IS_ERR(out_col)) {
                     td_release(trimmed); td_release(result);
-                    td_graph_free(mg); td_release(merge_tbl);
+                    if (merge_tbl) td_release(merge_tbl);
                     return NULL;
                 }
                 out_col->len = nrows;
@@ -7125,22 +7231,13 @@ exec_group_per_partition(td_t* parted_tbl, td_op_ext_t* ext,
         rncols = td_table_ncols(result);
     }
 
-    /* Fix result column names: the merge may produce "v1_sum_sum" instead
-     * of "v1_sum". Replace with the original partial result names.
-     * Agg columns in merge_tbl start at n_part_keys (MC keys appended after). */
-    for (uint8_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++) {
-        int64_t want_name = td_table_col_name(merge_tbl, (int64_t)n_part_keys + a);
-        td_table_set_col_name(result, (int64_t)n_keys + a, want_name);
-    }
+    /* Agg column names already fixed by td_table_set_col_name inside batch loop.
+     * Apply final name fixup for the user-facing n_aggs columns (trim decomposed extras). */
+    for (uint8_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++)
+        td_table_set_col_name(result, (int64_t)n_keys + a, agg_name_ids[a]);
 
-    td_graph_free(mg);
-    td_release(merge_tbl);
+    if (merge_tbl) td_release(merge_tbl);
     return result;
-
-fail:
-    for (int32_t j = 0; j < n_parts; j++)
-        if (partials[j]) td_release(partials[j]);
-    return NULL;
 }
 
 /* ============================================================================

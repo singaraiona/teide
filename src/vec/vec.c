@@ -34,7 +34,7 @@
 
 static int64_t vec_capacity(td_t* vec) {
     size_t block_size = (size_t)1 << vec->order;
-    size_t data_space = block_size - 32;
+    size_t data_space = block_size - 32;  /* 32B td_t header */
     uint8_t esz = td_sym_elem_size(vec->type, vec->attrs);
     if (esz == 0) return 0;
     return (int64_t)(data_space / esz);

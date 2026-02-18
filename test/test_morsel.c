@@ -29,13 +29,13 @@
 
 static void* morsel_setup(const void* params, void* user_data) {
     (void)params; (void)user_data;
-    td_arena_init();
+    td_heap_init();
     return NULL;
 }
 
 static void morsel_teardown(void* fixture) {
     (void)fixture;
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* ---- morsel_init ------------------------------------------------------- */

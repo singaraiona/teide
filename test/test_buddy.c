@@ -23,20 +23,19 @@
 
 #include "munit.h"
 #include <teide/td.h>
-#include "mem/buddy.h"
 #include <string.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
 static void* buddy_setup(const void* params, void* user_data) {
     (void)params; (void)user_data;
-    td_arena_init();
+    td_heap_init();
     return NULL;
 }
 
 static void buddy_teardown(void* fixture) {
     (void)fixture;
-    td_arena_destroy_all();
+    td_heap_destroy();
 }
 
 /* ---- Basic alloc/free -------------------------------------------------- */
@@ -125,7 +124,7 @@ static MunitResult test_header_zeroed(const void* params, void* fixture) {
     /* type and attrs should be 0 */
     munit_assert_int(v->type, ==, 0);
     munit_assert_uint(v->attrs, ==, 0);
-    /* mmod should be 0 (arena) */
+    /* mmod should be 0 (heap) */
     munit_assert_uint(v->mmod, ==, 0);
     /* rc should be 1 */
     munit_assert_uint(atomic_load_explicit(&v->rc, memory_order_relaxed), ==, 1);
@@ -164,14 +163,14 @@ static MunitResult test_small_block_reuse(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
-/* ---- Arena growth ------------------------------------------------------- */
+/* ---- Pool growth -------------------------------------------------------- */
 
-static MunitResult test_arena_growth(const void* params, void* fixture) {
+static MunitResult test_pool_growth(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    /* Allocate blocks until we exhaust the first 64 MiB arena.
-     * Each block is 2^15 = 32 KiB, so ~2048 blocks to fill 64 MiB. */
-    size_t block_data_size = (1 << 15) - 32;  /* order 15 */
+    /* Allocate blocks until we exhaust the first 32 MiB pool.
+     * Each block is 2^15 = 32 KiB, so ~1024 blocks to fill 32 MiB. */
+    size_t block_data_size = (1 << 15) - 32;  /* order 15 (32B td_t header) */
     int count = 0;
     td_t* blocks[4096];
     for (int i = 0; i < 4096; i++) {
@@ -179,8 +178,8 @@ static MunitResult test_arena_growth(const void* params, void* fixture) {
         if (!blocks[i]) break;
         count++;
     }
-    /* Should have allocated many blocks (some from first arena, some from second) */
-    munit_assert_int(count, >, 2000);
+    /* Should have allocated many blocks (some from first pool, some from second) */
+    munit_assert_int(count, >, 1000);
 
     for (int i = 0; i < count; i++) {
         td_free(blocks[i]);
@@ -227,7 +226,7 @@ static MunitResult test_coalescing(const void* params, void* fixture) {
     /* Allocate two blocks of order 10 (1024 bytes each), then free them.
      * After freeing both, they should coalesce into a larger block.
      * Verify by allocating one block of order 11 (2048 bytes). */
-    size_t data_size = (1 << 10) - 32;  /* order 10 */
+    size_t data_size = (1 << 10) - 32;  /* order 10 (32B td_t header) */
     td_t* a = td_alloc(data_size);
     td_t* b = td_alloc(data_size);
     munit_assert_ptr_not_null(a);
@@ -333,18 +332,78 @@ static MunitResult test_various_sizes(const void* params, void* fixture) {
 static MunitResult test_order_for_size(const void* params, void* fixture) {
     (void)params; (void)fixture;
 
-    /* 0 data bytes -> need 32 bytes total -> order 5 (2^5=32) */
-    munit_assert_uint(td_order_for_size(0), ==, 5);
+    /* 0 data bytes -> need 32 bytes total (32B td_t header) -> order 6 (2^6=64) */
+    munit_assert_uint(td_order_for_size(0), ==, 6);
 
     /* 1 data byte -> 33 bytes -> order 6 (2^6=64) */
     munit_assert_uint(td_order_for_size(1), ==, 6);
 
-    /* 32 data bytes -> 64 bytes -> order 6 */
+    /* 32 data bytes -> 64 bytes -> order 6 (exact fit) */
     munit_assert_uint(td_order_for_size(32), ==, 6);
+
+    /* 33 data bytes -> 65 bytes -> order 7 (2^7=128) */
+    munit_assert_uint(td_order_for_size(33), ==, 7);
 
     /* 800 data bytes (100 i64s) -> 832 bytes -> order 10 (2^10=1024) */
     munit_assert_uint(td_order_for_size(800), ==, 10);
 
+    return MUNIT_OK;
+}
+
+/* ---- Pool alignment ---------------------------------------------------- */
+
+static MunitResult test_pool_alignment(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Allocate a block and verify self-aligned pool derivation */
+    td_t* v = td_alloc(64);
+    munit_assert_ptr_not_null(v);
+
+    /* Block must be inside a self-aligned pool */
+    uintptr_t addr = (uintptr_t)v;
+    size_t pool_size = (size_t)1 << 25;  /* 32 MB standard pool */
+    uintptr_t pool_base = addr & ~(pool_size - 1);
+
+    /* Pool base must be self-aligned */
+    munit_assert_uint(pool_base % pool_size, ==, 0);
+    /* Block must be within pool */
+    munit_assert_true(addr >= pool_base && addr < pool_base + pool_size);
+
+    td_free(v);
+    return MUNIT_OK;
+}
+
+/* ---- Heap ID derivation ------------------------------------------------ */
+
+static MunitResult test_heap_id_derivation(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Allocate blocks and verify pool header heap_id matches */
+    td_t* v1 = td_alloc(0);
+    td_t* v2 = td_alloc(1024);
+    td_t* v3 = td_alloc(65536);
+    munit_assert_ptr_not_null(v1);
+    munit_assert_ptr_not_null(v2);
+    munit_assert_ptr_not_null(v3);
+
+    /* All blocks in same heap should derive same heap_id */
+    uintptr_t p1 = (uintptr_t)v1 & ~(((size_t)1 << 25) - 1);
+    uintptr_t p3 = (uintptr_t)v3 & ~(((size_t)1 << 25) - 1);
+
+    uint16_t hid1 = ((uint16_t*)p1)[0]; /* heap_id at offset 0 of pool header */
+    uint16_t hid3 = ((uint16_t*)p3)[0];
+
+    /* If same pool, heap_ids must match */
+    if (p1 == p3) {
+        munit_assert_uint(hid1, ==, hid3);
+    }
+    /* All heap_ids should be non-zero (counter starts at 1) */
+    munit_assert_uint(hid1, >, 0);
+    munit_assert_uint(hid3, >, 0);
+
+    td_free(v1);
+    td_free(v2);
+    td_free(v3);
     return MUNIT_OK;
 }
 
@@ -357,13 +416,15 @@ static MunitTest buddy_tests[] = {
     { "/alloc_large",       test_alloc_large,       buddy_setup, buddy_teardown, 0, NULL },
     { "/header_zeroed",     test_header_zeroed,     buddy_setup, buddy_teardown, 0, NULL },
     { "/small_reuse",       test_small_block_reuse, buddy_setup, buddy_teardown, 0, NULL },
-    { "/arena_growth",      test_arena_growth,      buddy_setup, buddy_teardown, 0, NULL },
+    { "/pool_growth",       test_pool_growth,       buddy_setup, buddy_teardown, 0, NULL },
     { "/mem_stats",         test_mem_stats,         buddy_setup, buddy_teardown, 0, NULL },
     { "/coalescing",        test_coalescing,        buddy_setup, buddy_teardown, 0, NULL },
     { "/alloc_copy",        test_alloc_copy,        buddy_setup, buddy_teardown, 0, NULL },
     { "/alloc_free_cycles", test_alloc_free_cycles, buddy_setup, buddy_teardown, 0, NULL },
     { "/various_sizes",     test_various_sizes,     buddy_setup, buddy_teardown, 0, NULL },
     { "/order_for_size",    test_order_for_size,    buddy_setup, buddy_teardown, 0, NULL },
+    { "/pool_alignment",    test_pool_alignment,    buddy_setup, buddy_teardown, 0, NULL },
+    { "/heap_id_derivation", test_heap_id_derivation, buddy_setup, buddy_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

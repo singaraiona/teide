@@ -94,7 +94,7 @@ td_t* td_table_add_col(td_t* tbl, int64_t name_id, td_t* col_vec) {
 
     /* Check capacity: we need (1 + idx + 1) pointers in data region */
     size_t block_size = (size_t)1 << tbl->order;
-    size_t data_space = block_size - 32;
+    size_t data_space = block_size - 32;  /* 32B td_t header */
     int64_t max_cols = (int64_t)(data_space / sizeof(td_t*)) - 1;  /* minus schema slot */
 
     if (idx >= max_cols) {

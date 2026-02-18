@@ -75,6 +75,14 @@ extern "C" {
 #endif
 #endif /* TD_LIKELY */
 
+#ifndef TD_ASSUME_ALIGNED
+#if defined(__GNUC__) || defined(__clang__)
+  #define TD_ASSUME_ALIGNED(p, n) __builtin_assume_aligned((p), (n))
+#else
+  #define TD_ASSUME_ALIGNED(p, n) (p)
+#endif
+#endif
+
 #if defined(_MSC_VER)
   #define TD_TLS __declspec(thread)
 #else
@@ -208,7 +216,7 @@ const char* td_err_str(td_err_t e);
 
 /* ===== Core Type: td_t (32-byte block/object header) ===== */
 
-typedef union td_t {
+typedef union TD_ALIGN(32) td_t {
     /* Allocated: object header */
     struct {
         /* Bytes 0-15: nullable bitmask / slice / ext nullmap */
@@ -254,7 +262,10 @@ extern const uint8_t td_type_sizes[TD_TYPE_COUNT];
 #define td_is_atom(v)    ((v)->type < 0)
 #define td_is_vec(v)     ((v)->type > 0)
 #define td_len(v)        ((v)->len)
-#define td_data(v)       ((void*)(v)->data)
+static inline void* td_data_fn(td_t* v) {
+    return TD_ASSUME_ALIGNED((void*)v->data, 32);
+}
+#define td_data(v)       td_data_fn(v)
 #define td_elem_size(t)  (td_type_sizes[(t)])
 
 /* SYM-aware element size: returns adaptive width for TD_SYM columns */

@@ -744,7 +744,7 @@ fn map_sql_type(dt: &DataType) -> Result<i8, SqlError> {
         | DataType::Double
         | DataType::DoublePrecision
         | DataType::Real => Ok(crate::types::F64),
-        DataType::Varchar(_) | DataType::Text | DataType::String(_) => Ok(crate::types::STR),
+        DataType::Varchar(_) | DataType::Text | DataType::String(_) => Ok(crate::types::SYM),
         DataType::Date => Ok(crate::types::DATE),
         DataType::Time(_, _) => Ok(crate::types::TIME),
         DataType::Timestamp(_, _) => Ok(crate::types::TIMESTAMP),

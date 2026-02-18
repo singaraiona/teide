@@ -111,7 +111,6 @@ extern "C" {
 #define TD_I32        5
 #define TD_I64        6
 #define TD_F64        7
-#define TD_STR        8
 #define TD_DATE       9
 #define TD_TIME      10
 #define TD_TIMESTAMP 11
@@ -156,7 +155,7 @@ extern "C" {
 #define TD_ATOM_I32        (-TD_I32)
 #define TD_ATOM_I64        (-TD_I64)
 #define TD_ATOM_F64        (-TD_F64)
-#define TD_ATOM_STR        (-TD_STR)
+#define TD_ATOM_STR        (-8)
 #define TD_ATOM_DATE       (-TD_DATE)
 #define TD_ATOM_TIME       (-TD_TIME)
 #define TD_ATOM_TIMESTAMP  (-TD_TIMESTAMP)

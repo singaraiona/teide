@@ -1783,7 +1783,6 @@ pub mod types {
     pub const I32: i8 = super::ffi::TD_I32;
     pub const I64: i8 = super::ffi::TD_I64;
     pub const F64: i8 = super::ffi::TD_F64;
-    pub const STR: i8 = super::ffi::TD_STR;
     pub const DATE: i8 = super::ffi::TD_DATE;
     pub const TIME: i8 = super::ffi::TD_TIME;
     pub const TIMESTAMP: i8 = super::ffi::TD_TIMESTAMP;

@@ -38,7 +38,7 @@ Usage:
 """
 
 import ctypes
-from teide import TeideLib, TD_I64, TD_F64, TD_I32, TD_BOOL, TD_SYM, TD_TABLE, TD_STR
+from teide import TeideLib, TD_I64, TD_F64, TD_I32, TD_BOOL, TD_SYM, TD_TABLE
 from teide import OP_SUM, OP_AVG, OP_MIN, OP_MAX, OP_COUNT, OP_FIRST, OP_LAST
 
 # Opcode constants not in __init__
@@ -46,7 +46,7 @@ OP_PROD = 51
 
 _DTYPE_NAMES = {
     TD_BOOL: "bool", TD_I32: "i32", TD_I64: "i64",
-    TD_F64: "f64", TD_STR: "str", TD_SYM: "sym",
+    TD_F64: "f64", TD_SYM: "sym",
 }
 
 # TD_SYM width constants (lower 2 bits of attrs)

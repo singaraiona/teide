@@ -50,7 +50,7 @@ td_t* td_u8(uint8_t val) {
 td_t* td_char(char val) {
     td_t* v = td_alloc(0);
     if (TD_IS_ERR(v)) return v;
-    v->type = TD_ATOM_CHAR;
+    v->type = TD_ATOM_U8;
     v->c8 = val;
     return v;
 }
@@ -110,7 +110,7 @@ td_t* td_str(const char* s, size_t len) {
     size_t data_size = len + 1;
     td_t* chars = td_alloc(data_size);
     if (!chars || TD_IS_ERR(chars)) return chars;
-    chars->type = TD_CHAR;
+    chars->type = TD_U8;
     chars->len = (int64_t)len;
     memcpy(td_data(chars), s, len);
     ((char*)td_data(chars))[len] = '\0';

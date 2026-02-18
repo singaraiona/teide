@@ -31,12 +31,12 @@ use std::sync::atomic::AtomicU32;
 pub const TD_LIST: i8 = 0;
 pub const TD_BOOL: i8 = 1;
 pub const TD_U8: i8 = 2;
-pub const TD_CHAR: i8 = 3;
+// TD_CHAR (3) removed — use TD_U8
 pub const TD_I16: i8 = 4;
 pub const TD_I32: i8 = 5;
 pub const TD_I64: i8 = 6;
 pub const TD_F64: i8 = 7;
-pub const TD_STR: i8 = 8;
+pub const TD_STR: i8 = 8; // atom-only (TD_ATOM_STR)
 pub const TD_DATE: i8 = 9;
 pub const TD_TIME: i8 = 10;
 pub const TD_TIMESTAMP: i8 = 11;
@@ -69,7 +69,6 @@ pub fn td_parted_basetype(t: i8) -> i8 {
 // Atom variants (negative type tags)
 pub const TD_ATOM_BOOL: i8 = -TD_BOOL;
 pub const TD_ATOM_U8: i8 = -TD_U8;
-pub const TD_ATOM_CHAR: i8 = -TD_CHAR;
 pub const TD_ATOM_I16: i8 = -TD_I16;
 pub const TD_ATOM_I32: i8 = -TD_I32;
 pub const TD_ATOM_I64: i8 = -TD_I64;

@@ -106,12 +106,12 @@ extern "C" {
 #define TD_LIST       0
 #define TD_BOOL       1
 #define TD_U8         2
-#define TD_CHAR       3
+/*      TD_CHAR    3  -- removed: was identical to TD_U8 */
 #define TD_I16        4
 #define TD_I32        5
 #define TD_I64        6
 #define TD_F64        7
-#define TD_STR        8
+#define TD_STR        8   /* atom-only: TD_ATOM_STR for string scalars */
 #define TD_DATE       9
 #define TD_TIME      10
 #define TD_TIMESTAMP 11
@@ -151,7 +151,6 @@ extern "C" {
 /* Atom variants (negative type tags) */
 #define TD_ATOM_BOOL       (-TD_BOOL)
 #define TD_ATOM_U8         (-TD_U8)
-#define TD_ATOM_CHAR       (-TD_CHAR)
 #define TD_ATOM_I16        (-TD_I16)
 #define TD_ATOM_I32        (-TD_I32)
 #define TD_ATOM_I64        (-TD_I64)

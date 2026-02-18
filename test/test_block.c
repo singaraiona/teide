@@ -72,7 +72,6 @@ static MunitResult test_elem_size(const void* params, void* fixture) {
 
     munit_assert_int(td_elem_size(TD_BOOL), ==, 1);
     munit_assert_int(td_elem_size(TD_U8),   ==, 1);
-    munit_assert_int(td_elem_size(TD_CHAR), ==, 1);
     munit_assert_int(td_elem_size(TD_I16),  ==, 2);
     munit_assert_int(td_elem_size(TD_I32),  ==, 4);
     munit_assert_int(td_elem_size(TD_I64),  ==, 8);

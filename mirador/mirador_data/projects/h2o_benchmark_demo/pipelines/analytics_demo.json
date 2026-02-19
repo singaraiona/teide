@@ -1,0 +1,193 @@
+{
+  "nodes": [
+    {
+      "id": "csv1",
+      "type": "pipeline",
+      "position": {
+        "x": 100,
+        "y": 250
+      },
+      "data": {
+        "nodeType": "csv_source",
+        "label": "H2O 10M CSV",
+        "category": "input",
+        "config": {
+          "file_path": "/home/hetoku/data/work/rayforce-bench/datasets/G1_1e7_1e2_0_0/G1_1e7_1e2_0_0.csv"
+        }
+      }
+    },
+    {
+      "id": "grp1",
+      "type": "pipeline",
+      "position": {
+        "x": 380,
+        "y": 120
+      },
+      "data": {
+        "nodeType": "query",
+        "label": "Group by id1 \u2192 SUM(v1)",
+        "category": "compute",
+        "config": {
+          "mode": "form",
+          "groupby": {
+            "keys": [
+              "id1"
+            ],
+            "aggs": [
+              {
+                "column": "v1",
+                "op": "sum"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "grp2",
+      "type": "pipeline",
+      "position": {
+        "x": 380,
+        "y": 380
+      },
+      "data": {
+        "nodeType": "query",
+        "label": "Group by id1,id2 \u2192 SUM+AVG",
+        "category": "compute",
+        "config": {
+          "mode": "form",
+          "groupby": {
+            "keys": [
+              "id1",
+              "id2"
+            ],
+            "aggs": [
+              {
+                "column": "v1",
+                "op": "sum"
+              },
+              {
+                "column": "v3",
+                "op": "avg"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "chart1",
+      "type": "pipeline",
+      "position": {
+        "x": 700,
+        "y": 50
+      },
+      "data": {
+        "nodeType": "chart",
+        "label": "Bar: SUM(v1) by id1",
+        "category": "output",
+        "config": {
+          "chart_type": "bar",
+          "x_column": "id1",
+          "y_column": "v1_sum",
+          "title": "Sum of v1 by Category (id1)"
+        }
+      }
+    },
+    {
+      "id": "grid1",
+      "type": "pipeline",
+      "position": {
+        "x": 700,
+        "y": 200
+      },
+      "data": {
+        "nodeType": "grid",
+        "label": "Summary Table",
+        "category": "output",
+        "config": {
+          "page_size": 50
+        }
+      }
+    },
+    {
+      "id": "chart2",
+      "type": "pipeline",
+      "position": {
+        "x": 700,
+        "y": 350
+      },
+      "data": {
+        "nodeType": "chart",
+        "label": "Scatter: SUM vs AVG",
+        "category": "output",
+        "config": {
+          "chart_type": "scatter",
+          "x_column": "v1_sum",
+          "y_column": "v3_mean",
+          "title": "v1 Sum vs v3 Average (by id1 x id2)"
+        }
+      }
+    },
+    {
+      "id": "grid2",
+      "type": "pipeline",
+      "position": {
+        "x": 700,
+        "y": 500
+      },
+      "data": {
+        "nodeType": "grid",
+        "label": "Detailed Grid",
+        "category": "output",
+        "config": {
+          "page_size": 100
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "csv1",
+      "target": "grp1",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    },
+    {
+      "id": "e2",
+      "source": "csv1",
+      "target": "grp2",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    },
+    {
+      "id": "e3",
+      "source": "grp1",
+      "target": "chart1",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    },
+    {
+      "id": "e4",
+      "source": "grp1",
+      "target": "grid1",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    },
+    {
+      "id": "e5",
+      "source": "grp2",
+      "target": "chart2",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    },
+    {
+      "id": "e6",
+      "source": "grp2",
+      "target": "grid2",
+      "sourceHandle": "out-0",
+      "targetHandle": "in-0"
+    }
+  ]
+}

@@ -76,13 +76,34 @@ def refresh_dashboard(slug: str, name: str):
         # Execute the pipeline to get results
         try:
             from mirador.engine.executor import PipelineExecutor
-            executor = PipelineExecutor()
-            results = executor.run(pipeline)
-            node_result = results.get(node_id, {})
-            data[alias] = {
-                "rows": node_result.get("rows", []),
-                "columns": node_result.get("columns", []),
+            from mirador.api.nodes import get_registry
+            # Transform React Flow format to executor format
+            exec_pipeline = {
+                "nodes": [
+                    {"id": n["id"], "type": n["data"]["nodeType"], "config": n["data"].get("config", {})}
+                    for n in pipeline.get("nodes", [])
+                ],
+                "edges": [
+                    {"source": e["source"], "target": e["target"]}
+                    for e in pipeline.get("edges", [])
+                ],
             }
+            executor = PipelineExecutor(get_registry())
+            results = executor.run(exec_pipeline)
+            node_result = results.get(node_id, {})
+            # Extract actual row data from the Table df object
+            table = node_result.get("df")
+            if table is not None and hasattr(table, "to_dict"):
+                columns = node_result.get("columns", table.columns if hasattr(table, "columns") else [])
+                table_data = table.to_dict()
+                n = len(table)
+                rows = [{col: table_data[col][i] for col in columns} for i in range(min(n, 500))]
+                data[alias] = {"rows": rows, "columns": list(columns)}
+            else:
+                data[alias] = {
+                    "rows": node_result.get("rows", []),
+                    "columns": node_result.get("columns", []),
+                }
         except Exception as e:
             data[alias] = {"rows": [], "columns": [], "error": str(e)}
 

@@ -1,0 +1,91 @@
+{
+  "name": "h2o_overview",
+  "data_sources": [
+    {
+      "workflow_name": "analytics_demo",
+      "node_id": "grp1",
+      "alias": "by_id1"
+    },
+    {
+      "workflow_name": "analytics_demo",
+      "node_id": "grp2",
+      "alias": "by_id1_id2"
+    }
+  ],
+  "widgets": [
+    {
+      "id": "w1",
+      "type": "bar_chart",
+      "title": "SUM(v1) by Category",
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "data_source": "by_id1",
+      "config": {
+        "x_column": "id1",
+        "y_column": "v1_sum"
+      }
+    },
+    {
+      "id": "w2",
+      "type": "table",
+      "title": "Grouped by id1 \u2014 Summary",
+      "layout": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "data_source": "by_id1",
+      "config": {}
+    },
+    {
+      "id": "w3",
+      "type": "pie_chart",
+      "title": "Value Distribution by id1",
+      "layout": {
+        "x": 0,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "data_source": "by_id1",
+      "config": {
+        "x_column": "id1",
+        "y_column": "v1_sum"
+      }
+    },
+    {
+      "id": "w4",
+      "type": "stat_card",
+      "title": "Total Groups (id1)",
+      "layout": {
+        "x": 4,
+        "y": 4,
+        "w": 2,
+        "h": 2
+      },
+      "data_source": "by_id1",
+      "config": {
+        "stat_type": "count"
+      }
+    },
+    {
+      "id": "w5",
+      "type": "table",
+      "title": "Detailed: id1 x id2 Aggregation",
+      "layout": {
+        "x": 6,
+        "y": 4,
+        "w": 6,
+        "h": 4
+      },
+      "data_source": "by_id1_id2",
+      "config": {}
+    }
+  ],
+  "grid_cols": 12
+}

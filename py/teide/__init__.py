@@ -225,6 +225,9 @@ class TeideLib:
         lib.td_const_bool.argtypes = [c_graph_p, ctypes.c_bool]
         lib.td_const_bool.restype = c_op_p
 
+        lib.td_const_str.argtypes = [c_graph_p, ctypes.c_char_p]
+        lib.td_const_str.restype = c_op_p
+
         lib.td_const_vec.argtypes = [c_graph_p, c_td_p]
         lib.td_const_vec.restype = c_op_p
 
@@ -366,6 +369,9 @@ class TeideLib:
 
     def const_i64(self, g, val):
         return self._lib.td_const_i64(g, ctypes.c_int64(val))
+
+    def const_str(self, g, s):
+        return self._lib.td_const_str(g, s.encode('utf-8') if isinstance(s, str) else s)
 
     def const_vec(self, g, vec):
         return self._lib.td_const_vec(g, vec)

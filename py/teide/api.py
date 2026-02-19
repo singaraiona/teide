@@ -645,8 +645,11 @@ class Query:
                 )
 
         if current is None:
-            # No ops — just return the bound table
             current = lib.const_table(g, self._ptr)
+
+        # Apply any pending filter predicate
+        if filter_pred is not None:
+            current = lib._lib.td_filter(g, current, filter_pred)
 
         return current, pinned
 
@@ -666,6 +669,8 @@ def _emit_expr(lib, g, expr):
             return lib._lib.td_const_bool(g, val)
         elif isinstance(val, int):
             return lib.const_i64(g, val)
+        elif isinstance(val, str):
+            return lib.const_str(g, val)
         else:
             raise TypeError(f"Unsupported literal type: {type(val)}")
 

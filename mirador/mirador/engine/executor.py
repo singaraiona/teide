@@ -4,6 +4,11 @@ from collections import defaultdict
 from typing import Any, Callable
 from mirador.engine.registry import NodeRegistry
 
+# In-memory session cache: session_id -> {node_id: full_output_dict}
+# Keeps raw DataFrames alive so resume can feed them to downstream nodes.
+_session_cache: dict[str, dict[str, Any]] = {}
+_MAX_SESSIONS = 20
+
 
 class PipelineExecutor:
     """Walks a pipeline DAG in topological order, executing each node eagerly."""
@@ -17,6 +22,8 @@ class PipelineExecutor:
         on_node_start: Callable[[str], None] | None = None,
         on_node_done: Callable[[str, dict], None] | None = None,
         on_node_error: Callable[[str, Exception], None] | None = None,
+        session_id: str | None = None,
+        start_from: str | None = None,
     ) -> dict[str, Any]:
         """Execute the pipeline, return {node_id: output_dict}."""
         nodes = {n["id"]: n for n in pipeline["nodes"]}
@@ -47,9 +54,21 @@ class PipelineExecutor:
         if len(order) != len(nodes):
             raise ValueError("Pipeline has a cycle")
 
-        # Execute in topological order
+        # Determine start index for resume
         results: dict[str, Any] = {}
-        for n_id in order:
+        start_idx = 0
+
+        if start_from and session_id and session_id in _session_cache:
+            cached = _session_cache[session_id]
+            if start_from in order:
+                start_idx = order.index(start_from)
+                # Restore cached results for nodes before start_from
+                for n_id in order[:start_idx]:
+                    if n_id in cached:
+                        results[n_id] = cached[n_id]
+
+        # Execute from start_idx onward
+        for n_id in order[start_idx:]:
             node_def = nodes[n_id]
             node_cls = self.registry.get(node_def["type"])
             node = node_cls()
@@ -57,7 +76,7 @@ class PipelineExecutor:
             # Merge upstream outputs into input dict
             inputs: dict[str, Any] = {}
             for up_id in upstream[n_id]:
-                up_out = results[up_id]
+                up_out = results.get(up_id, {})
                 inputs.update(up_out)
 
             if on_node_start:
@@ -73,5 +92,12 @@ class PipelineExecutor:
                 if on_node_error:
                     on_node_error(n_id, exc)
                 break  # stop on first error
+
+        # Cache results for future resume
+        if session_id:
+            _session_cache[session_id] = results
+            if len(_session_cache) > _MAX_SESSIONS:
+                oldest = next(iter(_session_cache))
+                del _session_cache[oldest]
 
         return results

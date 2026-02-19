@@ -14,6 +14,8 @@ from fastapi.responses import FileResponse
 from teide import TeideLib
 
 from mirador import __version__
+from mirador.api.dashboards import router as dashboards_router
+from mirador.api.files import router as files_router
 from mirador.api.nodes import router as nodes_router
 from mirador.api.pipelines import router as pipelines_router
 from mirador.api.projects import router as projects_router
@@ -55,6 +57,8 @@ app.add_middleware(
 )
 
 
+app.include_router(dashboards_router)
+app.include_router(files_router)
 app.include_router(nodes_router)
 app.include_router(pipelines_router)
 app.include_router(projects_router)

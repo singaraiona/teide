@@ -1,9 +1,9 @@
-import { useCallback, useRef, type DragEvent } from 'react';
+import { useCallback, useRef, type DragEvent, type MouseEvent } from 'react';
 import {
   ReactFlow,
   Background,
   Controls,
-  MiniMap,
+  MarkerType,
   type Node,
   type Edge,
   type ReactFlowInstance,
@@ -15,6 +15,12 @@ import PipelineNode from './PipelineNode';
 
 const nodeTypes = { pipeline: PipelineNode };
 
+const defaultEdgeOptions = {
+  type: 'smoothstep',
+  style: { stroke: '#b0c4cf', strokeWidth: 1 },
+  markerEnd: { type: MarkerType.ArrowClosed, width: 8, height: 8, color: '#b0c4cf' },
+};
+
 export default function Canvas() {
   const nodes = useStore((s) => s.nodes);
   const edges = useStore((s) => s.edges);
@@ -23,8 +29,10 @@ export default function Canvas() {
   const onConnect = useStore((s) => s.onConnect);
   const addNode = useStore((s) => s.addNode);
   const selectNode = useStore((s) => s.selectNode);
+  const setEditingNodeId = useStore((s) => s.setEditingNodeId);
 
   const reactFlowInstance = useRef<ReactFlowInstance<Node<NodeData>, Edge> | null>(null);
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const onDragOver = useCallback((event: DragEvent) => {
     event.preventDefault();
@@ -58,18 +66,54 @@ export default function Canvas() {
   );
 
   const onNodeClick = useCallback(
-    (_: React.MouseEvent, node: any) => {
-      selectNode(node.id);
+    (_: MouseEvent, node: any) => {
+      // Delay selection to allow double-click to cancel it
+      if (clickTimer.current) {
+        clearTimeout(clickTimer.current);
+        clickTimer.current = null;
+        return;
+      }
+      clickTimer.current = setTimeout(() => {
+        clickTimer.current = null;
+        selectNode(node.id);
+      }, 250);
     },
     [selectNode]
   );
 
+  const onNodeDoubleClick = useCallback(
+    (_: MouseEvent, node: any) => {
+      // Cancel the pending single-click selection
+      if (clickTimer.current) {
+        clearTimeout(clickTimer.current);
+        clickTimer.current = null;
+      }
+      setEditingNodeId(node.id);
+    },
+    [setEditingNodeId]
+  );
+
   const onPaneClick = useCallback(() => {
     selectNode(null);
-  }, [selectNode]);
+    setEditingNodeId(null);
+  }, [selectNode, setEditingNodeId]);
 
   return (
     <div className="canvas-container">
+      {nodes.length === 0 && (
+        <div className="canvas-empty">
+          <div className="canvas-empty-content">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="7" height="7" rx="1" />
+              <rect x="14" y="3" width="7" height="7" rx="1" />
+              <rect x="3" y="14" width="7" height="7" rx="1" />
+              <path d="M17.5 14v7M14 17.5h7" />
+            </svg>
+            <p>Drag nodes from the palette to build your pipeline</p>
+            <span>or click a node type to add it</span>
+          </div>
+        </div>
+      )}
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -77,6 +121,7 @@ export default function Canvas() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onNodeClick={onNodeClick}
+        onNodeDoubleClick={onNodeDoubleClick}
         onPaneClick={onPaneClick}
         onDragOver={onDragOver}
         onDrop={onDrop}
@@ -84,21 +129,12 @@ export default function Canvas() {
           reactFlowInstance.current = instance;
         }}
         nodeTypes={nodeTypes}
+        defaultEdgeOptions={defaultEdgeOptions}
         fitView
         deleteKeyCode="Delete"
       >
-        <Background />
+        <Background color="#dce8ee" gap={24} size={1.5} />
         <Controls />
-        <MiniMap
-          nodeColor={(n: any) => {
-            const cat = n.data?.category;
-            if (cat === 'input') return '#3b82f6';
-            if (cat === 'compute') return '#22c55e';
-            if (cat === 'generic') return '#a855f7';
-            if (cat === 'output') return '#f97316';
-            return '#ccc';
-          }}
-        />
       </ReactFlow>
     </div>
   );

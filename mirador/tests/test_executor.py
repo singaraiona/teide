@@ -38,22 +38,25 @@ def test_csv_to_grid(init_teide):
         os.unlink(path)
 
 
-def test_csv_groupby_grid(init_teide):
-    """CSV → GroupBy → Grid."""
+def test_csv_query_groupby_grid(init_teide):
+    """CSV → Query(groupby) → Grid."""
     path = _make_csv("id,val\na,10\na,20\nb,30\n")
     try:
         pipeline = {
             "nodes": [
                 {"id": "src", "type": "csv_source", "config": {"file_path": path}},
-                {"id": "grp", "type": "groupby", "config": {
-                    "keys": ["id"],
-                    "aggs": [{"column": "val", "op": "sum"}],
+                {"id": "qry", "type": "query", "config": {
+                    "mode": "form",
+                    "groupby": {
+                        "keys": ["id"],
+                        "aggs": [{"column": "val", "op": "sum"}],
+                    },
                 }},
                 {"id": "out", "type": "grid", "config": {}},
             ],
             "edges": [
-                {"source": "src", "target": "grp"},
-                {"source": "grp", "target": "out"},
+                {"source": "src", "target": "qry"},
+                {"source": "qry", "target": "out"},
             ],
         }
         executor = PipelineExecutor(_make_registry())
@@ -64,21 +67,22 @@ def test_csv_groupby_grid(init_teide):
         os.unlink(path)
 
 
-def test_csv_filter_grid(init_teide):
-    """CSV → Filter → Grid."""
+def test_csv_query_filter_grid(init_teide):
+    """CSV → Query(filter) → Grid."""
     path = _make_csv("id,val\na,10\na,20\nb,30\nb,40\n")
     try:
         pipeline = {
             "nodes": [
                 {"id": "src", "type": "csv_source", "config": {"file_path": path}},
-                {"id": "flt", "type": "filter", "config": {
-                    "column": "val", "operator": "gt", "value": "20",
+                {"id": "qry", "type": "query", "config": {
+                    "mode": "form",
+                    "filter": {"column": "val", "operator": "gt", "value": "20"},
                 }},
                 {"id": "out", "type": "grid", "config": {}},
             ],
             "edges": [
-                {"source": "src", "target": "flt"},
-                {"source": "flt", "target": "out"},
+                {"source": "src", "target": "qry"},
+                {"source": "qry", "target": "out"},
             ],
         }
         executor = PipelineExecutor(_make_registry())

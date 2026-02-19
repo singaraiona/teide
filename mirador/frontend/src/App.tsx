@@ -1,18 +1,21 @@
 import './App.css';
-import Toolbar from './components/Toolbar';
-import Sidebar from './components/Sidebar';
-import Canvas from './components/Canvas';
-import PreviewPanel from './components/PreviewPanel';
+import NavBar from './components/NavBar';
+import useStore from './store/useStore';
+import WorkflowListPage from './pages/WorkflowListPage';
+import DashboardListPage from './pages/DashboardListPage';
+import WorkflowEditorPage from './pages/WorkflowEditorPage';
+import DashboardEditorPage from './pages/DashboardEditorPage';
 
 function App() {
+  const view = useStore((s) => s.currentView);
+
   return (
     <div className="app-layout">
-      <Toolbar />
-      <div className="app-main">
-        <Sidebar />
-        <Canvas />
-      </div>
-      <PreviewPanel />
+      <NavBar />
+      {view === 'workflows' && <WorkflowListPage />}
+      {view === 'dashboards' && <DashboardListPage />}
+      {view === 'workflow-editor' && <WorkflowEditorPage />}
+      {view === 'dashboard-editor' && <DashboardEditorPage />}
     </div>
   );
 }

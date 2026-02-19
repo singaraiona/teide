@@ -43,6 +43,7 @@ class ProjectStore:
         (proj_dir / "data").mkdir()
         (proj_dir / "outputs").mkdir()
         (proj_dir / "pipelines").mkdir()
+        (proj_dir / "dashboards").mkdir()
         meta = ProjectMeta(name=name, slug=slug)
         (proj_dir / "meta.json").write_text(meta.model_dump_json(indent=2))
         return meta.model_dump()
@@ -88,6 +89,37 @@ class ProjectStore:
     def delete_pipeline(self, slug: str, pipeline_name: str) -> bool:
         """Delete a pipeline from a project."""
         path = self._projects_dir() / slug / "pipelines" / f"{pipeline_name}.json"
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
+    # ---- Dashboard CRUD ----
+
+    def list_dashboards(self, slug: str) -> list[str]:
+        """List dashboard names in a project."""
+        dash_dir = self._projects_dir() / slug / "dashboards"
+        if not dash_dir.exists():
+            return []
+        return [p.stem for p in sorted(dash_dir.glob("*.json"))]
+
+    def save_dashboard(self, slug: str, name: str, data: dict):
+        """Save a dashboard definition to a project."""
+        dash_dir = self._projects_dir() / slug / "dashboards"
+        dash_dir.mkdir(parents=True, exist_ok=True)
+        path = dash_dir / f"{name}.json"
+        path.write_text(json.dumps(data, indent=2))
+
+    def load_dashboard(self, slug: str, name: str) -> dict | None:
+        """Load a dashboard definition from a project."""
+        path = self._projects_dir() / slug / "dashboards" / f"{name}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def delete_dashboard(self, slug: str, name: str) -> bool:
+        """Delete a dashboard from a project."""
+        path = self._projects_dir() / slug / "dashboards" / f"{name}.json"
         if not path.exists():
             return False
         path.unlink()

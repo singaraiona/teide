@@ -15,8 +15,7 @@ async def test_list_node_types(init_teide):
         ids = [n["id"] for n in data]
         assert "csv_source" in ids
         assert "grid" in ids
-        assert "filter" in ids
-        assert "groupby" in ids
+        assert "query" in ids
 
 
 @pytest.mark.asyncio
@@ -48,7 +47,7 @@ async def test_run_pipeline(init_teide):
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_with_groupby(init_teide):
+async def test_run_pipeline_with_query_groupby(init_teide):
     data_csv = "id,val\na,10\na,20\nb,30\n"
     with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
         f.write(data_csv)
@@ -58,15 +57,18 @@ async def test_run_pipeline_with_groupby(init_teide):
         payload = {
             "nodes": [
                 {"id": "src", "type": "csv_source", "config": {"file_path": csv_path}},
-                {"id": "grp", "type": "groupby", "config": {
-                    "keys": ["id"],
-                    "aggs": [{"column": "val", "op": "sum"}],
+                {"id": "qry", "type": "query", "config": {
+                    "mode": "form",
+                    "groupby": {
+                        "keys": ["id"],
+                        "aggs": [{"column": "val", "op": "sum"}],
+                    },
                 }},
                 {"id": "out", "type": "grid", "config": {}},
             ],
             "edges": [
-                {"source": "src", "target": "grp"},
-                {"source": "grp", "target": "out"},
+                {"source": "src", "target": "qry"},
+                {"source": "qry", "target": "out"},
             ],
         }
         transport = ASGITransport(app=app)

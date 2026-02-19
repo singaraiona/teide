@@ -4705,6 +4705,8 @@ typedef struct {
     uint16_t*      agg_ops;      /* per-agg operation code */
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
+    uint32_t       agg_f64_mask; /* bitmask: bit a set if agg[a] is TD_F64 */
+    bool           all_sum;      /* true when all ops are SUM/AVG/COUNT (no MIN/MAX/FIRST/LAST) */
     uint32_t       n_slots;
     const uint64_t* mask;
     const uint8_t*  sel_flags;   /* per-segment TD_SEL_NONE/ALL/MIX (NULL=all pass) */
@@ -4947,11 +4949,32 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     }
 }
 
-/* Inner DA accumulation for a single row — shared by single-key and multi-key paths */
+/* Inner DA accumulation for a single row — shared by single-key and multi-key paths.
+ * Fast path for SUM/AVG-only queries: eliminates op-code dispatch and da_read_val
+ * dual-write overhead.  The branch on c->all_sum is perfectly predicted (invariant
+ * across all rows). */
 static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r) {
     uint8_t n_aggs = c->n_aggs;
     acc->count[gid]++;
     size_t base = (size_t)gid * n_aggs;
+
+    if (TD_LIKELY(c->all_sum)) {
+        /* SUM/AVG/COUNT fast path — no op-code dispatch, typed read only.
+         * COUNT-only queries have acc->sum==NULL; count[gid]++ above suffices. */
+        if (!acc->sum) return;
+        uint32_t f64m = c->agg_f64_mask;
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            if (!c->agg_ptrs[a]) continue;
+            size_t idx = base + a;
+            if (f64m & (1u << a))
+                acc->sum[idx].f += ((const double*)c->agg_ptrs[a])[r];
+            else
+                acc->sum[idx].i += read_col_i64(c->agg_ptrs[a], r,
+                                                c->agg_types[a], 0);
+        }
+        return;
+    }
+
     for (uint8_t a = 0; a < n_aggs; a++) {
         if (!c->agg_ptrs[a]) continue;
         size_t idx = base + a;
@@ -5858,6 +5881,7 @@ da_path:;
         if (da_fits) {
             /* Recompute need_flags (da_fits may have changed scope) */
             uint8_t need_flags = DA_NEED_COUNT;
+            bool all_sum = true;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
@@ -5865,6 +5889,8 @@ da_path:;
                     { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
+                if (aop != OP_SUM && aop != OP_AVG && aop != OP_COUNT)
+                    all_sum = false;
             }
 
             /* Compute strides: stride[k] = product of ranges[k+1..n_keys-1]
@@ -5889,10 +5915,13 @@ da_path:;
 
             void* agg_ptrs[n_aggs];
             int8_t agg_types[n_aggs];
+            uint32_t agg_f64_mask = 0;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 if (agg_vecs[a]) {
                     agg_ptrs[a]  = td_data(agg_vecs[a]);
                     agg_types[a] = agg_vecs[a]->type;
+                    if (agg_vecs[a]->type == TD_F64)
+                        agg_f64_mask |= (1u << a);
                 } else {
                     agg_ptrs[a]  = NULL;
                     agg_types[a] = 0;
@@ -5984,6 +6013,8 @@ da_path:;
                 .agg_ops     = ext->agg_ops,
                 .n_aggs      = n_aggs,
                 .need_flags  = need_flags,
+                .agg_f64_mask = agg_f64_mask,
+                .all_sum     = all_sum,
                 .n_slots     = n_slots,
                 .mask        = mask,
                 .sel_flags   = sel_flags,

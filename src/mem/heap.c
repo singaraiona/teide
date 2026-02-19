@@ -857,7 +857,7 @@ void td_heap_gc(void) {
         /* Phase 4: Reclaim OVERSIZED empty pools.
          * Standard pools (pool_order == TD_HEAP_POOL_ORDER) are never
          * munmapped — physical pages released via madvise (phase 5)
-         * re-fault cheaply on next query (kdb+ style).
+         * re-fault cheaply on next query.
          * Only oversized pools (pool_order > TD_HEAP_POOL_ORDER) are
          * candidates — these are one-off large allocations.
          *

@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Create a partitioned table from the H2OAI 10M-row benchmark CSV.
+"""Create a partitioned table from the 10M-row benchmark CSV.
 
 Loads the CSV, splits into N date-partitioned splayed tables on disk:
 
@@ -52,7 +52,7 @@ TABLE_NAME = "quotes"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create partitioned table from H2OAI CSV")
+    parser = argparse.ArgumentParser(description="Create partitioned table from benchmark CSV")
     parser.add_argument("--parts", type=int, default=5, help="Number of partitions")
     parser.add_argument("--db", type=str, default="/tmp/teide_db", help="Database root")
     args = parser.parse_args()

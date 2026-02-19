@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Query a partitioned table with H2OAI groupby benchmarks (q1-q7).
+"""Query a partitioned table with groupby benchmarks (q1-q7).
 
 Opens the parted table via td_read_parted (zero-copy mmap), then runs
 all 7 groupby queries. The partition-aware executor concatenates
@@ -113,7 +113,7 @@ def main():
     ncols = lib.table_ncols(tbl)
     print(f"Opened: {nrows:,} rows x {ncols} cols in {open_ms:.1f} ms\n")
 
-    # Run all 7 H2OAI groupby queries
+    # Run all 7 groupby queries
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 

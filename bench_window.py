@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Window function benchmark runner for Teide via CLI on H2OAI 10M dataset."""
+"""Window function benchmark runner for Teide via CLI on 10M dataset."""
 
 import subprocess
 import time

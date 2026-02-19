@@ -21,9 +21,9 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""DuckDB sort benchmark for comparison with Teide on H2OAI 10M dataset.
+"""Baseline sort benchmark for comparison with Teide on 10M dataset.
 
-Uses CREATE OR REPLACE TABLE to materialize results inside DuckDB,
+Uses CREATE OR REPLACE TABLE to materialize results,
 avoiding Python fetchall() overhead for fair comparison with Teide's
 in-C materialization.
 """
@@ -80,7 +80,7 @@ def main():
     row_count = con.execute("SELECT COUNT(*) FROM df").fetchone()[0]
     print(f"Loaded: {row_count:,} rows in {load_time*1000:.0f} ms\n")
 
-    print("DuckDB sort benchmarks (single-threaded):")
+    print("Baseline sort benchmarks (single-threaded):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
@@ -89,7 +89,7 @@ def main():
 
     con.execute("RESET threads")
     nthreads = con.execute("SELECT current_setting('threads')").fetchone()[0]
-    print(f"\nDuckDB sort benchmarks (multi-threaded, {nthreads} threads):")
+    print(f"\nBaseline sort benchmarks (multi-threaded, {nthreads} threads):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 

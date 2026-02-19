@@ -21,9 +21,9 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""DuckDB join benchmark for comparison with Teide on H2OAI 10M join dataset.
+"""Baseline join benchmark for comparison with Teide on 10M join dataset.
 
-Uses CREATE OR REPLACE TABLE to materialize results inside DuckDB,
+Uses CREATE OR REPLACE TABLE to materialize results,
 avoiding Python fetchall() overhead for fair comparison.
 """
 
@@ -84,7 +84,7 @@ def main():
     print(f"  {con.execute('SELECT COUNT(*) FROM y').fetchone()[0]:,} rows in "
           f"{(time.perf_counter()-t0)*1000:.0f} ms\n")
 
-    print("DuckDB join benchmarks (single-threaded):")
+    print("Baseline join benchmarks (single-threaded):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 
@@ -93,7 +93,7 @@ def main():
 
     con.execute("RESET threads")
     nthreads = con.execute("SELECT current_setting('threads')").fetchone()[0]
-    print(f"\nDuckDB join benchmarks (multi-threaded, {nthreads} threads):")
+    print(f"\nBaseline join benchmarks (multi-threaded, {nthreads} threads):")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")
     print(f"  {'-'*12}  {'-'*8}  {'-'*20}")
 

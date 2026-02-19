@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Generate a 500M-row partitioned table from H2OAI 10M CSV.
+"""Generate a 500M-row partitioned table from 10M CSV.
 
 Replicates the full 10M-row CSV into 50 date-partitioned splayed tables,
 producing 500M total rows under /tmp/db:

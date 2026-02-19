@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Generate a partitioned table from H2OAI CSV for on-disk benchmarks.
+"""Generate a partitioned table from benchmark CSV for on-disk benchmarks.
 
 Creates N date-partitioned splayed tables under DB_ROOT, mirroring the
 directory structure used by rayforce's parted.rfl example:
@@ -58,7 +58,7 @@ TABLE_NAME = "quotes"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate partitioned table from H2OAI CSV")
+    parser = argparse.ArgumentParser(description="Generate partitioned table from benchmark CSV")
     parser.add_argument("--parts", type=int, default=5, help="Number of partitions (default: 5)")
     parser.add_argument("--db", type=str, default="/tmp/teide_db", help="Database root directory")
     args = parser.parse_args()

@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""DuckDB benchmark for comparison with Teide on H2OAI 10M groupby dataset."""
+"""Baseline benchmark for comparison with Teide on 10M groupby dataset."""
 
 import duckdb
 import time
@@ -98,7 +98,7 @@ def main():
     con = duckdb.connect()
     con.execute("RESET threads")
     nthreads = con.execute("SELECT current_setting('threads')").fetchone()[0]
-    print(f"DuckDB benchmarks ({nthreads} threads)")
+    print(f"Baseline benchmarks ({nthreads} threads)")
 
     print(f"\nLoading groupby CSV ...")
     t0 = time.perf_counter()

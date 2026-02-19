@@ -21,9 +21,9 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""DuckDB window function benchmark for comparison with Teide on H2OAI 10M dataset.
+"""Baseline window function benchmark for comparison with Teide on 10M dataset.
 
-Uses CREATE OR REPLACE TABLE to materialize results inside DuckDB,
+Uses CREATE OR REPLACE TABLE to materialize results,
 avoiding Python fetchall() overhead for fair comparison.
 """
 
@@ -77,7 +77,7 @@ def main():
     row_count = con.execute("SELECT COUNT(*) FROM df").fetchone()[0]
     print(f"Loaded: {row_count:,} rows in {load_time*1000:.0f} ms\n")
 
-    print("DuckDB window benchmarks (multi-threaded):")
+    print("Baseline window benchmarks (multi-threaded):")
     nthreads = con.execute("SELECT current_setting('threads')").fetchone()[0]
     print(f"  Threads: {nthreads}")
     print(f"  {'Query':12s}  {'Time':>8s}       Result")

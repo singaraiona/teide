@@ -16,7 +16,7 @@ See SPEC.md Section 1 for the full layout. Key entry points:
 - `src/` — implementation (core/, mem/, vec/, table/, ops/, store/, io/)
 - `test/` — munit-based tests (test_main.c + test_*.c)
 - `bindings/python/` — ctypes wrapper + high-level Python API
-- `bench_run.py` / `bench_duckdb.py` — H2OAI groupby benchmarks
+- `bench_run.py` / `bench_duckdb.py` — groupby benchmarks
 
 ## Build & Test
 

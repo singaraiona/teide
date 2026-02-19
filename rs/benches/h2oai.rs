@@ -19,9 +19,9 @@
 //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //   SOFTWARE.
 
-//! H2OAI benchmark suite for Teide SQL engine (criterion).
+//! Groupby benchmark suite for Teide SQL engine (criterion).
 //!
-//! Requires the 10M-row H2OAI CSV datasets at `../rayforce-bench/datasets/`
+//! Requires the 10M-row CSV datasets at `../rayforce-bench/datasets/`
 //! relative to the workspace root. Benchmarks are silently skipped if CSVs
 //! are not found.
 

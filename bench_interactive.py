@@ -31,7 +31,7 @@ Then in the REPL:
     timeit(q1, n=5)      # 5 runs, prints min/mean/max
     timeit_all()         # all queries, 3 runs each
     timeit_all(n=5)      # all queries, 5 runs each
-    compare()            # side-by-side Teide vs DuckDB
+    compare()            # side-by-side Teide vs baseline
 """
 
 import ctypes
@@ -183,21 +183,21 @@ def timeit_all(n=3, warmup=1):
     return results
 
 # --------------------------------------------------------------------------
-# compare: Teide vs DuckDB side-by-side
+# compare: Teide vs baseline side-by-side
 # --------------------------------------------------------------------------
 
 def compare(n=3):
-    """Run Teide and DuckDB benchmarks side-by-side."""
+    """Run Teide and baseline benchmarks side-by-side."""
     try:
         import duckdb
     except ImportError:
-        print("pip install duckdb to enable comparison")
+        print("pip install duckdb to enable baseline comparison")
         return
 
     con = duckdb.connect()
     con.execute(f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{CSV_PATH}')")
 
-    duckdb_queries = {
+    baseline_queries = {
         "q1": "SELECT id1, SUM(v1) FROM data GROUP BY id1",
         "q2": "SELECT id1, id2, SUM(v1) FROM data GROUP BY id1, id2",
         "q3": "SELECT id3, SUM(v1), AVG(v3) FROM data GROUP BY id3",
@@ -207,10 +207,10 @@ def compare(n=3):
         "q7": "SELECT id1,id2,id3,id4,id5,id6, SUM(v3), COUNT(v1) FROM data GROUP BY id1,id2,id3,id4,id5,id6",
     }
 
-    # DuckDB single-thread
+    # Baseline single-thread
     con.execute("SET threads=1")
 
-    print(f"{'Query':6s}  {'Teide':>10s}  {'DuckDB/1':>10s}  {'DuckDB/N':>10s}  {'ratio':>8s}")
+    print(f"{'Query':6s}  {'Teide':>10s}  {'Base/1':>10s}  {'Base/N':>10s}  {'ratio':>8s}")
     print(f"{'─'*6}  {'─'*10}  {'─'*10}  {'─'*10}  {'─'*8}")
 
     for name in ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]:
@@ -220,25 +220,25 @@ def compare(n=3):
         teide_times = [run(name)[0] for _ in range(n)]
         t_ms = min(teide_times)
 
-        # DuckDB single-thread
+        # Baseline single-thread
         con.execute("SET threads=1")
         for _ in range(1):
-            con.execute(duckdb_queries[name]).fetchall()
+            con.execute(baseline_queries[name]).fetchall()
         dk1_times = []
         for _ in range(n):
             t0 = time.perf_counter()
-            con.execute(duckdb_queries[name]).fetchall()
+            con.execute(baseline_queries[name]).fetchall()
             dk1_times.append((time.perf_counter() - t0) * 1000)
         d1_ms = min(dk1_times)
 
-        # DuckDB multi-thread
+        # Baseline multi-thread
         con.execute("RESET threads")
         for _ in range(1):
-            con.execute(duckdb_queries[name]).fetchall()
+            con.execute(baseline_queries[name]).fetchall()
         dkn_times = []
         for _ in range(n):
             t0 = time.perf_counter()
-            con.execute(duckdb_queries[name]).fetchall()
+            con.execute(baseline_queries[name]).fetchall()
             dkn_times.append((time.perf_counter() - t0) * 1000)
         dn_ms = min(dkn_times)
 
@@ -260,7 +260,7 @@ Interactive Teide Benchmark
   timeit(q3, n=10)     - time q3 with 10 runs
   timeit_all()         - time all queries (3 runs each)
   timeit_all(n=5)      - time all queries (5 runs each)
-  compare()            - Teide vs DuckDB side-by-side
+  compare()            - Teide vs baseline side-by-side
   compare(n=5)         - ... with 5 runs each
   run(q1)              - single run, returns (ms, nrows, ncols)
 

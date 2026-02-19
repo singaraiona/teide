@@ -21,7 +21,7 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
-"""Quick benchmark runner for Teide groupby queries on H2OAI 10M dataset."""
+"""Quick benchmark runner for Teide groupby queries on 10M dataset."""
 
 import ctypes
 import time

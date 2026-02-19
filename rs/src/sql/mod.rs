@@ -21,8 +21,8 @@
 
 // teide-db: SQL parser and planner for the Teide columnar table engine.
 //
-// Translates SQL queries (via sqlparser with DuckDB dialect) into Teide
-// execution graphs and runs them against CSV files.
+// Translates SQL queries into Teide execution graphs and runs them against
+// CSV files.
 
 pub mod expr;
 pub mod planner;

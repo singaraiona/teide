@@ -22,7 +22,7 @@
 //! SQL integration tests for teide-db.
 //!
 //! Small-data tests use a ~20-row inline CSV for deterministic assertions.
-//! Benchmarks have been moved to `benches/h2oai.rs` (criterion).
+//! Benchmarks have been moved to `benches/` (criterion).
 
 use std::io::Write;
 use std::sync::Mutex;

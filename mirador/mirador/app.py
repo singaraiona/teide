@@ -16,6 +16,7 @@ from teide import TeideLib
 from mirador import __version__
 from mirador.api.nodes import router as nodes_router
 from mirador.api.pipelines import router as pipelines_router
+from mirador.api.projects import router as projects_router
 from mirador.api.ws import router as ws_router
 
 _teide: TeideLib | None = None
@@ -56,6 +57,7 @@ app.add_middleware(
 
 app.include_router(nodes_router)
 app.include_router(pipelines_router)
+app.include_router(projects_router)
 app.include_router(ws_router)
 
 

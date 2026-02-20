@@ -654,6 +654,94 @@ static MunitResult test_group_parted(const void* params, void* fixture) {
     return MUNIT_OK;
 }
 
+/* ---- test_col_ext_nullmap_roundtrip ------------------------------------- */
+
+#define EXT_NM_LEN 256  /* >128 to trigger ext_nullmap */
+
+static MunitResult test_col_ext_nullmap_roundtrip(const void* params, void* fixture) {
+    (void)params; (void)fixture;
+
+    /* Create a 256-element I64 vector with nulls at various positions */
+    td_t* vec = td_vec_new(TD_I64, EXT_NM_LEN);
+    munit_assert_ptr_not_null(vec);
+    munit_assert_false(TD_IS_ERR(vec));
+    vec->len = EXT_NM_LEN;
+
+    int64_t* data = (int64_t*)td_data(vec);
+    for (int i = 0; i < EXT_NM_LEN; i++) data[i] = i * 10;
+
+    /* Set nulls at positions: 0, 5, 127, 128, 200, 255 */
+    int null_positions[] = { 0, 5, 127, 128, 200, 255 };
+    int n_nulls = (int)(sizeof(null_positions) / sizeof(null_positions[0]));
+    for (int i = 0; i < n_nulls; i++)
+        td_vec_set_null(vec, null_positions[i], true);
+
+    /* Verify ext_nullmap was created (>128 elements forces external) */
+    munit_assert_true((vec->attrs & TD_ATTR_HAS_NULLS) != 0);
+    munit_assert_true((vec->attrs & TD_ATTR_NULLMAP_EXT) != 0);
+    munit_assert_ptr_not_null(vec->ext_nullmap);
+
+    /* --- Round-trip via td_col_load --- */
+    td_err_t err = td_col_save(vec, TMP_COL_PATH);
+    munit_assert_int(err, ==, TD_OK);
+
+    td_t* loaded = td_col_load(TMP_COL_PATH);
+    munit_assert_ptr_not_null(loaded);
+    munit_assert_false(TD_IS_ERR(loaded));
+
+    munit_assert_int(loaded->type, ==, TD_I64);
+    munit_assert_int(loaded->len, ==, EXT_NM_LEN);
+    munit_assert_true((loaded->attrs & TD_ATTR_HAS_NULLS) != 0);
+    munit_assert_true((loaded->attrs & TD_ATTR_NULLMAP_EXT) != 0);
+    munit_assert_ptr_not_null(loaded->ext_nullmap);
+
+    /* Verify null positions preserved */
+    for (int i = 0; i < n_nulls; i++)
+        munit_assert_true(td_vec_is_null(loaded, null_positions[i]));
+
+    /* Verify non-null positions */
+    munit_assert_false(td_vec_is_null(loaded, 1));
+    munit_assert_false(td_vec_is_null(loaded, 129));
+    munit_assert_false(td_vec_is_null(loaded, 254));
+
+    /* Verify data values at non-null positions */
+    int64_t* ld = (int64_t*)td_data(loaded);
+    munit_assert_int(ld[1], ==, 10);
+    munit_assert_int(ld[129], ==, 1290);
+    munit_assert_int(ld[254], ==, 2540);
+
+    td_release(loaded);
+
+    /* --- Round-trip via td_col_mmap --- */
+    td_t* mapped = td_col_mmap(TMP_COL_PATH);
+    munit_assert_ptr_not_null(mapped);
+    munit_assert_false(TD_IS_ERR(mapped));
+
+    munit_assert_uint(mapped->mmod, ==, 1);
+    munit_assert_int(mapped->type, ==, TD_I64);
+    munit_assert_int(mapped->len, ==, EXT_NM_LEN);
+    munit_assert_true((mapped->attrs & TD_ATTR_HAS_NULLS) != 0);
+    munit_assert_true((mapped->attrs & TD_ATTR_NULLMAP_EXT) != 0);
+    munit_assert_ptr_not_null(mapped->ext_nullmap);
+
+    /* Verify null positions preserved in mmap path */
+    for (int i = 0; i < n_nulls; i++)
+        munit_assert_true(td_vec_is_null(mapped, null_positions[i]));
+
+    munit_assert_false(td_vec_is_null(mapped, 1));
+    munit_assert_false(td_vec_is_null(mapped, 129));
+
+    /* Verify data */
+    int64_t* md = (int64_t*)td_data(mapped);
+    munit_assert_int(md[1], ==, 10);
+    munit_assert_int(md[129], ==, 1290);
+
+    td_release(mapped);
+    td_release(vec);
+    unlink(TMP_COL_PATH);
+    return MUNIT_OK;
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static MunitTest store_tests[] = {
@@ -669,6 +757,7 @@ static MunitTest store_tests[] = {
     { "/parted_release",      test_parted_release,        store_setup, store_teardown, 0, NULL },
     { "/part_open",            test_part_open,            store_setup, store_teardown, 0, NULL },
     { "/group_parted",         test_group_parted,         store_setup, store_teardown, 0, NULL },
+    { "/col_ext_nullmap_roundtrip", test_col_ext_nullmap_roundtrip, store_setup, store_teardown, 0, NULL },
     { NULL, NULL, NULL, NULL, 0, NULL },
 };
 

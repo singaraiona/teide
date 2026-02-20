@@ -27,9 +27,10 @@
 
 /* --------------------------------------------------------------------------
  * Column file format:
- *   Bytes 0-15:  nullmap
+ *   Bytes 0-15:  nullmap (inline) or zeroed (ext_nullmap / no nulls)
  *   Bytes 16-31: mmod=0, order=0, type, attrs, rc=0, len
  *   Bytes 32+:   raw element data
+ *   (if TD_ATTR_NULLMAP_EXT): appended (len+7)/8 bitmap bytes
  *
  * On-disk format IS the in-memory format (zero deserialization on load).
  * -------------------------------------------------------------------------- */
@@ -70,11 +71,15 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     header.order = 0;
     atomic_store_explicit(&header.rc, 0, memory_order_relaxed);
 
-    /* Clear slice/ext_nullmap fields for clean serialization */
+    /* Clear slice field; preserve ext_nullmap flag for bitmap append */
+    header.attrs &= ~TD_ATTR_SLICE;
     if (!(header.attrs & TD_ATTR_HAS_NULLS)) {
         memset(header.nullmap, 0, 16);
+        header.attrs &= ~TD_ATTR_NULLMAP_EXT;
+    } else if (header.attrs & TD_ATTR_NULLMAP_EXT) {
+        /* Ext bitmap appended after data; zero pointer bytes in header */
+        memset(header.nullmap, 0, 16);
     }
-    header.attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
 
     size_t written = fwrite(&header, 1, 32, f);
     if (written != 32) { fclose(f); return TD_ERR_IO; }
@@ -107,6 +112,14 @@ td_err_t td_col_save(td_t* vec, const char* path) {
     if (data_size > 0) {
         written = fwrite(data, 1, data_size, f);
         if (written != data_size) { fclose(f); return TD_ERR_IO; }
+    }
+
+    /* Append external nullmap bitmap after data */
+    if ((vec->attrs & TD_ATTR_HAS_NULLS) &&
+        (vec->attrs & TD_ATTR_NULLMAP_EXT) && vec->ext_nullmap) {
+        size_t bitmap_len = ((size_t)vec->len + 7) / 8;
+        written = fwrite(td_data(vec->ext_nullmap), 1, bitmap_len, f);
+        if (written != bitmap_len) { fclose(f); return TD_ERR_IO; }
     }
 
     /* No fsync; durability not guaranteed on power failure. */
@@ -159,6 +172,15 @@ td_t* td_col_load(const char* path) {
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
 
+    /* Check for appended ext_nullmap bitmap */
+    bool has_ext_nullmap = (tmp->attrs & TD_ATTR_HAS_NULLS) &&
+                           (tmp->attrs & TD_ATTR_NULLMAP_EXT);
+    size_t bitmap_len = has_ext_nullmap ? ((size_t)tmp->len + 7) / 8 : 0;
+    if (has_ext_nullmap && 32 + data_size + bitmap_len > mapped_size) {
+        td_vm_unmap_file(ptr, mapped_size);
+        return TD_ERR_PTR(TD_ERR_CORRUPT);
+    }
+
     /* Allocate buddy block and copy file data */
     td_t* vec = td_alloc(data_size);
     if (!vec || TD_IS_ERR(vec)) {
@@ -167,12 +189,29 @@ td_t* td_col_load(const char* path) {
     }
     uint8_t saved_order = vec->order;  /* preserve buddy order */
     memcpy(vec, ptr, 32 + data_size);
-    td_vm_unmap_file(ptr, mapped_size);
+
+    /* Restore external nullmap if present */
+    if (has_ext_nullmap) {
+        td_t* ext = td_vec_new(TD_U8, (int64_t)bitmap_len);
+        if (!ext || TD_IS_ERR(ext)) {
+            td_vm_unmap_file(ptr, mapped_size);
+            td_free(vec);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        ext->len = (int64_t)bitmap_len;
+        memcpy(td_data(ext), (char*)ptr + 32 + data_size, bitmap_len);
+        td_vm_unmap_file(ptr, mapped_size);
+        vec->ext_nullmap = ext;
+    } else {
+        td_vm_unmap_file(ptr, mapped_size);
+    }
 
     /* Fix up header for buddy-allocated block */
     vec->mmod = 0;
     vec->order = saved_order;
-    vec->attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
+    vec->attrs &= ~TD_ATTR_SLICE;
+    if (!has_ext_nullmap)
+        vec->attrs &= ~TD_ATTR_NULLMAP_EXT;
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;
@@ -223,21 +262,36 @@ td_t* td_col_mmap(const char* path) {
         return TD_ERR_PTR(TD_ERR_CORRUPT);
     }
 
-    /* Validate that 32 + len*esz matches the file size.
-     * td_free() reconstructs the munmap size as:
-     *   (32 + len*esz + 4095) & ~4095  (page-rounded)
-     * This must match the kernel's page-rounded mmap size (derived from
-     * file_size). If the file has trailing garbage, the formula diverges. */
-    size_t expected = 32 + (size_t)vec->len * esz;
+    /* Validate that file size matches expected layout.
+     * td_free() reconstructs the munmap size using the same formula. */
+    bool has_ext_nullmap = (vec->attrs & TD_ATTR_HAS_NULLS) &&
+                           (vec->attrs & TD_ATTR_NULLMAP_EXT);
+    size_t bitmap_len = has_ext_nullmap ? ((size_t)vec->len + 7) / 8 : 0;
+    size_t expected = 32 + data_size + bitmap_len;
     if (expected != mapped_size) {
         td_vm_unmap_file(ptr, mapped_size);
         return TD_ERR_PTR(TD_ERR_IO);
     }
 
+    /* Restore external nullmap: allocate buddy-backed copy
+     * (ext_nullmap must be a proper td_t for ref counting) */
+    if (has_ext_nullmap) {
+        td_t* ext = td_vec_new(TD_U8, (int64_t)bitmap_len);
+        if (!ext || TD_IS_ERR(ext)) {
+            td_vm_unmap_file(ptr, mapped_size);
+            return TD_ERR_PTR(TD_ERR_OOM);
+        }
+        ext->len = (int64_t)bitmap_len;
+        memcpy(td_data(ext), (char*)ptr + 32 + data_size, bitmap_len);
+        vec->ext_nullmap = ext;
+    }
+
     /* Patch header -- MAP_PRIVATE COW: only the header page gets copied */
     vec->mmod = 1;
     vec->order = 0;
-    vec->attrs &= ~(TD_ATTR_SLICE | TD_ATTR_NULLMAP_EXT);
+    vec->attrs &= ~TD_ATTR_SLICE;
+    if (!has_ext_nullmap)
+        vec->attrs &= ~TD_ATTR_NULLMAP_EXT;
     atomic_store_explicit(&vec->rc, 1, memory_order_relaxed);
 
     return vec;

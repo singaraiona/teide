@@ -569,6 +569,8 @@ void td_free(td_t* v) {
         if (v->type > 0 && v->type < TD_TYPE_COUNT) {
             uint8_t esz = td_sym_elem_size(v->type, v->attrs);
             size_t data_size = 32 + (size_t)v->len * esz;
+            if (v->attrs & TD_ATTR_NULLMAP_EXT)
+                data_size += ((size_t)v->len + 7) / 8;
             size_t mapped_size = (data_size + 4095) & ~(size_t)4095;
             td_vm_unmap_file(v, mapped_size);
         } else {
